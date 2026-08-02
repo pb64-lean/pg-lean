@@ -1,0 +1,16 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_binary")
+
+# The pg-lean command-line query client:
+#   bazel run //Cmd:pg_lean -- postgres://user@host/db "SELECT 1"
+lean_binary(
+    name = "pg_lean",
+    srcs = ["PgLean.lean"],
+    deps = [
+        "//Pg:config",
+        "//Pg:connection",
+        "//Pg/Crypto:crypto",
+        "//Pg/Types:types",
+    ],
+)

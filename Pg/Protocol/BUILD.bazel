@@ -1,0 +1,20 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+# Wire protocol: byte framing, typed message catalog, and the sans-IO
+# connection state machine.
+lean_library(
+    name = "protocol",
+    srcs = [
+        "Backend.lean",
+        "Frontend.lean",
+        "Machine.lean",
+        "Message.lean",
+    ],
+    deps = [
+        "//Pg:channel_binding",
+        "//Pg/Crypto:crypto",
+        "//Pg/Sasl:sasl",
+    ],
+)

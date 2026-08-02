@@ -1,0 +1,16 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+# Test-only fixtures: hex literals, backend-message builders, and the
+# scripted-exchange DSL with the fragmentation-torture runner.
+lean_library(
+    name = "pg_test_support",
+    testonly = True,
+    srcs = [
+        "Backend.lean",
+        "Hex.lean",
+        "Script.lean",
+    ],
+    deps = ["//Pg/Protocol:protocol"],
+)

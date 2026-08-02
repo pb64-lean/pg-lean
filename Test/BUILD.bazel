@@ -1,0 +1,86 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_test")
+
+lean_test(
+    name = "pg_message_test",
+    srcs = ["MessageTest.lean"],
+    deps = ["//Pg/Protocol:protocol"],
+)
+
+lean_test(
+    name = "pg_crypto_test",
+    srcs = ["CryptoTest.lean"],
+    deps = ["//Pg/Crypto:crypto"],
+)
+
+lean_test(
+    name = "pg_scram_test",
+    srcs = ["ScramTest.lean"],
+    deps = ["//Pg/Sasl:sasl"],
+)
+
+lean_test(
+    name = "pg_wire_test",
+    srcs = ["WireTest.lean"],
+    deps = [
+        "//Pg/Protocol:protocol",
+        "//Test/Support:pg_test_support",
+    ],
+)
+
+lean_test(
+    name = "pg_machine_test",
+    srcs = ["MachineTest.lean"],
+    deps = [
+        "//Pg/Protocol:protocol",
+        "//Test/Support:pg_test_support",
+    ],
+)
+
+lean_test(
+    name = "pg_flow_test",
+    srcs = ["FlowTest.lean"],
+    deps = [
+        "//Pg/Protocol:protocol",
+        "//Test/Support:pg_test_support",
+    ],
+)
+
+lean_test(
+    name = "pg_codec_test",
+    srcs = ["CodecTest.lean"],
+    deps = [
+        "//Pg/Types:types",
+        "//Test/Support:pg_test_support",
+    ],
+)
+
+lean_test(
+    name = "pg_connection_test",
+    srcs = ["ConnectionTest.lean"],
+    deps = [
+        "//Pg:config",
+        "//Pg:connection",
+        "//Test/Support:pg_test_support",
+    ],
+)
+
+lean_test(
+    name = "pg_tls_test",
+    srcs = ["TlsTest.lean"],
+    data = glob(["Fixtures/TlsCertificateVerify/*.pem"]),
+    deps = [
+        "//Pg/Crypto:crypto",
+        "@tls13_lean//Tls:tls",
+        "@tls13_lean//HaclStar:haclstar",
+        "@tls13_lean//TLS13:tls13",
+    ],
+)
+
+lean_test(
+    name = "pg_trust_store_test",
+    srcs = ["TrustStoreTest.lean"],
+    data = ["Fixtures/TlsCertificateVerify/rsa.pem"],
+    deps = ["//:pg_lean"],
+)

@@ -1,0 +1,23 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+# Umbrella library: the root `Pg` module re-exporting the whole client.
+# Per-directory libraries live in Pg/*/BUILD.bazel; tests in Test/BUILD.bazel;
+# binaries in Cmd/ and Integration/.
+lean_library(
+    name = "pg_lean",
+    srcs = ["Pg.lean"],
+    deps = [
+        "//Pg:channel_binding",
+        "//Pg:config",
+        "//Pg:connection",
+        "//Pg:error",
+        "//Pg/Crypto:crypto",
+        "//Pg/Protocol:protocol",
+        "//Pg/Sasl:sasl",
+        "@tls13_lean//Tls:tls",
+        "//Pg/Tls:trust_store",
+        "//Pg/Types:types",
+    ],
+)

@@ -1,0 +1,40 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+# ChannelBinding is leaf-level policy shared by the protocol machine below it
+# and the connection config above it — its own target avoids a package cycle.
+lean_library(
+    name = "channel_binding",
+    srcs = ["ChannelBinding.lean"],
+)
+
+lean_library(
+    name = "config",
+    srcs = ["Config.lean"],
+    deps = ["//Pg/Protocol:protocol"],
+)
+
+lean_library(
+    name = "error",
+    srcs = ["Error.lean"],
+    deps = [
+        "//Pg/Protocol:protocol",
+        "@tls13_lean//TLS13:tls13",
+    ],
+)
+
+# The async IO shell.
+lean_library(
+    name = "connection",
+    srcs = ["Connection.lean"],
+    deps = [
+        ":config",
+        ":error",
+        "//Pg/Protocol:protocol",
+        "//Pg/Sasl:sasl",
+        "@tls13_lean//Tls:tls",
+        "//Pg/Tls:trust_store",
+        "//Pg/Types:types",
+    ],
+)

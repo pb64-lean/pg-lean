@@ -1,0 +1,14 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+# Separate target: TrustStore imports Pg.Config, which sits above the TLS
+# engine (Connection depends on both), so bundling it into :tls would cycle.
+lean_library(
+    name = "trust_store",
+    srcs = ["TrustStore.lean"],
+    deps = [
+        "//Pg:config",
+        "@tls13_lean//TLS13:tls13",
+    ],
+)

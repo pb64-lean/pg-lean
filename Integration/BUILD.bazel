@@ -1,0 +1,17 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_binary")
+
+# Live conformance checklist (never part of `bazel test`):
+#   PG_URL=postgres://... bazel run //Integration:pg_live_test
+# or scripts/pg-live.sh.
+lean_binary(
+    name = "pg_live_test",
+    srcs = ["LiveTest.lean"],
+    deps = [
+        "//Pg:config",
+        "//Pg:connection",
+        "//Pg/Crypto:crypto",
+        "//Pg/Types:types",
+    ],
+)

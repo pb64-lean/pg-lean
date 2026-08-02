@@ -1,0 +1,16 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+# Pure-Lean crypto primitives (self-contained; upstream candidates).
+lean_library(
+    name = "crypto",
+    srcs = [
+        "Base64.lean",
+        "Hex.lean",
+        "Hmac.lean",
+        "Md5.lean",
+        "Pbkdf2.lean",
+        "Sha256.lean",
+    ],
+)

@@ -1,0 +1,18 @@
+package(default_visibility = ["//visibility:public"])
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+# OIDs and text/binary codecs (PgNumeric, PgInterval, Std.Time mappings).
+lean_library(
+    name = "types",
+    srcs = [
+        "Codec.lean",
+        "Interval.lean",
+        "Numeric.lean",
+        "Oid.lean",
+    ],
+    deps = [
+        "//Pg/Crypto:crypto",
+        "//Pg/Protocol:protocol",
+    ],
+)
