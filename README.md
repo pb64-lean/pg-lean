@@ -1,5 +1,7 @@
 # pg-lean
 
+[![CI](https://github.com/pb64-lean/pg-lean/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/pb64-lean/pg-lean/actions/workflows/ci.yml) [![PG live](https://github.com/pb64-lean/pg-lean/actions/workflows/pg-live.yml/badge.svg?branch=main)](https://github.com/pb64-lean/pg-lean/actions/workflows/pg-live.yml) [![Assurance](https://github.com/pb64-lean/pg-lean/actions/workflows/assurance.yml/badge.svg?branch=main)](https://github.com/pb64-lean/pg-lean/actions/workflows/assurance.yml)
+
 A PostgreSQL client for Lean 4, built as an extension of the standard
 library's networking foundations (`Std.Async.TCP`), with the eventual goal of
 an upstream contribution. The PostgreSQL protocol and TLS 1.3 state machines

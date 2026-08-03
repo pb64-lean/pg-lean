@@ -1,0 +1,60 @@
+name: pg-live
+
+# Live PostgreSQL conformance matrix against dockerized postgres:17/18.
+# Runs on the docker-capable self-hosted runner; the single lean-integration
+# runner per machine serializes combos (fixed host port 54399).
+# NEVER add pull_request here: these jobs run on self-hosted runners.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "43 9 * * 0"
+
+concurrency:
+  group: pg-live
+  cancel-in-progress: false
+
+jobs:
+  # Fast subset on push/dispatch: both versions, all four transports, all
+  # four auth modes represented, including the hardest path (SCRAM channel
+  # binding) and the md5 legacy path (meaningful on 17 only).
+  quick:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - { v: 17, auth: trust, tr: plain }
+          - { v: 17, auth: scram, tr: tls-cb }
+          - { v: 17, auth: md5, tr: plain }
+          - { v: 18, auth: password, tr: tls }
+          - { v: 18, auth: scram, tr: tls-verify }
+    uses: pb64-lean/.github/.github/workflows/integration.yml@main
+    with:
+      siblings: rules_lean tls13-lean grpc-lean
+      run: scripts/pg-live.sh ${{ matrix.v }} ${{ matrix.auth }} ${{ matrix.tr }}
+      timeout_minutes: 30
+
+  # Full documented matrix weekly: 13 legal auth x transport combos per
+  # version (tls-cb requires scram).
+  full:
+    if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        v: [17, 18]
+        auth: [trust, scram, password, md5]
+        tr: [plain, tls, tls-verify, tls-cb]
+        exclude:
+          - { auth: trust, tr: tls-cb }
+          - { auth: password, tr: tls-cb }
+          - { auth: md5, tr: tls-cb }
+    uses: pb64-lean/.github/.github/workflows/integration.yml@main
+    with:
+      siblings: rules_lean tls13-lean grpc-lean
+      run: scripts/pg-live.sh ${{ matrix.v }} ${{ matrix.auth }} ${{ matrix.tr }}
+      timeout_minutes: 30
