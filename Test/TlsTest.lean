@@ -176,8 +176,20 @@ def testRecordLimits : IO Unit := do
   expectRecordError
     (({} : Record.Decoder).feed tooShortHeader)
     (fun | .ciphertextTooShort _ => true | _ => false) "ciphertext minimum from header"
-  expectRecordError
+  -- RFC 8446 §5.1: the decoder ignores TLSPlaintext.legacy_record_version
+  -- (0x0301 ClientHello records are commonplace); `open` still requires
+  -- 0x0303 on protected TLSCiphertext records.
+  let (_, legacyRecords) ← must
     (({} : Record.Decoder).feed (ByteArray.mk #[22, 3, 1, 0, 0]))
+    "legacy plaintext record version tolerated"
+  expect (legacyRecords.size == 1 && legacyRecords[0]!.legacyVersion == 0x0301)
+    "legacy plaintext record version was not preserved"
+  let ciphertextLegacy : Record.RawRecord := {
+    contentType := .applicationData
+    legacyVersion := 0x0301
+    fragment := bytes (Record.aeadTagLength + 1) 0
+  }
+  expectRecordError (Record.open keys ciphertextLegacy)
     (fun | .invalidLegacyVersion _ => true | _ => false) "legacy record version"
 
 def parseExtensionsForTest (bytes : ByteArray) :
