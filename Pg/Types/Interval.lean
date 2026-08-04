@@ -1,5 +1,7 @@
 module
 
+public import Pg.Types.Digits
+
 public section
 
 namespace Pg
@@ -9,6 +11,10 @@ namespace Pg
 microseconds are NOT interconvertible (a month is not a fixed number of days,
 a day not a fixed number of hours under DST), so the wire triple is preserved
 as-is. Text form follows the default `postgres` interval style.
+
+Both directions are explicit recursion over character lists: a `for` loop with
+mutable state and `String.splitOn` are opaque to the kernel, and
+`Pg.Types.Codec` proves `PgInterval.fromString_toString` on top of this shape.
 -/
 
 structure PgInterval where
@@ -19,88 +25,113 @@ structure PgInterval where
 
 namespace PgInterval
 
-private def pad2 (v : Nat) : String :=
-  if v < 10 then "0" ++ toString v else toString v
+/-! ### Rendering -/
 
-protected def toString (iv : PgInterval) : String := Id.run do
-  let mut pieces : Array String := #[]
-  if iv.months != 0 then
-    pieces := pieces.push s!"{iv.months} mons"
-  if iv.days != 0 then
-    pieces := pieces.push s!"{iv.days} days"
-  let neg := iv.micros < 0
-  let us := iv.micros.natAbs
-  let h := us / 3600000000
-  let m := us / 60000000 % 60
-  let s := us / 1000000 % 60
-  let frac := us % 1000000
-  let mut time := (if neg then "-" else "") ++ s!"{pad2 h}:{pad2 m}:{pad2 s}"
-  if frac != 0 then
-    let f := toString (1000000 + frac)  -- "1ffffff": drop the lead, keep zeros
-    time := time ++ "." ++ (f.toUTF8.extract 1 7 |> String.fromUTF8?).getD ""
-  if iv.micros != 0 || pieces.isEmpty then
-    pieces := pieces.push time
-  return String.intercalate " " pieces.toList
+/-- Decimal characters of an `Int`, sign included. -/
+@[expose] def intChars (v : Int) : List Char :=
+  if v < 0 then '-' :: natDigits v.natAbs else natDigits v.natAbs
+
+/-- `[-]HH:MM:SS`, each field at least two digits, plus `.ffffff` when there is
+a microsecond remainder. Hours are not capped: an interval is a duration, not a
+time of day. -/
+@[expose] def timeChars (micros : Int) : List Char :=
+  (if micros < 0 then ['-'] else []) ++
+    padDigits 2 (micros.natAbs / 3600000000) ++
+    ':' :: padDigits 2 (micros.natAbs / 60000000 % 60) ++
+    ':' :: padDigits 2 (micros.natAbs / 1000000 % 60) ++
+    (if micros.natAbs % 1000000 = 0 then []
+      else '.' :: padDigits 6 (micros.natAbs % 1000000))
+
+/-- The space-separated tokens of the rendering. A zero component is omitted,
+except that an all-zero interval still renders its time piece. -/
+@[expose] def tokens (iv : PgInterval) : List (List Char) :=
+  (if iv.months = 0 then [] else [intChars iv.months, ['m', 'o', 'n', 's']]) ++
+  (if iv.days = 0 then [] else [intChars iv.days, ['d', 'a', 'y', 's']]) ++
+  (if iv.micros = 0 ∧ ¬(iv.months = 0 ∧ iv.days = 0) then [] else [timeChars iv.micros])
+
+/-- Join with single spaces (`String.intercalate " "`, at the character
+level). -/
+@[expose] def joinSpace : List (List Char) → List Char
+  | [] => []
+  | [p] => p
+  | p :: rest => p ++ ' ' :: joinSpace rest
+
+@[expose] def chars (iv : PgInterval) : List Char := joinSpace iv.tokens
+
+protected def toString (iv : PgInterval) : String := String.ofList iv.chars
 
 instance : ToString PgInterval := ⟨PgInterval.toString⟩
 
-private def parseTime (tok : String) : Except String Int := do
-  let (neg, body) :=
-    if tok.startsWith "-" then (true, (tok.toUTF8.extract 1 tok.utf8ByteSize))
-    else if tok.startsWith "+" then (false, (tok.toUTF8.extract 1 tok.utf8ByteSize))
-    else (false, tok.toUTF8)
-  let some body := String.fromUTF8? body | throw "interval: bad time"
-  let (hms, frac) := match body.splitOn "." with
-    | [t] => (t, "")
-    | [t, f] => (t, f)
-    | _ => ("", "")
-  let micros ← match hms.splitOn ":" with
-    | [h, m, s] =>
-      let some h := h.toNat? | throw s!"interval: bad hours {hms}"
-      let some m := m.toNat? | throw s!"interval: bad minutes {hms}"
-      let some s := s.toNat? | throw s!"interval: bad seconds {hms}"
-      pure (Int.ofNat ((h * 3600 + m * 60 + s) * 1000000))
-    | _ => throw s!"interval: cannot parse time {tok}"
-  let fracUs ← do
-    if frac.isEmpty then
-      pure 0
+/-! ### Parsing -/
+
+/-- Optional sign, then a decimal field. Matches `String.toInt?`. -/
+@[expose] def intOfChars : List Char → Option Int
+  | '-' :: rest => (natOfDigitsFull rest).map (fun n => -Int.ofNat n)
+  | cs => (natOfDigitsFull cs).map Int.ofNat
+
+/-- `HH:MM:SS` plus an already-parsed microsecond remainder. -/
+@[expose] def hmsMicros (orig : String) (hms : List Char) (frac : Nat) :
+    Except String Int :=
+  match hms.splitOn ':' with
+  | [h, m, s] =>
+    match natOfDigitsFull h, natOfDigitsFull m, natOfDigitsFull s with
+    | some h, some m, some s => .ok (Int.ofNat ((h * 3600 + m * 60 + s) * 1000000 + frac))
+    | _, _, _ => .error s!"interval: bad time {orig}"
+  | _ => .error s!"interval: cannot parse time {orig}"
+
+/-- A fraction of a second: right-pad with zeros and keep six places, so `.5`
+is 500000 microseconds. -/
+@[expose] def fracMicros (frac : List Char) : Option Nat :=
+  natOfDigitsFull ((frac ++ List.replicate 6 '0').take 6)
+
+@[expose] def timeMagnitude (orig : String) (body : List Char) : Except String Int :=
+  match body.splitOn '.' with
+  | [hms] => hmsMicros orig hms 0
+  | [hms, frac] =>
+    match fracMicros frac with
+    | some v => hmsMicros orig hms v
+    | none => .error s!"interval: bad fraction {orig}"
+  | _ => .error s!"interval: cannot parse time {orig}"
+
+@[expose] def parseTime (orig : String) : List Char → Except String Int
+  | '-' :: rest => (timeMagnitude orig rest).map (fun v => -v)
+  | '+' :: rest => timeMagnitude orig rest
+  | body => timeMagnitude orig body
+
+/-- One token at a time, carrying the accumulated interval and a number
+awaiting its unit word. Explicit recursion — the `for` loop this replaces had
+two mutable variables and was opaque to the kernel. -/
+@[expose] def step (orig : String) (iv : PgInterval) (pending : Option Int) :
+    List (List Char) → Except String PgInterval
+  | [] => if pending.isNone then .ok iv else .error "interval: trailing number"
+  | tok :: rest =>
+    if tok.contains ':' then
+      if pending.isNone then
+        match parseTime (String.ofList tok) tok with
+        | .ok us => step orig { iv with micros := iv.micros + us } none rest
+        | .error e => .error e
+      else .error s!"interval: dangling number before {String.ofList tok}"
     else
-      let padded := (frac ++ "000000").toUTF8.extract 0 6
-      let some fs := String.fromUTF8? padded | throw "interval: bad fraction"
-      let some v := fs.toNat? | throw s!"interval: bad fraction {frac}"
-      pure (Int.ofNat v)
-  let total := micros + fracUs
-  pure (if neg then -total else total)
+      match pending with
+      | none =>
+        match intOfChars tok with
+        | some n => step orig iv (some n) rest
+        | none => .error s!"interval: expected number, got {String.ofList tok}"
+      | some n =>
+        if ['y', 'e', 'a', 'r'].isPrefixOf tok then
+          step orig { iv with months := iv.months + n * 12 } none rest
+        else if ['m', 'o', 'n'].isPrefixOf tok then
+          step orig { iv with months := iv.months + n } none rest
+        else if ['w', 'e', 'e', 'k'].isPrefixOf tok then
+          step orig { iv with days := iv.days + n * 7 } none rest
+        else if ['d', 'a', 'y'].isPrefixOf tok then
+          step orig { iv with days := iv.days + n } none rest
+        else .error s!"interval: unknown unit {String.ofList tok}"
 
 /-- Parses the default `postgres` output style, e.g.
 `"1 year 2 mons 3 days 04:05:06.789"`, `"-00:00:01.5"`, `"00:00:00"`. -/
-def fromString (s : String) : Except String PgInterval := do
-  let tokens := (s.trimAscii.toString.splitOn " ").filter (!·.isEmpty)
-  let mut iv : PgInterval := {}
-  let mut pendingNum : Option Int := none
-  for tok in tokens do
-    if tok.toList.contains ':' then
-      unless pendingNum.isNone do throw s!"interval: dangling number before {tok}"
-      iv := { iv with micros := iv.micros + (← parseTime tok) }
-    else
-      match pendingNum with
-      | none =>
-        let some n := tok.toInt? | throw s!"interval: expected number, got {tok}"
-        pendingNum := some n
-      | some n =>
-        pendingNum := none
-        if tok.startsWith "year" then
-          iv := { iv with months := iv.months + n * 12 }
-        else if tok.startsWith "mon" then
-          iv := { iv with months := iv.months + n }
-        else if tok.startsWith "week" then
-          iv := { iv with days := iv.days + n * 7 }
-        else if tok.startsWith "day" then
-          iv := { iv with days := iv.days + n }
-        else
-          throw s!"interval: unknown unit {tok}"
-  unless pendingNum.isNone do throw "interval: trailing number"
-  pure iv
+def fromString (s : String) : Except String PgInterval :=
+  step s {} none (((trimAsciiChars s.toList).splitOn ' ').filter (fun t => !t.isEmpty))
 
 end PgInterval
 
