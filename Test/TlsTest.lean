@@ -192,17 +192,6 @@ def testRecordLimits : IO Unit := do
   expectRecordError (Record.open keys ciphertextLegacy)
     (fun | .invalidLegacyVersion _ => true | _ => false) "legacy record version"
 
-def parseExtensionsForTest (bytes : ByteArray) :
-    Except String (Array Handshake.Extension) := do
-  let mut reader : Handshake.Reader := { bytes }
-  let mut out : Array Handshake.Extension := #[]
-  while !reader.atEnd do
-    let (extensionType, reader') ← reader.readUInt16
-    let (data, reader') ← reader'.readVector16
-    out := out.push { extensionType, data }
-    reader := reader'
-  pure out
-
 def clientHelloExtensions (hello : Handshake.Message) :
     Except String (Array Handshake.Extension) := do
   unless hello.msgType == Handshake.clientHelloType do
@@ -219,7 +208,9 @@ def clientHelloExtensions (hello : Handshake.Message) :
   unless compression == ByteArray.mk #[0] do throw "bad compression methods"
   let (extensionBytes, reader) ← reader.readVector16
   reader.requireEnd "ClientHello"
-  parseExtensionsForTest extensionBytes
+  -- tls13-lean's own extension-block parser (proved: `parseExtensions_extensionsBytes`),
+  -- so this test checks the shipped parser rather than a hand-rolled copy.
+  Handshake.parseExtensions extensionBytes
 
 structure OfferedKeyShare where
   group : Handshake.NamedGroup
