@@ -317,82 +317,97 @@ private def quiet (s : State) : State × Array Event × ByteArray :=
   (s, #[], ByteArray.empty)
 
 private def stepStartup (s : State) (auth : AuthState) (m : BackendMsg) :
-    Except PgError (State × Array Event × ByteArray) := do
+    Except PgError (State × Array Event × ByteArray) :=
   match m with
   | .auth req =>
-    if s.cfg.channelBinding == .require && auth matches .awaitingRequest then
-      unless req matches .sasl _ do
-        throw (.channelBinding .plusNotOffered)
-    match req, auth with
-    | .ok, .awaitingRequest | .ok, .sentCleartext | .ok, .sentMd5 | .ok, .saslDone =>
-      pure ({ s with phase := .startup .awaitingReady }, #[.authOk], ByteArray.empty)
-    | .ok, .scram _ =>
-      -- AuthenticationOk without a SASLFinal: server signature never arrived
-      throw (.authFailed "server skipped its SASL final message (no server signature)")
-    | .cleartextPassword, .awaitingRequest =>
-      let pw ← requirePassword s
-      pure ({ s with phase := .startup .sentCleartext }, #[], Frontend.password pw)
-    | .md5Password salt, .awaitingRequest =>
-      let pw ← requirePassword s
-      pure ({ s with phase := .startup .sentMd5 }, #[],
-        Frontend.password (Crypto.md5PasswordHash s.cfg.user pw salt))
-    | .sasl mechanisms, .awaitingRequest =>
-      let binding ← match selectScramChannelBinding s.cfg.channelBinding
-          s.cfg.tlsServerEndPoint mechanisms with
-        | .ok binding => pure binding
+    if s.cfg.channelBinding == .require && (auth matches .awaitingRequest) &&
+        !(req matches .sasl _) then
+      throw (.channelBinding .plusNotOffered)
+    else
+      match req, auth with
+      | .ok, .awaitingRequest | .ok, .sentCleartext | .ok, .sentMd5 | .ok, .saslDone =>
+        pure ({ s with phase := .startup .awaitingReady }, #[.authOk], ByteArray.empty)
+      | .ok, .scram _ =>
+        -- AuthenticationOk without a SASLFinal: server signature never arrived
+        throw (.authFailed "server skipped its SASL final message (no server signature)")
+      | .cleartextPassword, .awaitingRequest =>
+        match requirePassword s with
+        | .error e => throw e
+        | .ok pw =>
+          pure ({ s with phase := .startup .sentCleartext }, #[], Frontend.password pw)
+      | .md5Password salt, .awaitingRequest =>
+        match requirePassword s with
+        | .error e => throw e
+        | .ok pw =>
+          pure ({ s with phase := .startup .sentMd5 }, #[],
+            Frontend.password (Crypto.md5PasswordHash s.cfg.user pw salt))
+      | .sasl mechanisms, .awaitingRequest =>
+        match selectScramChannelBinding s.cfg.channelBinding
+            s.cfg.tlsServerEndPoint mechanisms with
         | .error failure =>
           if s.cfg.channelBinding == .require ||
               failure == .plusWithoutTls then
             throw (.channelBinding failure)
           else
             throw (.unsupportedAuth (String.intercalate ", " mechanisms.toList))
-      let pw ← requirePassword s
-      let (client, firstMsg) := Sasl.Scram.clientFirstWithChannelBinding
-        binding s.cfg.user pw s.cfg.scramNonce
-      pure ({
-          s with
-          phase := .startup (.scram client)
-          negotiatedSaslMechanism := some binding.mechanism
-        }, #[], Frontend.saslInitialResponse binding.mechanism firstMsg.toUTF8)
-    | .saslContinue data, .scram client =>
-      let some serverFirst := String.fromUTF8? data
-        | throw (.protocol "SASL server-first is not UTF-8")
-      match Sasl.Scram.clientFinal client serverFirst with
-      | .ok (client, final) =>
-        pure ({ s with phase := .startup (.scram client) }, #[],
-          Frontend.saslResponse final.toUTF8)
-      | .error e => throw (.authFailed s!"SCRAM: {repr e}")
-    | .saslFinal data, .scram client =>
-      let some serverFinal := String.fromUTF8? data
-        | throw (.protocol "SASL server-final is not UTF-8")
-      match Sasl.Scram.verifyServerFinal client serverFinal with
-      | .ok () => pure ({ s with phase := .startup .saslDone }, #[], ByteArray.empty)
-      | .error e => throw (.authFailed s!"SCRAM: {repr e}")
-    | .kerberosV5, _ | .gss, _ | .gssContinue _, _ | .sspi, _ | .unknown _, _ =>
-      throw (.unsupportedAuth (authName req))
-    | _, _ => throw (.protocol "authentication request out of sequence")
+        | .ok binding =>
+          match requirePassword s with
+          | .error e => throw e
+          | .ok pw =>
+            let (client, firstMsg) := Sasl.Scram.clientFirstWithChannelBinding
+              binding s.cfg.user pw s.cfg.scramNonce
+            pure ({
+                s with
+                phase := .startup (.scram client)
+                negotiatedSaslMechanism := some binding.mechanism
+              }, #[], Frontend.saslInitialResponse binding.mechanism firstMsg.toUTF8)
+      | .saslContinue data, .scram client =>
+        match String.fromUTF8? data with
+        | none => throw (.protocol "SASL server-first is not UTF-8")
+        | some serverFirst =>
+          match Sasl.Scram.clientFinal client serverFirst with
+          | .ok (client, final) =>
+            pure ({ s with phase := .startup (.scram client) }, #[],
+              Frontend.saslResponse final.toUTF8)
+          | .error e => throw (.authFailed s!"SCRAM: {repr e}")
+      | .saslFinal data, .scram client =>
+        match String.fromUTF8? data with
+        | none => throw (.protocol "SASL server-final is not UTF-8")
+        | some serverFinal =>
+          match Sasl.Scram.verifyServerFinal client serverFinal with
+          | .ok () => pure ({ s with phase := .startup .saslDone }, #[], ByteArray.empty)
+          | .error e => throw (.authFailed s!"SCRAM: {repr e}")
+      | .kerberosV5, _ | .gss, _ | .gssContinue _, _ | .sspi, _ | .unknown _, _ =>
+        throw (.unsupportedAuth (authName req))
+      | _, _ => throw (.protocol "authentication request out of sequence")
   | .backendKeyData pid secret =>
-    unless auth matches .awaitingReady do
+    if auth matches .awaitingReady then
+      if s.protocolVersion == .v3_0 && secret.size != 4 then
+        throw (.protocol s!"protocol 3.0 cancel key must be 4 bytes, got {secret.size}")
+      else
+        pure (quiet { s with backendKey := some { processId := pid, secret } })
+    else
       throw (.protocol "BackendKeyData before AuthenticationOk")
-    if s.protocolVersion == .v3_0 && secret.size != 4 then
-      throw (.protocol s!"protocol 3.0 cancel key must be 4 bytes, got {secret.size}")
-    pure (quiet { s with backendKey := some { processId := pid, secret } })
   | .negotiateProtocolVersion newest unrecognized =>
-    unless auth matches .awaitingRequest do
-      throw (.protocol "NegotiateProtocolVersion after authentication began")
-    -- The field carries the newest protocol version the server supports.
-    -- PostgreSQL sends the full code (e.g. 196608 = 3.0); the docs' wording
-    -- ("newest minor") suggests a bare minor, so accept both encodings.
-    let version ← match newest.toNat with
-      | 0 | 196608 => pure ProtocolVersion.v3_0
-      | 2 | 196610 => pure ProtocolVersion.v3_2
+    if auth matches .awaitingRequest then
+      -- The field carries the newest protocol version the server supports.
+      -- PostgreSQL sends the full code (e.g. 196608 = 3.0); the docs' wording
+      -- ("newest minor") suggests a bare minor, so accept both encodings.
+      match newest.toNat with
+      | 0 | 196608 =>
+        pure ({ s with protocolVersion := ProtocolVersion.v3_0 },
+          #[.negotiatedVersion .v3_0 unrecognized], ByteArray.empty)
+      | 2 | 196610 =>
+        pure ({ s with protocolVersion := ProtocolVersion.v3_2 },
+          #[.negotiatedVersion .v3_2 unrecognized], ByteArray.empty)
       | v => throw (.protocol s!"server negotiated unsupported protocol version {v}")
-    pure ({ s with protocolVersion := version },
-      #[.negotiatedVersion version unrecognized], ByteArray.empty)
+    else
+      throw (.protocol "NegotiateProtocolVersion after authentication began")
   | .readyForQuery tx =>
-    unless auth matches .awaitingReady do
+    if auth matches .awaitingReady then
+      pure ({ s with phase := .running {}, txStatus := tx }, #[.ready tx], ByteArray.empty)
+    else
       throw (.protocol "ReadyForQuery before AuthenticationOk")
-    pure ({ s with phase := .running {}, txStatus := tx }, #[.ready tx], ByteArray.empty)
   | .errorResponse fields => throw (.serverFatal fields)
   | other => throw (.protocol s!"unexpected message during startup: {repr other}")
 
@@ -431,7 +446,7 @@ private def abortToSync (pipe : Pipeline) : Pipeline :=
 private def isSimple (op : CurrentOp) : Bool := op.kind == .simpleQuery
 
 private def stepRunning (s : State) (pipe : Pipeline) (m : BackendMsg) :
-    Except PgError (State × Array Event × ByteArray) := do
+    Except PgError (State × Array Event × ByteArray) :=
   match m with
   | .errorResponse fields =>
     match pipe.current with
@@ -454,103 +469,144 @@ private def stepRunning (s : State) (pipe : Pipeline) (m : BackendMsg) :
     match pipe.current with
     | some op =>
       if op.kind == .sync || op.kind == .simpleQuery then
-        let (s', evs, out) := finish { s with txStatus := tx } pipe (.ready tx)
-        pure (s', evs, out)
+        pure (finish { s with txStatus := tx } pipe (.ready tx))
       else
         throw (.protocol s!"ReadyForQuery while awaiting replies for {repr op.kind}")
     | none => throw (.protocol "unsolicited ReadyForQuery")
   | .parseComplete =>
-    let some op := pipe.current | throw (.protocol "unsolicited ParseComplete")
-    unless op.kind == .parse && op.progress == .start do
-      throw (.protocol "unexpected ParseComplete")
-    pure (finish s pipe .parseComplete)
+    match pipe.current with
+    | none => throw (.protocol "unsolicited ParseComplete")
+    | some op =>
+      if op.kind == .parse && op.progress == .start then
+        pure (finish s pipe .parseComplete)
+      else
+        throw (.protocol "unexpected ParseComplete")
   | .bindComplete =>
-    let some op := pipe.current | throw (.protocol "unsolicited BindComplete")
-    unless op.kind == .bind && op.progress == .start do
-      throw (.protocol "unexpected BindComplete")
-    pure (finish s pipe .bindComplete)
+    match pipe.current with
+    | none => throw (.protocol "unsolicited BindComplete")
+    | some op =>
+      if op.kind == .bind && op.progress == .start then
+        pure (finish s pipe .bindComplete)
+      else
+        throw (.protocol "unexpected BindComplete")
   | .closeComplete =>
-    let some op := pipe.current | throw (.protocol "unsolicited CloseComplete")
-    unless op.kind == .close && op.progress == .start do
-      throw (.protocol "unexpected CloseComplete")
-    pure (finish s pipe .closeComplete)
+    match pipe.current with
+    | none => throw (.protocol "unsolicited CloseComplete")
+    | some op =>
+      if op.kind == .close && op.progress == .start then
+        pure (finish s pipe .closeComplete)
+      else
+        throw (.protocol "unexpected CloseComplete")
   | .parameterDescription oids =>
-    let some op := pipe.current | throw (.protocol "unsolicited ParameterDescription")
-    unless op.kind == .describeStatement && op.progress == .start do
-      throw (.protocol "unexpected ParameterDescription")
-    pure (progressTo s pipe op .descParams (.parameterDescription oids))
+    match pipe.current with
+    | none => throw (.protocol "unsolicited ParameterDescription")
+    | some op =>
+      if op.kind == .describeStatement && op.progress == .start then
+        pure (progressTo s pipe op .descParams (.parameterDescription oids))
+      else
+        throw (.protocol "unexpected ParameterDescription")
   | .rowDescription columns =>
-    let some op := pipe.current | throw (.protocol "unsolicited RowDescription")
-    match op.kind, op.progress with
-    | .describeStatement, .descParams => pure (finish s pipe (.rowDescription columns))
-    | .describePortal, .start => pure (finish s pipe (.rowDescription columns))
-    | .simpleQuery, .start => pure (progressTo s pipe op (.rows (some columns.size))
-        (.rowDescription columns))
-    | _, _ => throw (.protocol "unexpected RowDescription")
+    match pipe.current with
+    | none => throw (.protocol "unsolicited RowDescription")
+    | some op =>
+      match op.kind, op.progress with
+      | .describeStatement, .descParams => pure (finish s pipe (.rowDescription columns))
+      | .describePortal, .start => pure (finish s pipe (.rowDescription columns))
+      | .simpleQuery, .start => pure (progressTo s pipe op (.rows (some columns.size))
+          (.rowDescription columns))
+      | _, _ => throw (.protocol "unexpected RowDescription")
   | .noData =>
-    let some op := pipe.current | throw (.protocol "unsolicited NoData")
-    match op.kind, op.progress with
-    | .describeStatement, .descParams => pure (finish s pipe .noData)
-    | .describePortal, .start => pure (finish s pipe .noData)
-    | _, _ => throw (.protocol "unexpected NoData")
+    match pipe.current with
+    | none => throw (.protocol "unsolicited NoData")
+    | some op =>
+      match op.kind, op.progress with
+      | .describeStatement, .descParams => pure (finish s pipe .noData)
+      | .describePortal, .start => pure (finish s pipe .noData)
+      | _, _ => throw (.protocol "unexpected NoData")
   | .dataRow columns =>
-    let some op := pipe.current | throw (.protocol "unsolicited DataRow")
-    match op.kind, op.progress with
-    | .execute, .start => pure (progressTo s pipe op (.rows none) (.dataRow columns))
-    | .execute, .rows _ =>
-      pure (withPipe s pipe, #[.dataRow columns], ByteArray.empty)
-    | .simpleQuery, .rows cols =>
-      if let some n := cols then
-        unless columns.size == n do
-          throw (.protocol s!"DataRow arity {columns.size}, RowDescription said {n}")
-      pure (withPipe s pipe, #[.dataRow columns], ByteArray.empty)
-    | _, _ => throw (.protocol "DataRow without a RowDescription/Execute context")
+    match pipe.current with
+    | none => throw (.protocol "unsolicited DataRow")
+    | some op =>
+      match op.kind, op.progress with
+      | .execute, .start => pure (progressTo s pipe op (.rows none) (.dataRow columns))
+      | .execute, .rows _ =>
+        pure (withPipe s pipe, #[.dataRow columns], ByteArray.empty)
+      | .simpleQuery, .rows cols =>
+        match cols with
+        | some n =>
+          if columns.size == n then
+            pure (withPipe s pipe, #[.dataRow columns], ByteArray.empty)
+          else
+            throw (.protocol s!"DataRow arity {columns.size}, RowDescription said {n}")
+        | none => pure (withPipe s pipe, #[.dataRow columns], ByteArray.empty)
+      | _, _ => throw (.protocol "DataRow without a RowDescription/Execute context")
   | .commandComplete tag =>
-    let some op := pipe.current | throw (.protocol "unsolicited CommandComplete")
-    match op.kind with
-    | .execute => pure (finish s pipe (.commandComplete tag))
-    | .simpleQuery =>
-      -- statement finished; more statements may follow until ReadyForQuery
-      pure (progressTo s pipe op .start (.commandComplete tag))
-    | _ => throw (.protocol "unexpected CommandComplete")
+    match pipe.current with
+    | none => throw (.protocol "unsolicited CommandComplete")
+    | some op =>
+      match op.kind with
+      | .execute => pure (finish s pipe (.commandComplete tag))
+      | .simpleQuery =>
+        -- statement finished; more statements may follow until ReadyForQuery
+        pure (progressTo s pipe op .start (.commandComplete tag))
+      | _ => throw (.protocol "unexpected CommandComplete")
   | .emptyQueryResponse =>
-    let some op := pipe.current | throw (.protocol "unsolicited EmptyQueryResponse")
-    match op.kind with
-    | .execute => pure (finish s pipe .emptyQuery)
-    | .simpleQuery => pure (progressTo s pipe op .start .emptyQuery)
-    | _ => throw (.protocol "unexpected EmptyQueryResponse")
+    match pipe.current with
+    | none => throw (.protocol "unsolicited EmptyQueryResponse")
+    | some op =>
+      match op.kind with
+      | .execute => pure (finish s pipe .emptyQuery)
+      | .simpleQuery => pure (progressTo s pipe op .start .emptyQuery)
+      | _ => throw (.protocol "unexpected EmptyQueryResponse")
   | .portalSuspended =>
-    let some op := pipe.current | throw (.protocol "unsolicited PortalSuspended")
-    unless op.kind == .execute do throw (.protocol "unexpected PortalSuspended")
-    pure (finish s pipe .portalSuspended)
+    match pipe.current with
+    | none => throw (.protocol "unsolicited PortalSuspended")
+    | some op =>
+      if op.kind == .execute then
+        pure (finish s pipe .portalSuspended)
+      else
+        throw (.protocol "unexpected PortalSuspended")
   | .copyInResponse overall formats =>
-    let some op := pipe.current | throw (.protocol "unsolicited CopyInResponse")
-    unless (op.kind == .execute || op.kind == .simpleQuery) && op.progress == .start do
-      throw (.protocol "unexpected CopyInResponse")
-    -- Frontend messages already pipelined behind this op would be consumed as
-    -- COPY data by the backend — unrecoverable (a trailing Sync is harmless).
-    unless pipe.queued.all (· == OpKind.sync) && pipe.queued.size ≤ 1 do
-      throw (.protocol "COPY started with operations pipelined behind it")
-    let info : CopyInfo := { binary := overall == 1, columnFormats := formats }
-    pure (progressTo s pipe op (.copyIn info false) (.copyInStarted info))
+    match pipe.current with
+    | none => throw (.protocol "unsolicited CopyInResponse")
+    | some op =>
+      if (op.kind == .execute || op.kind == .simpleQuery) && op.progress == .start then
+        -- Frontend messages already pipelined behind this op would be consumed
+        -- as COPY data by the backend — unrecoverable (a trailing Sync is
+        -- harmless).
+        if pipe.queued.all (· == OpKind.sync) && pipe.queued.size ≤ 1 then
+          let info : CopyInfo := { binary := overall == 1, columnFormats := formats }
+          pure (progressTo s pipe op (.copyIn info false) (.copyInStarted info))
+        else
+          throw (.protocol "COPY started with operations pipelined behind it")
+      else
+        throw (.protocol "unexpected CopyInResponse")
   | .copyOutResponse overall formats =>
-    let some op := pipe.current | throw (.protocol "unsolicited CopyOutResponse")
-    unless (op.kind == .execute || op.kind == .simpleQuery) && op.progress == .start do
-      throw (.protocol "unexpected CopyOutResponse")
-    unless pipe.queued.all (· == OpKind.sync) && pipe.queued.size ≤ 1 do
-      throw (.protocol "COPY started with operations pipelined behind it")
-    let info : CopyInfo := { binary := overall == 1, columnFormats := formats }
-    pure (progressTo s pipe op (.copyOut info) (.copyOutStarted info))
+    match pipe.current with
+    | none => throw (.protocol "unsolicited CopyOutResponse")
+    | some op =>
+      if (op.kind == .execute || op.kind == .simpleQuery) && op.progress == .start then
+        if pipe.queued.all (· == OpKind.sync) && pipe.queued.size ≤ 1 then
+          let info : CopyInfo := { binary := overall == 1, columnFormats := formats }
+          pure (progressTo s pipe op (.copyOut info) (.copyOutStarted info))
+        else
+          throw (.protocol "COPY started with operations pipelined behind it")
+      else
+        throw (.protocol "unexpected CopyOutResponse")
   | .copyData data =>
-    let some op := pipe.current | throw (.protocol "unsolicited CopyData")
-    match op.progress with
-    | .copyOut _ => pure (withPipe s pipe, #[.copyData data], ByteArray.empty)
-    | _ => throw (.protocol "CopyData outside COPY OUT")
+    match pipe.current with
+    | none => throw (.protocol "unsolicited CopyData")
+    | some op =>
+      match op.progress with
+      | .copyOut _ => pure (withPipe s pipe, #[.copyData data], ByteArray.empty)
+      | _ => throw (.protocol "CopyData outside COPY OUT")
   | .copyDone =>
-    let some op := pipe.current | throw (.protocol "unsolicited CopyDone")
-    match op.progress with
-    | .copyOut _ => pure (progressTo s pipe op .start .copyOutDone)
-    | _ => throw (.protocol "CopyDone outside COPY OUT")
+    match pipe.current with
+    | none => throw (.protocol "unsolicited CopyDone")
+    | some op =>
+      match op.progress with
+      | .copyOut _ => pure (progressTo s pipe op .start .copyOutDone)
+      | _ => throw (.protocol "CopyDone outside COPY OUT")
   | .copyBothResponse .. => throw (.protocol "CopyBothResponse (replication) not supported")
   | .functionCallResponse _ => throw (.protocol "FunctionCallResponse not supported")
   | .auth _ => throw (.protocol "authentication request after startup")
@@ -563,44 +619,46 @@ private def stepRunning (s : State) (pipe : Pipeline) (m : BackendMsg) :
 /-- Advance on one framed backend message. On `.ok (s', events, out)`: events
 in wire order, `out` = protocol-driven bytes to write (auth responses; empty
 after startup). On `.error`: the connection is poisoned — close the socket. -/
-def step (s : State) (msg : RawMessage) : Except PgError (State × Array Event × ByteArray) := do
+def step (s : State) (msg : RawMessage) : Except PgError (State × Array Event × ByteArray) :=
   if s.phase matches .closed then
     throw (.protocol "message received after Terminate")
-  let m ← match Backend.decode msg with
-    | .ok m => pure m
+  else
+    match Backend.decode msg with
     | .error e => throw (.decode e)
-  -- async messages are valid in every phase
-  match m with
-  | .noticeResponse fields => pure (s, #[.notice fields], ByteArray.empty)
-  | .parameterStatus name value =>
-    pure ({ s with params := upsert s.params name value },
-      #[.parameterStatus name value], ByteArray.empty)
-  | .notificationResponse pid channel payload =>
-    pure (s, #[.notification pid channel payload], ByteArray.empty)
-  | _ =>
-    match s.phase with
-    | .startup auth => stepStartup s auth m
-    | .running pipe => stepRunning s pipe m
-    | .closed => throw (.protocol "unreachable")
+    | .ok m =>
+      -- async messages are valid in every phase
+      match m with
+      | .noticeResponse fields => pure (s, #[.notice fields], ByteArray.empty)
+      | .parameterStatus name value =>
+        pure ({ s with params := upsert s.params name value },
+          #[.parameterStatus name value], ByteArray.empty)
+      | .notificationResponse pid channel payload =>
+        pure (s, #[.notification pid channel payload], ByteArray.empty)
+      | _ =>
+        match s.phase with
+        | .startup auth => stepStartup s auth m
+        | .running pipe => stepRunning s pipe m
+        | .closed => throw (.protocol "unreachable")
 
 /-- `step` each frame in order, accumulating events and output bytes. -/
 private def runSteps (s : State) (msgs : List RawMessage) (events : Array Event)
     (out : ByteArray) : Except PgError (State × Array Event × ByteArray) :=
   match msgs with
   | [] => pure (s, events, out)
-  | m :: rest => do
-    let (s', evs, bytes) ← step s m
-    runSteps s' rest (events ++ evs) (out ++ bytes)
+  | m :: rest =>
+    match step s m with
+    | .error e => .error e
+    | .ok (s', evs, bytes) => runSteps s' rest (events ++ evs) (out ++ bytes)
 
 /-- Shell entry point: buffer a TCP chunk, then `step` each completed frame.
 Feeding byte-at-a-time is semantically identical to feeding whole — the
 fragmentation-torture hook. -/
-def feed (s : State) (chunk : ByteArray) : Except PgError (State × Array Event × ByteArray) := do
-  let fed ← match s.decode.feed chunk with
-    | .ok st => pure st
-    | .error e => throw (.decode e)
-  let (msgs, decode) := fed.take
-  runSteps { s with decode } msgs.toList #[] ByteArray.empty
+def feed (s : State) (chunk : ByteArray) : Except PgError (State × Array Event × ByteArray) :=
+  match s.decode.feed chunk with
+  | .error e => throw (.decode e)
+  | .ok fed =>
+    let (msgs, decode) := fed.take
+    runSteps { s with decode } msgs.toList #[] ByteArray.empty
 
 /-- Queue an op behind the pipeline. -/
 private def enqueue (pipe : Pipeline) (kind : OpKind) : Pipeline :=
@@ -1011,6 +1069,296 @@ theorem submit_error_rejection {s : State} {req : Request} {e : PgError}
       | (cases h <;> first
           | exact Or.inl rfl
           | exact Or.inr ⟨_, rfl⟩)
+
+private theorem aborted_false_of_current {pipe : Pipeline} (hwf : pipe.WellFormed)
+    {op : CurrentOp} (hcur : pipe.current = some op) : pipe.aborted = false := by
+  cases hab : pipe.aborted
+  · rfl
+  · exact absurd (hwf.1 hab).1 (by simp [hcur])
+
+/-- Queue restriction the invariant demands while a fresh COPY IN is open. -/
+private def CopyGate (pipe : Pipeline) (p : Progress) : Prop :=
+  match p with
+  | .copyIn _ false =>
+    pipe.queued.all (· == OpKind.sync) = true ∧ pipe.queued.size ≤ 1
+  | _ => True
+
+/-- The updated head op stays coherent, so replacing its progress keeps the
+pipeline well-formed. -/
+private theorem progressTo_wf {pipe : Pipeline} (hwf : pipe.WellFormed)
+    {op : CurrentOp} (hcur : pipe.current = some op) {p : Progress}
+    (hcoh : CurrentOp.Coherent { op with progress := p })
+    (hgate : CopyGate pipe p) :
+    ({ pipe with current := some { op with progress := p } } : Pipeline).WellFormed := by
+  refine ⟨(fun habt => absurd (hwf.1 habt).1 (by simp [hcur])), (fun hh => nomatch hh), ?_⟩
+  exact ⟨hcoh, hgate⟩
+
+private theorem opKind_eq_of_beq {a b : OpKind} (h : (a == b) = true) : a = b := by
+  cases a <;> cases b <;> first | rfl | exact absurd h (by decide)
+
+private theorem stepRunning_wf {s : State} {pipe : Pipeline} {m : BackendMsg}
+    (hphase : s.phase = .running pipe) (hwf : pipe.WellFormed) :
+    ∀ {s' : State} {evs : Array Event} {out : ByteArray},
+      stepRunning s pipe m = .ok (s', evs, out) → s'.WellFormed := by
+  fun_cases stepRunning s pipe m <;> intro s' evs out h <;> cases h
+  case case1 =>
+    exact wf_of_phase_running hphase hwf
+  case case3 =>
+    rename_i fields op hcur hsimple
+    show Pipeline.WellFormed _
+    refine progressTo_wf hwf hcur ?_ True.intro
+    show op.kind = .sync ∨ op.kind = .simpleQuery
+    exact Or.inr (opKind_eq_of_beq (by simpa [isSimple] using hsimple))
+  case case4 =>
+    rename_i fields op hcur hnotsimple hsync
+    show Pipeline.WellFormed _
+    refine progressTo_wf hwf hcur ?_ True.intro
+    show op.kind = .sync ∨ op.kind = .simpleQuery
+    exact Or.inl (opKind_eq_of_beq hsync)
+  case case5 =>
+    rename_i fields op hcur hnotsimple hnotsync
+    show Pipeline.WellFormed (abortToSync pipe)
+    exact abortToSync_wf (aborted_false_of_current hwf hcur)
+  case case6 =>
+    rename_i tx op hcur hkind
+    show Pipeline.WellFormed (advance pipe)
+    exact advance_wf (aborted_false_of_current hwf hcur)
+  case case10 =>
+    rename_i op hcur hguard
+    show Pipeline.WellFormed (advance pipe)
+    exact advance_wf (aborted_false_of_current hwf hcur)
+  case case13 =>
+    rename_i op hcur hguard
+    show Pipeline.WellFormed (advance pipe)
+    exact advance_wf (aborted_false_of_current hwf hcur)
+  case case16 =>
+    rename_i op hcur hguard
+    show Pipeline.WellFormed (advance pipe)
+    exact advance_wf (aborted_false_of_current hwf hcur)
+  case case19 =>
+    rename_i oids op hcur hguard
+    show Pipeline.WellFormed _
+    refine progressTo_wf hwf hcur ?_ True.intro
+    show op.kind = .describeStatement
+    exact opKind_eq_of_beq (by
+      simp only [Bool.and_eq_true] at hguard
+      exact hguard.1)
+  case case22 =>
+    rename_i columns op hcur hprog hkind
+    show Pipeline.WellFormed (advance pipe)
+    exact advance_wf (aborted_false_of_current hwf hcur)
+  case case23 =>
+    rename_i columns op hcur hprog hkind
+    show Pipeline.WellFormed (advance pipe)
+    exact advance_wf (aborted_false_of_current hwf hcur)
+  case case24 =>
+    rename_i columns op hcur hprog hkind
+    show Pipeline.WellFormed _
+    refine progressTo_wf hwf hcur ?_ True.intro
+    show op.kind = .simpleQuery
+    exact hkind
+  case case27 =>
+    rename_i op hcur hprog hkind
+    show Pipeline.WellFormed (advance pipe)
+    exact advance_wf (aborted_false_of_current hwf hcur)
+  case case28 =>
+    rename_i op hcur hprog hkind
+    show Pipeline.WellFormed (advance pipe)
+    exact advance_wf (aborted_false_of_current hwf hcur)
+  case case31 =>
+    rename_i columns op hcur hprog hkind
+    show Pipeline.WellFormed _
+    refine progressTo_wf hwf hcur ?_ True.intro
+    show op.kind = .execute
+    exact hkind
+  case case32 =>
+    rename_i columns op hcur cols hprog hkind
+    show Pipeline.WellFormed pipe
+    exact hwf
+  case case33 =>
+    rename_i columns op hcur hkind n hsize hprog
+    show Pipeline.WellFormed pipe
+    exact hwf
+  case case35 =>
+    rename_i columns op hcur hkind hprog
+    show Pipeline.WellFormed pipe
+    exact hwf
+  case case38 =>
+    rename_i tag op hcur hkind
+    show Pipeline.WellFormed (advance pipe)
+    exact advance_wf (aborted_false_of_current hwf hcur)
+  case case39 =>
+    rename_i tag op hcur hkind
+    show Pipeline.WellFormed _
+    exact progressTo_wf hwf hcur True.intro True.intro
+  case case42 =>
+    rename_i op hcur hkind
+    show Pipeline.WellFormed (advance pipe)
+    exact advance_wf (aborted_false_of_current hwf hcur)
+  case case43 =>
+    rename_i op hcur hkind
+    show Pipeline.WellFormed _
+    exact progressTo_wf hwf hcur True.intro True.intro
+  case case46 =>
+    rename_i op hcur hguard
+    show Pipeline.WellFormed (advance pipe)
+    exact advance_wf (aborted_false_of_current hwf hcur)
+  case case49 =>
+    rename_i overall formats op hcur hguard hqueue info
+    show Pipeline.WellFormed _
+    refine progressTo_wf hwf hcur ?_ ?_
+    · show op.kind = .execute ∨ op.kind = .simpleQuery
+      simp only [Bool.and_eq_true, Bool.or_eq_true] at hguard
+      exact hguard.1.imp opKind_eq_of_beq opKind_eq_of_beq
+    · show pipe.queued.all (· == OpKind.sync) = true ∧ pipe.queued.size ≤ 1
+      simp only [Bool.and_eq_true, decide_eq_true_eq] at hqueue
+      exact hqueue
+  case case53 =>
+    rename_i overall formats op hcur hguard hqueue info
+    show Pipeline.WellFormed _
+    refine progressTo_wf hwf hcur ?_ True.intro
+    show op.kind = .execute ∨ op.kind = .simpleQuery
+    simp only [Bool.and_eq_true, Bool.or_eq_true] at hguard
+    exact hguard.1.imp opKind_eq_of_beq opKind_eq_of_beq
+  case case57 =>
+    rename_i data op hcur info hprog
+    show Pipeline.WellFormed pipe
+    exact hwf
+  case case60 =>
+    rename_i op hcur info hprog
+    show Pipeline.WellFormed _
+    exact progressTo_wf hwf hcur True.intro True.intro
+
+/-- The SCRAM-mechanism record the startup invariant tracks. -/
+private def StartupMech (s : State) (auth : AuthState) : Prop :=
+  match auth with
+  | .scram _ => s.negotiatedSaslMechanism.isSome = true
+  | _ => True
+
+private theorem startup_parts {s : State} {auth : AuthState}
+    (hphase : s.phase = .startup auth) (hwf : s.WellFormed) :
+    s.txStatus = .idle ∧ StartupMech s auth := by
+  unfold State.WellFormed at hwf
+  rw [hphase] at hwf
+  exact hwf
+
+private theorem stepStartup_wf {s : State} {auth : AuthState} {m : BackendMsg}
+    (hphase : s.phase = .startup auth) (hwf : s.WellFormed) :
+    ∀ {s' : State} {evs : Array Event} {out : ByteArray},
+      stepStartup s auth m = .ok (s', evs, out) → s'.WellFormed := by
+  fun_cases stepStartup s auth m <;> intro s' evs out h <;> cases h
+  case case2 => exact ⟨(startup_parts hphase hwf).1, True.intro⟩
+  case case3 => exact ⟨(startup_parts hphase hwf).1, True.intro⟩
+  case case4 => exact ⟨(startup_parts hphase hwf).1, True.intro⟩
+  case case5 => exact ⟨(startup_parts hphase hwf).1, True.intro⟩
+  case case8 => exact ⟨(startup_parts hphase hwf).1, True.intro⟩
+  case case10 => exact ⟨(startup_parts hphase hwf).1, True.intro⟩
+  case case14 => exact ⟨(startup_parts hphase hwf).1, rfl⟩
+  case case16 => exact ⟨(startup_parts hphase hwf).1, (startup_parts hphase hwf).2⟩
+  case case19 => exact ⟨(startup_parts hphase hwf).1, True.intro⟩
+  case case28 => exact hwf
+  case case30 => exact hwf
+  case case31 => exact hwf
+  case case32 => exact hwf
+  case case33 => exact hwf
+  case case36 => exact emptyPipeline_wf
+
+/-- `step` preserves well-formedness on every accepted backend message. -/
+theorem step_wellFormed {s : State} {msg : RawMessage} {s' : State}
+    {evs : Array Event} {out : ByteArray}
+    (hwf : s.WellFormed) (h : step s msg = .ok (s', evs, out)) : s'.WellFormed := by
+  revert h
+  fun_cases step s msg
+  case case3 => intro h; cases h; exact hwf
+  case case4 => intro h; cases h; exact hwf
+  case case5 => intro h; cases h; exact hwf
+  case case6 =>
+    rename_i m hdec auth hph hn1 hn2 hn3
+    intro h
+    exact stepStartup_wf hph hwf h
+  case case7 =>
+    rename_i m hdec pipe hph hn1 hn2 hn3
+    intro h
+    exact stepRunning_wf hph (pipe_wf_of_running hph hwf) h
+  all_goals (intro h; cases h)
+
+private theorem runSteps_wf :
+    ∀ {msgs : List RawMessage} {s : State} {events : Array Event} {out : ByteArray}
+      {r : State × Array Event × ByteArray},
+      s.WellFormed → runSteps s msgs events out = .ok r → r.1.WellFormed := by
+  intro msgs
+  induction msgs with
+  | nil =>
+    intro s events out r hwf h
+    cases h
+    exact hwf
+  | cons m rest ih =>
+    intro s events out r hwf h
+    unfold runSteps at h
+    cases hst : step s m with
+    | error e =>
+      rw [hst] at h
+      cases h
+    | ok res =>
+      obtain ⟨s1, evs1, b1⟩ := res
+      rw [hst] at h
+      exact ih (step_wellFormed hwf hst) h
+
+/-- `feed` preserves well-formedness across a whole chunk of frames. -/
+theorem feed_wellFormed {s : State} {chunk : ByteArray} {s' : State}
+    {evs : Array Event} {out : ByteArray}
+    (hwf : s.WellFormed) (h : feed s chunk = .ok (s', evs, out)) : s'.WellFormed := by
+  unfold feed at h
+  split at h
+  · cases h
+  · split at h
+    rename_i fed hd msgs decode htake
+    exact runSteps_wf (s := { s with decode := decode }) (r := (s', evs, out)) hwf h
+
+/-- Async messages (NoticeResponse / ParameterStatus / NotificationResponse)
+never advance the pending pipeline: the phase — including the whole op queue
+— is untouched, and no protocol bytes are emitted. -/
+theorem step_async_preserves_pipeline {s : State} {msg : RawMessage}
+    {m : BackendMsg} {s' : State} {evs : Array Event} {out : ByteArray}
+    (hdec : Backend.decode msg = .ok m)
+    (hasync : (m matches .noticeResponse _ | .parameterStatus .. |
+      .notificationResponse ..) = true)
+    (h : step s msg = .ok (s', evs, out)) :
+    s'.phase = s.phase ∧ out = ByteArray.empty := by
+  revert h
+  fun_cases step s msg
+  case case1 => intro h; cases h
+  case case2 =>
+    rename_i e hdec'
+    rw [hdec] at hdec'
+    cases hdec'
+  case case3 => intro h; cases h; exact ⟨rfl, rfl⟩
+  case case4 => intro h; cases h; exact ⟨rfl, rfl⟩
+  case case5 => intro h; cases h; exact ⟨rfl, rfl⟩
+  case case6 =>
+    rename_i m' hdec' auth hph hn1 hn2 hn3
+    rw [hdec] at hdec'
+    injection hdec' with hm
+    subst hm
+    cases m
+    case noticeResponse fields => exact absurd rfl (hn1 fields)
+    case parameterStatus name value => exact absurd rfl (hn2 name value)
+    case notificationResponse pid ch pl => exact absurd rfl (hn3 pid ch pl)
+    all_goals exact nomatch hasync
+  case case7 =>
+    rename_i m' hdec' pipe hph hn1 hn2 hn3
+    rw [hdec] at hdec'
+    injection hdec' with hm
+    subst hm
+    cases m
+    case noticeResponse fields => exact absurd rfl (hn1 fields)
+    case parameterStatus name value => exact absurd rfl (hn2 name value)
+    case notificationResponse pid ch pl => exact absurd rfl (hn3 pid ch pl)
+    all_goals exact nomatch hasync
+  case case8 =>
+    rename_i m' hdec' hph hn1 hn2 hn3
+    intro h
+    cases h
 
 end Machine
 end Protocol
