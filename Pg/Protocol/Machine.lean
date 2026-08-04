@@ -2637,6 +2637,251 @@ theorem submit_fifo {s : State} {pipe : Pipeline} {req : Request} {s' : State}
     exact submitRunning_fifo hph hwf h
   all_goals (intro h; cases h)
 
+/-!
+### Startup-phase refinement
+
+The running phase's refinement (above) says every reply is attributed to the
+right pending operation. Its startup-phase counterpart is *message ordering*:
+the authentication exchange has no pipeline, so what has to be pinned down is
+that the sub-phase only ever moves along one of PostgreSQL's documented
+sequences — trust, cleartext, md5, or SCRAM — and that the connection becomes
+usable only through the first ReadyForQuery, with an empty pipeline.
+
+`AuthStep` is that transition relation and `AuthReach` its reflexive-transitive
+closure. `stepStartup_order` / `step_startup_order` / `runSteps_startup_order`
+prove the machine refines it on every accepted message, batch included.
+`authStep_stage_le` says the exchange never runs backwards, `authStep_scram`
+that SCRAM's server signature can never be skipped, and `startup_ready` that a
+completed startup lands in `running` with an empty correlation FIFO.
+-/
+
+/-- How far the authentication exchange has got, as the protocol orders it:
+0 = no AuthenticationRequest seen yet, 1 = a challenge has been answered
+(cleartext, md5, or a SCRAM message in flight), 2 = SCRAM's server signature
+verified, 3 = AuthenticationOk seen, draining to the first ReadyForQuery. -/
+def AuthState.stage : AuthState → Nat
+  | .awaitingRequest => 0
+  | .sentCleartext => 1
+  | .sentMd5 => 1
+  | .scram _ => 1
+  | .saslDone => 2
+  | .awaitingReady => 3
+
+/-- The startup transitions PostgreSQL documents, one per accepted backend
+message. `same` covers the messages that carry no authentication progress
+(BackendKeyData, NegotiateProtocolVersion, and the async messages `step`
+filters out before this phase is reached). -/
+inductive AuthStep : AuthState → AuthState → Prop where
+  | same (a : AuthState) : AuthStep a a
+  /-- `trust`/`peer`: AuthenticationOk with no challenge at all. -/
+  | trust : AuthStep .awaitingRequest .awaitingReady
+  | cleartext : AuthStep .awaitingRequest .sentCleartext
+  | md5 : AuthStep .awaitingRequest .sentMd5
+  | saslStart (c : Sasl.Scram.Client) : AuthStep .awaitingRequest (.scram c)
+  | saslContinue (c c' : Sasl.Scram.Client) : AuthStep (.scram c) (.scram c')
+  /-- SASLFinal, and only after the server signature verified. -/
+  | saslFinal (c : Sasl.Scram.Client) : AuthStep (.scram c) .saslDone
+  /-- AuthenticationOk closing a challenge that was answered. -/
+  | challengeOk (a : AuthState)
+      (h : a = .sentCleartext ∨ a = .sentMd5 ∨ a = .saslDone) :
+      AuthStep a .awaitingReady
+
+/-- Reflexive-transitive closure of `AuthStep`: the sub-phases a startup can
+reach over a whole batch of frames. -/
+inductive AuthReach : AuthState → AuthState → Prop where
+  | refl (a : AuthState) : AuthReach a a
+  | tail {a b c : AuthState} : AuthReach a b → AuthStep b c → AuthReach a c
+
+/-- The exchange never runs backwards. -/
+theorem authStep_stage_le {a b : AuthState} (h : AuthStep a b) : a.stage ≤ b.stage := by
+  cases h with
+  | same => exact Nat.le_refl _
+  | trust => exact (by decide)
+  | cleartext => exact (by decide)
+  | md5 => exact (by decide)
+  | saslStart => exact Nat.zero_le _
+  | saslContinue => exact Nat.le_refl _
+  | saslFinal => exact Nat.le_succ 1
+  | challengeOk a h => rcases h with rfl | rfl | rfl <;> exact (by decide)
+
+theorem AuthReach.head {a b c : AuthState} (h : AuthStep a b) (t : AuthReach b c) :
+    AuthReach a c := by
+  induction t with
+  | refl => exact .tail (.refl a) h
+  | tail _ hs ih => exact .tail ih hs
+
+theorem authReach_stage_le {a b : AuthState} (h : AuthReach a b) : a.stage ≤ b.stage := by
+  induction h with
+  | refl => exact Nat.le_refl _
+  | tail _ hs ih => exact Nat.le_trans ih (authStep_stage_le hs)
+
+/-- **The server signature is never skipped**: once a SCRAM exchange is in
+flight the only accepted moves are another SCRAM message or SASLFinal, so
+`saslDone` — the state in which `Sasl.Scram.verifyServerFinal` has succeeded —
+is the only route from SCRAM to `AuthenticationOk`. -/
+theorem authStep_scram {c : Sasl.Scram.Client} {a : AuthState}
+    (h : AuthStep (.scram c) a) : (∃ c', a = .scram c') ∨ a = .saslDone := by
+  cases h with
+  | same => exact Or.inl ⟨c, rfl⟩
+  | saslContinue _ c' => exact Or.inl ⟨c', rfl⟩
+  | saslFinal => exact Or.inr rfl
+  | challengeOk _ h => rcases h with h | h | h <;> cases h
+
+/-- AuthenticationOk is only ever accepted from a sub-phase that answered the
+server's challenge (or from `awaitingRequest`, i.e. `trust`). -/
+theorem authStep_awaitingReady {a : AuthState} (h : AuthStep a .awaitingReady) :
+    a = .awaitingRequest ∨ a = .sentCleartext ∨ a = .sentMd5 ∨ a = .saslDone ∨
+      a = .awaitingReady := by
+  cases h with
+  | same => exact Or.inr (Or.inr (Or.inr (Or.inr rfl)))
+  | trust => exact Or.inl rfl
+  | challengeOk a h =>
+    rcases h with rfl | rfl | rfl
+    · exact Or.inr (Or.inl rfl)
+    · exact Or.inr (Or.inr (Or.inl rfl))
+    · exact Or.inr (Or.inr (Or.inr (Or.inl rfl)))
+
+private theorem stepRunning_phase {s : State} {pipe : Pipeline} {m : BackendMsg}
+    (hph : s.phase = .running pipe) :
+    ∀ {s' : State} {evs : Array Event} {out : ByteArray},
+      stepRunning s pipe m = .ok (s', evs, out) → ∃ pipe', s'.phase = .running pipe' := by
+  fun_cases stepRunning s pipe m <;> intro s' evs out h <;> cases h <;>
+    first | exact ⟨_, rfl⟩ | exact ⟨pipe, hph⟩
+
+private theorem step_phase_running {s : State} {pipe : Pipeline} {msg : RawMessage}
+    {s' : State} {evs : Array Event} {out : ByteArray}
+    (hph : s.phase = .running pipe) (h : step s msg = .ok (s', evs, out)) :
+    ∃ pipe', s'.phase = .running pipe' := by
+  revert h
+  fun_cases step s msg
+  case case3 => intro h; cases h; exact ⟨pipe, hph⟩
+  case case4 => intro h; cases h; exact ⟨pipe, hph⟩
+  case case5 => intro h; cases h; exact ⟨pipe, hph⟩
+  case case6 =>
+    rename_i m hdec auth hph2 hn1 hn2 hn3
+    rw [hph] at hph2
+    cases hph2
+  case case7 =>
+    rename_i m hdec pipe2 hph2 hn1 hn2 hn3
+    rw [hph] at hph2
+    injection hph2 with hp
+    subst hp
+    intro h
+    exact stepRunning_phase hph h
+  all_goals (intro h; cases h)
+
+private theorem runSteps_phase_running :
+    ∀ {msgs : List RawMessage} {s : State} {pipe : Pipeline} {events : Array Event}
+      {out : ByteArray} {r : State × Array Event × ByteArray},
+      s.phase = .running pipe → runSteps s msgs events out = .ok r →
+      ∃ pipe', r.1.phase = .running pipe' := by
+  intro msgs
+  induction msgs with
+  | nil => intro s pipe events out r hph h; cases h; exact ⟨pipe, hph⟩
+  | cons m rest ih =>
+    intro s pipe events out r hph h
+    unfold runSteps at h
+    cases hst : step s m with
+    | error e => rw [hst] at h; cases h
+    | ok res =>
+      obtain ⟨s1, evs1, b1⟩ := res
+      rw [hst] at h
+      obtain ⟨pipe1, hph1⟩ := step_phase_running hph hst
+      exact ih hph1 h
+
+private theorem awaitingReady_of_matches {auth : AuthState}
+    (h : (auth matches AuthState.awaitingReady) = true) : auth = .awaitingReady := by
+  cases auth <;> first | rfl | cases h
+
+private theorem stepStartup_order {s : State} {auth : AuthState} {m : BackendMsg}
+    (hphase : s.phase = .startup auth) :
+    ∀ {s' : State} {evs : Array Event} {out : ByteArray},
+      stepStartup s auth m = .ok (s', evs, out) →
+      (∃ auth', s'.phase = .startup auth' ∧ AuthStep auth auth') ∨
+        (auth = .awaitingReady ∧ s'.phase = .running {}) := by
+  fun_cases stepStartup s auth m <;> intro s' evs out h <;> cases h <;>
+    first
+      | exact Or.inl ⟨_, rfl, .trust⟩
+      | exact Or.inl ⟨_, rfl, .cleartext⟩
+      | exact Or.inl ⟨_, rfl, .md5⟩
+      | exact Or.inl ⟨_, rfl, .saslStart _⟩
+      | exact Or.inl ⟨_, rfl, .saslContinue _ _⟩
+      | exact Or.inl ⟨_, rfl, .saslFinal _⟩
+      | exact Or.inl ⟨_, rfl, .challengeOk _ (Or.inl rfl)⟩
+      | exact Or.inl ⟨_, rfl, .challengeOk _ (Or.inr (Or.inl rfl))⟩
+      | exact Or.inl ⟨_, rfl, .challengeOk _ (Or.inr (Or.inr rfl))⟩
+      | exact Or.inr ⟨awaitingReady_of_matches ‹_›, rfl⟩
+      | exact Or.inl ⟨auth, hphase, .same auth⟩
+
+/-- **Startup ordering, one message**: every backend message the startup phase
+accepts either advances the authentication exchange along `AuthStep`, or is the
+first ReadyForQuery, which can only arrive after AuthenticationOk. -/
+theorem step_startup_order {s : State} {auth : AuthState} {msg : RawMessage}
+    {s' : State} {evs : Array Event} {out : ByteArray}
+    (hph : s.phase = .startup auth) (h : step s msg = .ok (s', evs, out)) :
+    (∃ auth', s'.phase = .startup auth' ∧ AuthStep auth auth') ∨
+      (auth = .awaitingReady ∧ s'.phase = .running {}) := by
+  revert h
+  fun_cases step s msg
+  case case3 => intro h; cases h; exact Or.inl ⟨auth, hph, .same auth⟩
+  case case4 => intro h; cases h; exact Or.inl ⟨auth, hph, .same auth⟩
+  case case5 => intro h; cases h; exact Or.inl ⟨auth, hph, .same auth⟩
+  case case6 =>
+    rename_i m hdec auth2 hph2 hn1 hn2 hn3
+    rw [hph] at hph2
+    injection hph2 with ha
+    subst ha
+    intro h
+    exact stepStartup_order hph h
+  case case7 =>
+    rename_i m hdec pipe hph2 hn1 hn2 hn3
+    rw [hph] at hph2
+    cases hph2
+  all_goals (intro h; cases h)
+
+/-- **Startup completes exactly once**: the ReadyForQuery that ends startup is
+only accepted after AuthenticationOk, and it leaves the connection in the
+running phase with an empty pipeline — no operation is pending when the
+connection first becomes usable, so the correlation FIFO starts empty. -/
+theorem startup_ready {s : State} {auth : AuthState} {msg : RawMessage}
+    {s' : State} {evs : Array Event} {out : ByteArray}
+    (hph : s.phase = .startup auth) (h : step s msg = .ok (s', evs, out))
+    (hnot : ¬ ∃ auth', s'.phase = .startup auth') :
+    auth = .awaitingReady ∧ ∃ pipe, s'.phase = .running pipe ∧ pipe.pending = [] := by
+  rcases step_startup_order hph h with ⟨auth', hph', -⟩ | ⟨hready, hrun⟩
+  · exact absurd ⟨auth', hph'⟩ hnot
+  · exact ⟨hready, {}, hrun, rfl⟩
+
+/-- **Startup ordering, whole frame batch**: over any run of frames the
+sub-phase only ever moves along `AuthReach` — some chain of documented
+transitions — until the connection leaves startup for the running phase. -/
+theorem runSteps_startup_order :
+    ∀ {msgs : List RawMessage} {s : State} {auth : AuthState} {events : Array Event}
+      {out : ByteArray} {r : State × Array Event × ByteArray},
+      s.phase = .startup auth → runSteps s msgs events out = .ok r →
+      (∃ auth', r.1.phase = .startup auth' ∧ AuthReach auth auth') ∨
+        (∃ pipe, r.1.phase = .running pipe) := by
+  intro msgs
+  induction msgs with
+  | nil =>
+    intro s auth events out r hph h
+    cases h
+    exact Or.inl ⟨auth, hph, .refl auth⟩
+  | cons m rest ih =>
+    intro s auth events out r hph h
+    unfold runSteps at h
+    cases hst : step s m with
+    | error e => rw [hst] at h; cases h
+    | ok res =>
+      obtain ⟨s1, evs1, b1⟩ := res
+      rw [hst] at h
+      rcases step_startup_order hph hst with ⟨auth1, hph1, hstep⟩ | ⟨-, hrun⟩
+      · rcases ih hph1 h with ⟨auth2, hph2, hreach⟩ | hrest
+        · exact Or.inl ⟨auth2, hph2, AuthReach.head hstep hreach⟩
+        · exact Or.inr hrest
+      · exact Or.inr (runSteps_phase_running hrun h)
+
+
 end Machine
 end Protocol
 end Pg
