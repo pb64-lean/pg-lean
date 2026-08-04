@@ -306,6 +306,23 @@ def main : IO Unit := do
     "unknown channel_binding rejected"
   expect ((ConnectConfig.parseUri "http://u@h") matches .error _) "wrong scheme"
   expect ((ConnectConfig.parseUri "postgres://h") matches .error _) "missing user"
+  -- Percent-encoding is a proved inverse of percent-decoding
+  -- (`ConnectConfig.percentDecode_percentEncode`), non-ASCII included: the live
+  -- matrix connects as `pg-lean-läuft`.
+  for probe in #["pg-lean-läuft", "s@cr:et/pa?ss&wd=1%", "", "ok"] do
+    expect (ConnectConfig.percentDecode (ConnectConfig.percentEncode probe) == probe)
+      s!"percent-encoding roundtrip for {probe}"
+  match ConnectConfig.parseUri
+      (ConnectConfig.renderUri { user := "pg-lean-läuft", password := some "s@cr:et/1"
+                                 host := "db.example.com", port := 5433
+                                 database := some "orders/π" }) with
+  | .error e => throw (IO.userError s!"render/parse roundtrip: {e}")
+  | .ok cfg =>
+    expect (cfg.user == "pg-lean-läuft") "rendered URI user"
+    expect (cfg.password == some "s@cr:et/1") "rendered URI password"
+    expect (cfg.host == "db.example.com") "rendered URI host"
+    expect (cfg.port == 5433) "rendered URI port"
+    expect (cfg.database == some "orders/π") "rendered URI database"
 
   -- `require` without TLS fails before PostgreSQL startup, with a stable
   -- channel-binding-specific error.
