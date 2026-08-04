@@ -583,6 +583,15 @@ def step (s : State) (msg : RawMessage) : Except PgError (State × Array Event �
     | .running pipe => stepRunning s pipe m
     | .closed => throw (.protocol "unreachable")
 
+/-- `step` each frame in order, accumulating events and output bytes. -/
+private def runSteps (s : State) (msgs : List RawMessage) (events : Array Event)
+    (out : ByteArray) : Except PgError (State × Array Event × ByteArray) :=
+  match msgs with
+  | [] => pure (s, events, out)
+  | m :: rest => do
+    let (s', evs, bytes) ← step s m
+    runSteps s' rest (events ++ evs) (out ++ bytes)
+
 /-- Shell entry point: buffer a TCP chunk, then `step` each completed frame.
 Feeding byte-at-a-time is semantically identical to feeding whole — the
 fragmentation-torture hook. -/
@@ -591,15 +600,7 @@ def feed (s : State) (chunk : ByteArray) : Except PgError (State × Array Event 
     | .ok st => pure st
     | .error e => throw (.decode e)
   let (msgs, decode) := fed.take
-  let mut cur := { s with decode }
-  let mut events : Array Event := #[]
-  let mut out := ByteArray.empty
-  for m in msgs do
-    let (s', evs, bytes) ← step cur m
-    cur := s'
-    events := events ++ evs
-    out := out ++ bytes
-  pure (cur, events, out)
+  runSteps { s with decode } msgs.toList #[] ByteArray.empty
 
 /-- Queue an op behind the pipeline. -/
 private def enqueue (pipe : Pipeline) (kind : OpKind) : Pipeline :=
@@ -607,56 +608,58 @@ private def enqueue (pipe : Pipeline) (kind : OpKind) : Pipeline :=
   | none => { pipe with current := some { kind } }
   | some _ => { pipe with queued := pipe.queued.push kind }
 
-private def submitRunning (s : State) (pipe : Pipeline) (req : Request) :
-    Except PgError (State × ByteArray) := do
-  -- COPY IN reverses the data direction: only copy traffic may flow
-  if let some op := pipe.current then
-    if let .copyIn _ doneSent := op.progress then
-      if !doneSent then
-        match req with
-        | .copyData data => return (s, Frontend.copyData data)
-        | .copyDone =>
-          let pipe := { pipe with current := some { op with progress :=
-            match op.progress with
-            | .copyIn info _ => .copyIn info true
-            | p => p } }
-          return (withPipe s pipe, Frontend.copyDone)
-        | .copyFail reason =>
-          let pipe := { pipe with current := some { op with progress :=
-            match op.progress with
-            | .copyIn info _ => .copyIn info true
-            | p => p } }
-          return (withPipe s pipe, Frontend.copyFail reason)
-        | .flush => return (s, Frontend.flush)
-        | .terminate => return ({ s with phase := .closed }, encodeTerminate)
-        | _ => throw (.rejectedInvalid "COPY IN in progress")
+/-- Post-COPY-gate submission: the pipeline is not receiving COPY IN data. -/
+private def submitIdle (s : State) (pipe : Pipeline) (req : Request) :
+    Except PgError (State × ByteArray) :=
   if pipe.aborted then
     match req with
     | .sync =>
       let pipe := enqueue { pipe with aborted := false } .sync
-      return (withPipe s pipe, Frontend.sync)
-    | .terminate => return ({ s with phase := .closed }, encodeTerminate)
+      pure (withPipe s pipe, Frontend.sync)
+    | .terminate => pure ({ s with phase := .closed }, encodeTerminate)
     | _ => throw .rejectedAborted
-  match req with
-  | .simpleQuery sql => pure (withPipe s (enqueue pipe .simpleQuery), encodeQuery sql)
-  | .parse name sql oids => pure (withPipe s (enqueue pipe .parse), Frontend.parse name sql oids)
-  | .bind portal stmt pf ps rf =>
-    pure (withPipe s (enqueue pipe .bind), Frontend.bind portal stmt pf ps rf)
-  | .describeStatement name =>
-    pure (withPipe s (enqueue pipe .describeStatement), Frontend.describeStatement name)
-  | .describePortal name =>
-    pure (withPipe s (enqueue pipe .describePortal), Frontend.describePortal name)
-  | .execute portal maxRows =>
-    pure (withPipe s (enqueue pipe .execute), Frontend.execute portal maxRows)
-  | .closeStatement name =>
-    pure (withPipe s (enqueue pipe .close), Frontend.closeStatement name)
-  | .closePortal name =>
-    pure (withPipe s (enqueue pipe .close), Frontend.closePortal name)
-  | .flush => pure (s, Frontend.flush)
-  | .sync => pure (withPipe s (enqueue pipe .sync), Frontend.sync)
-  | .copyData _ | .copyDone | .copyFail _ =>
-    throw (.rejectedInvalid "no COPY IN in progress")
-  | .terminate => pure ({ s with phase := .closed }, encodeTerminate)
+  else
+    match req with
+    | .simpleQuery sql => pure (withPipe s (enqueue pipe .simpleQuery), encodeQuery sql)
+    | .parse name sql oids => pure (withPipe s (enqueue pipe .parse), Frontend.parse name sql oids)
+    | .bind portal stmt pf ps rf =>
+      pure (withPipe s (enqueue pipe .bind), Frontend.bind portal stmt pf ps rf)
+    | .describeStatement name =>
+      pure (withPipe s (enqueue pipe .describeStatement), Frontend.describeStatement name)
+    | .describePortal name =>
+      pure (withPipe s (enqueue pipe .describePortal), Frontend.describePortal name)
+    | .execute portal maxRows =>
+      pure (withPipe s (enqueue pipe .execute), Frontend.execute portal maxRows)
+    | .closeStatement name =>
+      pure (withPipe s (enqueue pipe .close), Frontend.closeStatement name)
+    | .closePortal name =>
+      pure (withPipe s (enqueue pipe .close), Frontend.closePortal name)
+    | .flush => pure (s, Frontend.flush)
+    | .sync => pure (withPipe s (enqueue pipe .sync), Frontend.sync)
+    | .copyData _ | .copyDone | .copyFail _ =>
+      throw (.rejectedInvalid "no COPY IN in progress")
+    | .terminate => pure ({ s with phase := .closed }, encodeTerminate)
+
+private def submitRunning (s : State) (pipe : Pipeline) (req : Request) :
+    Except PgError (State × ByteArray) :=
+  -- COPY IN reverses the data direction: only copy traffic may flow
+  match pipe.current with
+  | some op =>
+    match op.progress with
+    | .copyIn info false =>
+      match req with
+      | .copyData data => pure (s, Frontend.copyData data)
+      | .copyDone =>
+        let pipe := { pipe with current := some { op with progress := .copyIn info true } }
+        pure (withPipe s pipe, Frontend.copyDone)
+      | .copyFail reason =>
+        let pipe := { pipe with current := some { op with progress := .copyIn info true } }
+        pure (withPipe s pipe, Frontend.copyFail reason)
+      | .flush => pure (s, Frontend.flush)
+      | .terminate => pure ({ s with phase := .closed }, encodeTerminate)
+      | _ => throw (.rejectedInvalid "COPY IN in progress")
+    | _ => submitIdle s pipe req
+  | none => submitIdle s pipe req
 
 /-- User-initiated action. Failure is a rejection: state unchanged, connection
 healthy. Success returns bytes to write. -/
@@ -677,6 +680,337 @@ def submitAll (s : State) (reqs : Array Request) : Except PgError (State × Byte
     cur := s'
     out := out ++ bytes
   pure (cur, out)
+
+/-!
+### Machine invariant
+
+`State.WellFormed` captures the structural coherence the shell relies on:
+
+- **Phase coherence**: during startup the transaction status is still `idle`,
+  and once SCRAM has started a negotiated mechanism is recorded.
+- **Pending-queue coherence**: replies are only ever expected for the op at
+  the head of the pipeline (`current = none → queued = #[]`), and the head
+  op's reply progress matches its kind (a `descParams` head is a
+  describeStatement, a counted `rows` head is a simple query, ...).
+- **Error-drain/Sync-boundary coherence**: an aborted pipeline is fully
+  drained (`aborted → current = none ∧ queued = #[]`), and a `drainError`
+  head is exactly a Sync (extended protocol) or simple query — the two ops
+  whose ReadyForQuery ends recovery.
+- **COPY coherence**: while COPY IN is receiving data (`copyIn _ false`)
+  nothing beyond at most one trailing Sync is pipelined behind it.
+
+`submit` and `step` preserve it (`submit_wellFormed`, `step_wellFormed`,
+`feed_wellFormed`); a rejected submission returns no state at all and only
+rejection errors (`submit_error_rejection`), and async messages never touch
+the pipeline (`step_async_preserves_pipeline`).
+-/
+
+/-- The head op's reply progress is possible for its kind. -/
+def CurrentOp.Coherent (op : CurrentOp) : Prop :=
+  match op.progress with
+  | .start => True
+  | .descParams => op.kind = .describeStatement
+  | .rows (some _) => op.kind = .simpleQuery
+  | .rows none => op.kind = .execute
+  | .copyIn _ _ => op.kind = .execute ∨ op.kind = .simpleQuery
+  | .copyOut _ => op.kind = .execute ∨ op.kind = .simpleQuery
+  | .drainError => op.kind = .sync ∨ op.kind = .simpleQuery
+
+def Pipeline.WellFormed (pipe : Pipeline) : Prop :=
+  (pipe.aborted = true → pipe.current = none ∧ pipe.queued = #[]) ∧
+  (pipe.current = none → pipe.queued = #[]) ∧
+  (match pipe.current with
+   | none => True
+   | some op =>
+     op.Coherent ∧
+     (match op.progress with
+      | .copyIn _ false =>
+        pipe.queued.all (· == OpKind.sync) = true ∧ pipe.queued.size ≤ 1
+      | _ => True))
+
+def State.WellFormed (s : State) : Prop :=
+  match s.phase with
+  | .startup auth =>
+    s.txStatus = .idle ∧
+    (match auth with
+     | .scram _ => s.negotiatedSaslMechanism.isSome = true
+     | _ => True)
+  | .running pipe => pipe.WellFormed
+  | .closed => True
+
+theorem start_wellFormed (cfg : Config) : (start cfg).1.WellFormed := by
+  unfold start State.WellFormed
+  exact ⟨rfl, True.intro⟩
+
+private theorem emptyPipeline_wf : (({} : Pipeline)).WellFormed := by
+  unfold Pipeline.WellFormed
+  dsimp only
+  exact ⟨(fun h => nomatch h), (fun _ => rfl), True.intro⟩
+
+private theorem advance_wf {pipe : Pipeline} (hab : pipe.aborted = false) :
+    (advance pipe).WellFormed := by
+  unfold advance
+  split
+  · unfold Pipeline.WellFormed
+    dsimp only
+    exact ⟨(fun h => absurd h (by simp [hab])), (fun h => nomatch h), True.intro, True.intro⟩
+  · next hq =>
+    have hqe : pipe.queued = #[] := by
+      have hle := Array.getElem?_eq_none_iff.mp hq
+      exact Array.eq_empty_of_size_eq_zero (by omega)
+    unfold Pipeline.WellFormed
+    dsimp only
+    exact ⟨(fun _ => ⟨rfl, hqe⟩), (fun _ => hqe), True.intro⟩
+
+private theorem abortToSync_wf {pipe : Pipeline} (hab : pipe.aborted = false) :
+    (abortToSync pipe).WellFormed := by
+  unfold abortToSync
+  split
+  · unfold Pipeline.WellFormed
+    dsimp only
+    exact ⟨(fun h => absurd h (by simp [hab])), (fun h => nomatch h),
+      Or.inl rfl, True.intro⟩
+  · unfold Pipeline.WellFormed
+    dsimp only
+    exact ⟨(fun _ => ⟨rfl, rfl⟩), (fun _ => rfl), True.intro⟩
+
+private theorem enqueue_wf {pipe : Pipeline} (hwf : pipe.WellFormed)
+    (hab : pipe.aborted = false)
+    (hnocopy : ∀ op info, pipe.current = some op → op.progress ≠ .copyIn info false)
+    (kind : OpKind) : (enqueue pipe kind).WellFormed := by
+  obtain ⟨h1, h2, h3⟩ := hwf
+  unfold enqueue
+  split
+  · next hc =>
+    unfold Pipeline.WellFormed
+    dsimp only
+    exact ⟨(fun h => absurd h (by simp [hab])), (fun h => nomatch h), True.intro, True.intro⟩
+  · next op hc =>
+    rw [hc] at h3
+    unfold Pipeline.WellFormed
+    dsimp only
+    refine ⟨(fun h => absurd h (by simp [hab])),
+      (fun h => absurd h (by simp [hc])), ?_⟩
+    simp only [hc]
+    refine ⟨h3.1, ?_⟩
+    cases hp : op.progress with
+    | copyIn info done =>
+      cases done with
+      | false => exact absurd hp (hnocopy op info hc)
+      | true => exact True.intro
+    | _ => exact True.intro
+
+private theorem wf_of_phase_running {s : State} {pipe : Pipeline}
+    (hphase : s.phase = .running pipe) (hwf : pipe.WellFormed) : s.WellFormed := by
+  unfold State.WellFormed
+  rw [hphase]
+  exact hwf
+
+private theorem pipe_wf_of_running {s : State} {pipe : Pipeline}
+    (hphase : s.phase = .running pipe) (hwf : s.WellFormed) : pipe.WellFormed := by
+  unfold State.WellFormed at hwf
+  rw [hphase] at hwf
+  exact hwf
+
+private theorem submitIdle_wf {s : State} {pipe : Pipeline} {req : Request}
+    (hphase : s.phase = .running pipe) (hwf : pipe.WellFormed)
+    (hnocopy : ∀ op info, pipe.current = some op → op.progress ≠ .copyIn info false) :
+    ∀ {s' : State} {out : ByteArray}, submitIdle s pipe req = .ok (s', out) →
+      s'.WellFormed := by
+  obtain ⟨h1, h2, h3⟩ := hwf
+  fun_cases submitIdle s pipe req with
+  | case1 habt =>
+    intro s' out h
+    cases h
+    obtain ⟨hc, hq⟩ := h1 habt
+    have hwf' : Pipeline.WellFormed { pipe with aborted := false } := by
+      refine ⟨(fun hh => nomatch hh), (fun _ => hq), ?_⟩
+      show (match pipe.current with
+        | none => True
+        | some op => op.Coherent ∧ _)
+      rw [hc]
+      exact True.intro
+    show Pipeline.WellFormed (enqueue { pipe with aborted := false } .sync)
+    exact enqueue_wf hwf' rfl (fun op info hcur => absurd hcur (by simp [hc])) _
+  | case2 habt =>
+    intro s' out h
+    cases h
+    exact True.intro
+  | case3 habt hne =>
+    intro s' out h
+    cases h
+  | case4 hnab sql =>
+    intro s' out h
+    cases h
+    show Pipeline.WellFormed (enqueue _ _)
+    exact enqueue_wf ⟨h1, h2, h3⟩ (by simpa using hnab) hnocopy _
+  | case5 hnab name sql oids =>
+    intro s' out h
+    cases h
+    show Pipeline.WellFormed (enqueue _ _)
+    exact enqueue_wf ⟨h1, h2, h3⟩ (by simpa using hnab) hnocopy _
+  | case6 hnab portal stmt pf ps rf =>
+    intro s' out h
+    cases h
+    show Pipeline.WellFormed (enqueue _ _)
+    exact enqueue_wf ⟨h1, h2, h3⟩ (by simpa using hnab) hnocopy _
+  | case7 hnab name =>
+    intro s' out h
+    cases h
+    show Pipeline.WellFormed (enqueue _ _)
+    exact enqueue_wf ⟨h1, h2, h3⟩ (by simpa using hnab) hnocopy _
+  | case8 hnab name =>
+    intro s' out h
+    cases h
+    show Pipeline.WellFormed (enqueue _ _)
+    exact enqueue_wf ⟨h1, h2, h3⟩ (by simpa using hnab) hnocopy _
+  | case9 hnab portal maxRows =>
+    intro s' out h
+    cases h
+    show Pipeline.WellFormed (enqueue _ _)
+    exact enqueue_wf ⟨h1, h2, h3⟩ (by simpa using hnab) hnocopy _
+  | case10 hnab name =>
+    intro s' out h
+    cases h
+    show Pipeline.WellFormed (enqueue _ _)
+    exact enqueue_wf ⟨h1, h2, h3⟩ (by simpa using hnab) hnocopy _
+  | case11 hnab name =>
+    intro s' out h
+    cases h
+    show Pipeline.WellFormed (enqueue _ _)
+    exact enqueue_wf ⟨h1, h2, h3⟩ (by simpa using hnab) hnocopy _
+  | case12 hnab =>
+    intro s' out h
+    cases h
+    exact wf_of_phase_running hphase ⟨h1, h2, h3⟩
+  | case13 hnab =>
+    intro s' out h
+    cases h
+    show Pipeline.WellFormed (enqueue _ _)
+    exact enqueue_wf ⟨h1, h2, h3⟩ (by simpa using hnab) hnocopy _
+  | case14 hnab data =>
+    intro s' out h
+    cases h
+  | case15 hnab =>
+    intro s' out h
+    cases h
+  | case16 hnab reason =>
+    intro s' out h
+    cases h
+  | case17 hnab =>
+    intro s' out h
+    cases h
+    exact True.intro
+
+private theorem submitRunning_wf {s : State} {pipe : Pipeline} {req : Request}
+    (hphase : s.phase = .running pipe) (hwf : pipe.WellFormed) :
+    ∀ {s' : State} {out : ByteArray}, submitRunning s pipe req = .ok (s', out) →
+      s'.WellFormed := by
+  fun_cases submitRunning s pipe req with
+  | case1 op hcur info hprog data =>
+    intro s' out h
+    cases h
+    exact wf_of_phase_running hphase hwf
+  | case2 op hcur info hprog =>
+    intro s' out h
+    cases h
+    obtain ⟨h1, h2, h3⟩ := hwf
+    show Pipeline.WellFormed _
+    refine ⟨(fun habt => absurd (h1 habt).1 (by simp [hcur])), (fun hh => nomatch hh),
+      ?_, True.intro⟩
+    rw [hcur] at h3
+    have hcoh := h3.1
+    unfold CurrentOp.Coherent at hcoh ⊢
+    rw [hprog] at hcoh
+    exact hcoh
+  | case3 op hcur info hprog reason =>
+    intro s' out h
+    cases h
+    obtain ⟨h1, h2, h3⟩ := hwf
+    show Pipeline.WellFormed _
+    refine ⟨(fun habt => absurd (h1 habt).1 (by simp [hcur])), (fun hh => nomatch hh),
+      ?_, True.intro⟩
+    rw [hcur] at h3
+    have hcoh := h3.1
+    unfold CurrentOp.Coherent at hcoh ⊢
+    rw [hprog] at hcoh
+    exact hcoh
+  | case4 op hcur info hprog =>
+    intro s' out h
+    cases h
+    exact wf_of_phase_running hphase hwf
+  | case5 op hcur info hprog =>
+    intro s' out h
+    cases h
+    exact True.intro
+  | case6 op hcur info hprog hne =>
+    intro s' out h
+    cases h
+  | case7 =>
+    rename_i op hcur hnot
+    intro s' out h
+    refine submitIdle_wf hphase hwf ?_ h
+    intro op' info hcur'
+    rw [hcur] at hcur'
+    injection hcur' with heq
+    subst heq
+    intro hp
+    exact hnot info hp
+  | case8 =>
+    rename_i hcur
+    intro s' out h
+    refine submitIdle_wf hphase hwf ?_ h
+    intro op' info hcur'
+    rw [hcur] at hcur'
+    cases hcur'
+
+/-- `submit` preserves well-formedness. -/
+theorem submit_wellFormed {s : State} {req : Request} {s' : State} {out : ByteArray}
+    (hwf : s.WellFormed) (h : submit s req = .ok (s', out)) : s'.WellFormed := by
+  revert h
+  fun_cases submit s req
+  case case2 =>
+    intro h
+    cases h
+    exact True.intro
+  case case4 =>
+    rename_i pipe hph
+    intro h
+    exact submitRunning_wf hph (pipe_wf_of_running hph hwf) h
+  all_goals intro h
+  all_goals cases h
+
+/-- A failed `submit` is a *rejection*: no new state exists at all (so the
+machine is trivially unchanged), and the error is always `rejectedInvalid`
+or `rejectedAborted` — never a connection-poisoning class. -/
+theorem submit_error_rejection {s : State} {req : Request} {e : PgError}
+    (h : submit s req = .error e) :
+    e = .rejectedAborted ∨ ∃ why, e = .rejectedInvalid why := by
+  have idle : ∀ (s₀ : State) (pipe : Pipeline) (req₀ : Request),
+      submitIdle s₀ pipe req₀ = .error e →
+      e = .rejectedAborted ∨ ∃ why, e = .rejectedInvalid why := by
+    intro s₀ pipe req₀
+    fun_cases submitIdle s₀ pipe req₀ <;> intro h' <;> cases h' <;>
+      first
+        | exact Or.inl rfl
+        | exact Or.inr ⟨_, rfl⟩
+  have running : ∀ (s₀ : State) (pipe : Pipeline) (req₀ : Request),
+      submitRunning s₀ pipe req₀ = .error e →
+      e = .rejectedAborted ∨ ∃ why, e = .rejectedInvalid why := by
+    intro s₀ pipe req₀
+    fun_cases submitRunning s₀ pipe req₀ <;> intro h' <;>
+      first
+        | exact idle _ _ _ h'
+        | (cases h' <;> first
+            | exact Or.inl rfl
+            | exact Or.inr ⟨_, rfl⟩)
+  revert h
+  fun_cases submit s req <;> intro h <;>
+    first
+      | exact running _ _ _ h
+      | (cases h <;> first
+          | exact Or.inl rfl
+          | exact Or.inr ⟨_, rfl⟩)
 
 end Machine
 end Protocol
