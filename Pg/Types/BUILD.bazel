@@ -62,6 +62,7 @@ lean_assurance_test(
         "Pg.timestampFields_renderTimestamp",
         # 1-D arrays, NULLs and quoting included.
         "Pg.parseArrayText_renderArrayText",
+        "Pg.decode_encode_array",
         "Pg.arrayScan_elem",
         "Pg.arrayScan_quoted",
     ],

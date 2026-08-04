@@ -1559,6 +1559,36 @@ theorem parseArrayText_renderArrayText (es : List (Option String)) :
     simp only [arrayScan_body (String.ofList ('{' :: arrayBodyChars (e :: t))) t e #[] false]
     simp
 
+/-- An `Array.mapM` whose function never fails and returns its argument
+succeeds with that array. Core has `Array.mapM_pure` for a syntactically pure
+function; the element decoder is a `match`, so route through `funext`. -/
+private theorem mapM_ok_of_pure {α ε : Type} (f : α → Except ε α)
+    (a : Array α) (h : ∀ x, f x = .ok x) : a.mapM f = .ok a := by
+  have hf : f = fun x => pure (id x) := funext h
+  rw [hf, Array.mapM_pure, Array.map_id]
+  rfl
+
+/-- **The 1-D array roundtrip at the public API.** Whatever array of element
+texts (NULLs included) the client sends as a text parameter, `decodeValue`
+reads back as the same array. This is `parseArrayText_renderArrayText` lifted
+through the `PgDecode (Array α)` instance's per-element `mapM`. -/
+theorem decode_encode_array (oid : UInt32) (a : Array (Option String)) :
+    decodeValue (α := Array (Option String)) oid
+      (PgEncode.format (Array (Option String))) (PgEncode.encode a) = .ok a := by
+  show decodeValue oid 0 (some (renderArrayText a.toList).toUTF8) = .ok a
+  rw [decodeValue_text]
+  show (do
+    let elems ← parseArrayText (renderArrayText a.toList)
+    elems.mapM fun
+      | none => PgDecode.decodeNull
+      | some t => PgDecode.decodeText (Oid.arrayElem oid) t) = .ok a
+  rw [parseArrayText_renderArrayText, Array.toArray_toList]
+  show a.mapM (fun x =>
+    match x with
+    | none => PgDecode.decodeNull
+    | some t => PgDecode.decodeText (Oid.arrayElem oid) t) = .ok a
+  exact mapM_ok_of_pure _ a (fun x => by cases x <;> rfl)
+
 /-!
 ### `numeric`: the lossless base-10000 roundtrip
 

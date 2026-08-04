@@ -225,10 +225,14 @@ section docstring states its scope.
   a zero-padded decimal field reads back as the number it was rendered from, at
   any width.
 
-  For 1-D arrays, `parseArrayText_renderArrayText`: a rendered array parses
-  back to the same elements, NULLs included — and an element whose text is
-  literally `NULL` stays a value, because `renderArrayText` quotes every
-  non-NULL element (escaping `"` and `\`).
+  For 1-D arrays, `decode_encode_array`: an array of element texts sent as a
+  text parameter is read back by `decodeValue` as the same array, NULLs
+  included — and an element whose text is literally `NULL` stays a value,
+  because `renderArrayText` quotes every non-NULL element (escaping `"` and
+  `\`). The parser-level half is `parseArrayText_renderArrayText`; lifting it
+  to the public API needs "`Array.mapM` with a function that never fails
+  succeeds", which core does not have for a `match`-shaped function
+  (`mapM_ok_of_pure`, via `funext` into `Array.mapM_pure`).
 
   Two gaps are deliberate. **Floats are excluded**: `toString`/`parseFloat` is
   not an unconditional IEEE-754 roundtrip, and stating the true law needs
