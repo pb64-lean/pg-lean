@@ -1023,6 +1023,18 @@ private def queryFieldChars (kv : String × String) : List Char :=
 def renderQueryField (kv : String × String) : String :=
   String.ofList (queryFieldChars kv)
 
+/-- The `k1=v1&k2=v2&…` body of a URI query string. -/
+private def queryChars : List (String × String) → List Char
+  | [] => []
+  | [kv] => queryFieldChars kv
+  | kv :: rest => queryFieldChars kv ++ '&' :: queryChars rest
+
+/-- The query half of a URI: every pair percent-encoded and joined with `&`.
+`splitAllChar_renderQuery` proves `parseUri` splits it back into exactly these
+fields. -/
+def renderQuery (ps : List (String × String)) : String :=
+  String.ofList (queryChars ps)
+
 private theorem renderQueryField_not_empty (kv : String × String) :
     (renderQueryField kv).isEmpty = false := by
   refine String.isEmpty_eq_false_iff.mpr (fun he => ?_)
@@ -1077,6 +1089,188 @@ theorem applyQueryPairs_render (cfg : ConnectConfig) (ps : List (String × Strin
     · rw [h11]
       show (cfg.parameters.push kv).toList ++ rest = _
       rw [Array.toList_push, List.append_assoc, List.singleton_append]
+
+/-!
+### The whole URI, query included
+
+`parseUri_renderUri` covers the authority and path; `applyQueryPairs_render`
+covers a list of query fields. These join them: a rendered query string splits
+back into exactly its fields, so rendering a config *and* its startup
+parameters produces a URI that parses back to both.
+
+`parseUri_ofList_query` is stated over opaque character lists on purpose: with
+`uriBody cfg` and `queryChars ps` in the statement instead, the `show` that
+peels `parseUri`'s scheme match costs 50 s of `whnf` rather than milliseconds.
+-/
+
+private theorem splitAllAux_none {c : Char} {l : List Char}
+    (h : splitFirstAux c l = none) : splitAllAux c l = [l] := by
+  unfold splitAllAux
+  split
+  · next pre post heq => rw [h] at heq; cases heq
+  · rfl
+
+private theorem splitAllAux_some {c : Char} {l pre post : List Char}
+    (h : splitFirstAux c l = some (pre, post)) :
+    splitAllAux c l = pre :: splitAllAux c post := by
+  suffices hs : ∀ r, splitAllAux c post = r → splitAllAux c l = pre :: r from hs _ rfl
+  intro r hr
+  unfold splitAllAux
+  split
+  · next p q heq =>
+    rw [h] at heq
+    cases heq
+    exact congrArg _ hr
+  · next heq => rw [h] at heq; cases heq
+
+private theorem amp_not_mem_queryFieldChars (kv : String × String) :
+    ∀ a ∈ queryFieldChars kv, a ≠ '&' := by
+  unfold queryFieldChars
+  refine ne_append (ne_of_uriSafe (uriSafeChar_percentEncode _) (by decide)) ?_
+  exact ne_cons (by decide) (ne_of_uriSafe (uriSafeChar_percentEncode _) (by decide))
+
+private theorem splitAllAux_queryChars : ∀ (ps : List (String × String)), ps ≠ [] →
+    splitAllAux '&' (queryChars ps) = ps.map queryFieldChars := by
+  intro ps
+  induction ps with
+  | nil => intro h; exact absurd rfl h
+  | cons kv rest ih =>
+    intro _
+    cases rest with
+    | nil =>
+      show splitAllAux '&' (queryFieldChars kv) = _
+      rw [splitAllAux_none (splitFirstAux_none (amp_not_mem_queryFieldChars kv))]
+      rfl
+    | cons u us =>
+      show splitAllAux '&' (queryFieldChars kv ++ '&' :: queryChars (u :: us)) = _
+      rw [splitAllAux_some
+        (splitFirstAux_append _ (amp_not_mem_queryFieldChars kv)),
+        ih (List.cons_ne_nil _ _)]
+      rfl
+
+/-- **A rendered query string splits back into exactly its fields** — the step
+`parseUri` takes before decoding each `key=value` pair. -/
+theorem splitAllChar_renderQuery (ps : List (String × String)) (h : ps ≠ []) :
+    splitAllChar '&' (renderQuery ps) = ps.map renderQueryField := by
+  unfold splitAllChar renderQuery
+  rw [String.toList_ofList, splitAllAux_queryChars ps h, List.map_map]
+  rfl
+
+
+
+private theorem ofList_append (a b : List Char) :
+    String.ofList a ++ String.ofList b = String.ofList (a ++ b) :=
+  calc String.ofList a ++ String.ofList b
+      = String.ofList ((String.ofList a ++ String.ofList b).toList) :=
+        String.ofList_toList.symm
+    _ = String.ofList (a ++ b) := by
+        rw [String.toList_append, String.toList_ofList, String.toList_ofList]
+
+private theorem parseUri_ofList_query {t q : List Char} (h : ∀ a ∈ t, a ≠ '?') :
+    parseUri (String.ofList ("postgresql://".toList ++ (t ++ '?' :: q)))
+      = parseAfterScheme (String.ofList t) (some (String.ofList q)) := by
+  unfold parseUri
+  rw [afterPrefix_ofList (pre := "postgresql://")]
+  show (match splitFirstChar '?' (String.ofList (t ++ '?' :: q)) with
+        | some (b, qq) => parseAfterScheme b (some qq)
+        | none => parseAfterScheme (String.ofList (t ++ '?' :: q)) none)
+      = parseAfterScheme (String.ofList t) (some (String.ofList q))
+  rw [splitFirstChar_ofList h]
+
+/-- **End-to-end URI roundtrip**: rendering a config together with a list of
+startup parameters produces a connection URI that `parseUri` reads back into
+the same components, with the parameters landing in `parameters` in the order
+they were written. -/
+theorem parseUri_renderUri_query {cfg : ConnectConfig} (ps : List (String × String))
+    (huser : cfg.user ≠ "")
+    (hhost : cfg.host ≠ "")
+    (hhostsafe : ∀ c ∈ cfg.host.toList, uriSafeChar c = true)
+    (hport : cfg.port ≠ 0)
+    (hdbne : ∀ db ∈ cfg.database, db ≠ "")
+    (hps : ps ≠ [])
+    (hknown : ∀ kv ∈ ps, knownQueryKey kv.1 = false) :
+    ∃ cfg', parseUri (renderUri cfg ++ "?" ++ renderQuery ps) = .ok cfg' ∧
+      cfg'.user = cfg.user ∧ cfg'.password = cfg.password ∧
+      cfg'.host = cfg.host ∧ cfg'.port = cfg.port ∧
+      cfg'.database = cfg.database ∧ cfg'.parameters.toList = ps := by
+  have huserEmpty : (cfg.user).isEmpty = false := String.isEmpty_eq_false_iff.mpr huser
+  have hq : ("?" : String) = String.ofList ['?'] := by
+    rw [show (['?'] : List Char) = "?".toList from by rfl]
+    exact String.ofList_toList.symm
+  have hstr : renderUri cfg ++ "?" ++ renderQuery ps
+      = String.ofList ("postgresql://".toList ++ (uriBody cfg ++ '?' :: queryChars ps)) := by
+    unfold renderUri renderQuery
+    rw [hq, ofList_append, ofList_append]
+    congr 1
+    simp only [List.append_assoc, List.singleton_append]
+  have hscheme : parseUri (renderUri cfg ++ "?" ++ renderQuery ps)
+      = parseAfterScheme (String.ofList (uriBody cfg)) (some (renderQuery ps)) := by
+    rw [hstr, parseUri_ofList_query (uriBody_ne_question hhostsafe)]
+    rfl
+  have hauth : ∀ path? : Option String,
+      parseAuthority (String.ofList (userInfoChars cfg ++ '@' :: hostPortChars cfg))
+          path? (some (renderQuery ps))
+        = parseHostPart (applyUserInfo {} (String.ofList (userInfoChars cfg)))
+            (String.ofList (hostPortChars cfg)) path? (some (renderQuery ps)) := by
+    intro path?
+    unfold parseAuthority
+    rw [splitLastChar_ofList (hostPortChars_ne hhostsafe (by decide) (by decide))]
+  have hfinish : ∀ cfg1 : ConnectConfig, cfg1.user = cfg.user →
+      cfg1.parameters.toList = [] →
+      ∃ cfg', finishUri (.ok cfg1) (some (renderQuery ps)) = .ok cfg' ∧
+        cfg'.user = cfg1.user ∧ cfg'.password = cfg1.password ∧
+        cfg'.host = cfg1.host ∧ cfg'.port = cfg1.port ∧
+        cfg'.database = cfg1.database ∧ cfg'.parameters.toList = ps := by
+    intro cfg1 hu hpar
+    obtain ⟨cfg', hrun, h1, h2, h3, h4, h5, -, -, -, -, -, h11⟩ :=
+      applyQueryPairs_render cfg1 ps hknown
+    refine ⟨cfg', ?_, h1, h2, h3, h4, h5, by rw [h11, hpar, List.nil_append]⟩
+    unfold finishUri
+    show (match applyQueryPairs cfg1 (splitAllChar '&' (renderQuery ps)) with
+          | Except.error e => Except.error e
+          | Except.ok c =>
+            if c.user.isEmpty then
+              Except.error "no user in URL (postgres://user@host/db)"
+            else Except.ok c) = Except.ok cfg'
+    rw [splitAllChar_renderQuery ps hps, hrun]
+    show (if cfg'.user.isEmpty then _ else Except.ok cfg') = _
+    rw [h1, hu]
+    simp only [huserEmpty, Bool.false_eq_true, if_false]
+  cases hdbv : cfg.database with
+  | none =>
+    obtain ⟨cfg', hfin, h1, h2, h3, h4, h5, h6⟩ :=
+      hfinish { ({} : ConnectConfig) with
+                  user := cfg.user, password := cfg.password,
+                  host := cfg.host, port := cfg.port } rfl rfl
+    refine ⟨cfg', ?_, h1, h2, h3, h4, by rw [h5], h6⟩
+    rw [hscheme]
+    unfold parseAfterScheme uriBody pathChars
+    rw [hdbv, List.append_nil,
+      splitFirstChar_ofList_none (authority_ne_slash hhostsafe), hauth none,
+      applyUserInfo_render]
+    unfold parseHostPart
+    rw [applyHostPort_render hhost hhostsafe hport]
+    exact hfin
+  | some db =>
+    have hdb0 : db ≠ "" := hdbne db (Option.mem_def.mpr hdbv)
+    obtain ⟨cfg', hfin, h1, h2, h3, h4, h5, h6⟩ :=
+      hfinish { ({} : ConnectConfig) with
+                  user := cfg.user, password := cfg.password,
+                  host := cfg.host, port := cfg.port, database := some db } rfl rfl
+    refine ⟨cfg', ?_, h1, h2, h3, h4, by rw [h5], h6⟩
+    rw [hscheme]
+    unfold parseAfterScheme uriBody pathChars
+    rw [hdbv,
+      show userInfoChars cfg ++
+            '@' :: (hostPortChars cfg ++ '/' :: (percentEncode db).toList)
+          = (userInfoChars cfg ++ '@' :: hostPortChars cfg) ++
+            '/' :: (percentEncode db).toList from by
+        rw [List.append_assoc, List.cons_append],
+      splitFirstChar_ofList (authority_ne_slash hhostsafe)]
+    simp only [hauth, applyUserInfo_render, parseHostPart,
+      applyHostPort_render hhost hhostsafe hport, String.ofList_toList,
+      applyPath_render hdb0]
+    exact hfin
 
 end ConnectConfig
 

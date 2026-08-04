@@ -71,6 +71,8 @@ lean_assurance_test(
         "Pg.ConnectConfig.parseUri_renderUri",
         "Pg.ConnectConfig.applyQueryParam_unknown",
         "Pg.ConnectConfig.applyQueryPairs_render",
+        "Pg.ConnectConfig.splitAllChar_renderQuery",
+        "Pg.ConnectConfig.parseUri_renderUri_query",
     ],
     deps = [":pg_lean"],
 )

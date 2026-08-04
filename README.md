@@ -210,7 +210,12 @@ section docstring states its scope.
   rendered URI recovers user, password, host, port, and database),
   `applyQueryParam_unknown` and `applyQueryPairs_render` (unknown query
   parameters can neither fail the parse nor disturb a recognized setting, and
-  land in `parameters` in order).
+  land in `parameters` in order). The two halves join in
+  `parseUri_renderUri_query`: **rendering a config together with its startup
+  parameters produces a URI that parses back to both** — the authority, path
+  *and* every query field, in order. The step that needed proving was
+  `splitAllChar_renderQuery`, that a rendered query string splits back into
+  exactly its fields.
 - **Codecs** (`Pg/Types/Codec.lean`) — text and binary integer roundtrips and
   `PgInterval.fromBinary_toBinary`; `PgNumeric.fromBinary_toBinary` — **binary
   `numeric` is lossless**: sign, weight, display scale and every base-10000
