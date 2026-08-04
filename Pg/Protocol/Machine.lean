@@ -37,6 +37,13 @@ error-recovery drop rule the machine applies internally. That FIFO rule is
 `shellStep`, and it is *proved* to track the machine's own pending-op queue
 (`Pipeline.pending`) on every accepted message and submission — see the
 trace-level FIFO attribution section.
+
+The startup phase has its counterpart in the startup-phase refinement section:
+`AuthStep`/`AuthReach` are PostgreSQL's documented authentication orderings and
+the machine is proved to refine them, ending in `running` with an empty
+pipeline. The completion section closes the loop on liveness: for each
+`OpKind`, the documented reply sequence is proved to drive the machine to pop
+that operation.
 -/
 
 inductive ProtocolVersion where

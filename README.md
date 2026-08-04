@@ -163,6 +163,54 @@ Sans-IO core + thin async shell (the grpc-lean/PostgresNIO pattern):
   cancel.
 - `Cmd/PgProbe.lean`, `Integration/LiveTest.lean` — probing CLI + checklist.
 
+## Proved properties (kernel-checked, no `sorry`, core + Std only)
+
+Machine-checked theorems live next to the code they describe; each module's
+section docstring states its scope.
+
+- **Framing** (`Pg/Protocol/Message.lean`) — byte conservation, partition
+  invariance (a byte stream decodes the same however it is chunked), totalized
+  buffered parsing.
+- **Machine invariants** (`Pg/Protocol/Machine.lean`) — `State.WellFormed`
+  preserved by `submit`/`submitAll`/`step`/`feed`; `feed` factored through the
+  framing decoder with exact byte accounting.
+- **Correlation / FIFO attribution** — the shell's event-driven completion FIFO
+  (`shellStep`) is proved to equal the machine's pending-op queue
+  (`Pipeline.pending`) after every accepted message (`step_fifo`,
+  `runSteps_fifo`, `feed_fifo`) and submission (`submit_fifo`). Headline:
+  `terminal_pops_head` — every user-visible success pops exactly the head
+  operation, in submission order, COPY included — with
+  `nonterminal_preserves_fifo` and `error_drops_to_sync` as complements.
+- **Startup ordering** — `AuthStep`/`AuthReach` are PostgreSQL's documented
+  authentication sequences; `step_startup_order` and `runSteps_startup_order`
+  prove the machine refines them, `authStep_stage_le` that the exchange never
+  runs backwards, `authStep_scram` that SCRAM's server-signature check can
+  never be skipped, and `startup_ready` that a completed startup enters
+  `running` with an empty pipeline.
+- **Progress and completion** — `step_progress` (an expected reply always
+  steps), `step_errorResponse_progress` (a server error never poisons a
+  mid-pipeline connection), `expectedReply_nonempty` (the expected-reply table
+  is nowhere vacuous), and per-`OpKind` completion: the documented reply
+  sequence pops the operation, for Parse/Bind/Close/Describe/Sync, Execute with
+  any number of streamed rows, Execute over COPY IN and COPY OUT, and the
+  simple-query cycle.
+- **SCRAM** (`Pg/Sasl/Scram.lean`) — construction laws,
+  `parseServerFirst_render` (render→parse roundtrip), and `verifyServerFinal`'s
+  byte-exact mutual-authentication spec.
+- **TLS policy** (`Pg/Config.lean`) — `sslmode` is a single decision table that
+  `connect`, peer verification, and trust-store loading all read;
+  `policy_no_insecure_fallback` proves no encryption-requiring mode may retry
+  in a weaker transport.
+- **Connection strings** (`Pg/Config.lean`) — `percentDecode_percentEncode`
+  (percent-encoding roundtrips every byte, so non-ASCII passwords such as the
+  live suite's `pg-lean-läuft` survive), `parseUri_renderUri` (parsing a
+  rendered URI recovers user, password, host, port, and database),
+  `applyQueryParam_unknown` and `applyQueryPairs_render` (unknown query
+  parameters can neither fail the parse nor disturb a recognized setting, and
+  land in `parameters` in order).
+- **Codecs** (`Pg/Types/Codec.lean`) — text and binary integer roundtrips,
+  `PgInterval.fromBinary_toBinary`.
+
 ## Testing (the yardstick)
 
 Hermetic, every commit — `bazel test //...` (10 suites):
