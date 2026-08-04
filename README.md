@@ -252,7 +252,7 @@ time, so a regression is a red build rather than a stale claim:
 
 Each target checks that its named theorems exist, are theorems, and close over
 an allowed axiom set — and scans **every** first-party module (`module_prefixes
-= ["Pg"]`, 21 modules / ~3650 constants) for `sorry`, stray axioms, `unsafe`,
+= ["Pg"]`, 21 modules / ~3900 constants) for `sorry`, stray axioms, `unsafe`,
 and `@[extern]`. Current whole-client result: no `sorry`, no `unsafe`, no
 `opaque`, two `partial` definitions (the socket read loop and the cancellable
 sleep in `Pg/Connection.lean`), and **no `@[extern]` constants at all** —
