@@ -33,7 +33,10 @@ in exactly the order requests were sent, so the shell keeps its own FIFO of
 user-facing completions and pops on terminal events (`ready` for
 sync/simpleQuery, `commandComplete`/`portalSuspended`/`emptyQuery` for
 execute, ...). `dropAborted` is exported so the shell applies the same
-error-recovery drop rule the machine applies internally.
+error-recovery drop rule the machine applies internally. That FIFO rule is
+`shellStep`, and it is *proved* to track the machine's own pending-op queue
+(`Pipeline.pending`) on every accepted message and submission — see the
+trace-level FIFO attribution section.
 -/
 
 inductive ProtocolVersion where
@@ -1659,17 +1662,8 @@ rule, so no backend response can ever be attributed to the wrong request:
   accepted, re-arms the pipeline with exactly that Sync pending, and writes
   the Sync bytes.
 
-Trace-level statement (future work, stated precisely): for any run
-`start cfg → (submit | step)*` from a well-formed initial state, define the
-correlation FIFO as the sequence of submitted ops minus those cancelled by
-`dropAborted` at each extended-protocol error. Then every success-terminal
-event (`parseComplete`, `bindComplete`, `closeComplete`, `noData`/
-`rowDescription` for describe, `commandComplete`/`emptyQuery`/
-`portalSuspended` for execute, `ready` for sync/simpleQuery) is emitted
-exactly when its op is at the FIFO head, and pops it — i.e. every
-user-visible success corresponds to exactly one submitted operation, in
-submission order. The theorems above are the per-step cases of that
-induction; the missing piece is the trace-level FIFO refinement relation.
+These are the per-step cases of the trace-level FIFO refinement proved in the
+next section (`step_fifo`, `runSteps_fifo`, `feed_fifo`, `submit_fifo`).
 -/
 
 private theorem opKind_beq_eq_false {a b : OpKind} (h : a ≠ b) : (a == b) = false := by
@@ -1886,6 +1880,693 @@ theorem sync_clears_aborted {s : State} {pipe : Pipeline} {s' : State}
   show Phase.running _ = _
   congr 1
   simp only [hq]
+
+/-!
+### Trace-level FIFO attribution
+
+The shell keeps its own FIFO of user-facing completions, sees only the event
+stream, and applies two rules: pop the head on its terminal reply, and drop to
+the next pipelined Sync on an extended-protocol error. `shellStep` *is* that
+rule. `Pipeline.pending` is the same FIFO as the machine sees it — the ops
+still awaiting replies, in submission order.
+
+`step_fifo` / `runSteps_fifo` / `feed_fifo` prove the two agree on every
+accepted message, and `submit_fifo` proves submissions only ever append (one
+entry per accepted request, in submission order). Together they are the FIFO
+refinement: the shell's event-driven queue is always exactly the machine's
+pending-op queue, so no reply can be attributed to the wrong request.
+`terminal_pops_head` reads off the headline — every user-visible success is
+the terminal reply of the op at the FIFO head and pops exactly that one op —
+and `nonterminal_preserves_fifo` its complement.
+-/
+
+/-- The correlation FIFO as the machine sees it: the ops still awaiting
+replies, in submission order (head first). -/
+def Pipeline.pending (pipe : Pipeline) : List OpKind :=
+  match pipe.current with
+  | some op => op.kind :: pipe.queued.toList
+  | none => pipe.queued.toList
+
+/-- The user-visible terminal reply of an op kind: the event on which the
+shell completes that op and pops it from its FIFO. Every other event either
+reports intermediate progress on the head op (`parameterDescription`,
+`dataRow`, `copyInStarted`, a simple query's per-statement `commandComplete`,
+...), is an error, or is asynchronous. -/
+def isTerminal : OpKind → Event → Bool
+  | .parse, .parseComplete => true
+  | .bind, .bindComplete => true
+  | .close, .closeComplete => true
+  | .describeStatement, .rowDescription _ => true
+  | .describeStatement, .noData => true
+  | .describePortal, .rowDescription _ => true
+  | .describePortal, .noData => true
+  | .execute, .commandComplete _ => true
+  | .execute, .emptyQuery => true
+  | .execute, .portalSuspended => true
+  | .sync, .ready _ => true
+  | .simpleQuery, .ready _ => true
+  | _, _ => false
+
+/-- Recoverable server errors are the only events that cancel expectations. -/
+def isRecoverableError : Event → Bool
+  | .errorResponse _ => true
+  | _ => false
+
+/-- The FIFO suffix an extended-protocol error preserves: from the first
+pipelined Sync on, or nothing when none was pipelined. The list mirror of
+`dropAborted` (`abortToSync_pending`). -/
+def dropUntilSync : List OpKind → List OpKind
+  | [] => []
+  | k :: rest => if k == OpKind.sync then k :: rest else dropUntilSync rest
+
+/-- One shell-side FIFO transition, driven by an event alone. -/
+def shellStep (fifo : List OpKind) (ev : Event) : List OpKind :=
+  match fifo with
+  | [] => []
+  | k :: rest =>
+    if isTerminal k ev then rest
+    else if isRecoverableError ev && !(k == OpKind.sync) && !(k == OpKind.simpleQuery) then
+      dropUntilSync rest
+    else k :: rest
+
+/-- The shell's FIFO after a batch of events, in wire order. -/
+def shellRun (fifo : List OpKind) (evs : Array Event) : List OpKind :=
+  evs.foldl shellStep fifo
+
+private theorem shellRun_single (fifo : List OpKind) (ev : Event) :
+    shellRun fifo #[ev] = shellStep fifo ev := by rfl
+
+private theorem shellRun_append (fifo : List OpKind) (a b : Array Event) :
+    shellRun fifo (a ++ b) = shellRun (shellRun fifo a) b := by
+  unfold shellRun
+  exact Array.foldl_append
+
+private theorem shellStep_pop {k : OpKind} {rest : List OpKind} {ev : Event}
+    (hterm : isTerminal k ev = true) : shellStep (k :: rest) ev = rest := by
+  unfold shellStep
+  simp only [hterm, if_pos]
+
+private theorem shellStep_keep {k : OpKind} {rest : List OpKind} {ev : Event}
+    (hterm : isTerminal k ev = false) (herr : isRecoverableError ev = false) :
+    shellStep (k :: rest) ev = k :: rest := by
+  unfold shellStep
+  simp only [hterm, herr, Bool.false_and, Bool.false_eq_true, if_false]
+
+private theorem shellStep_keep_all {fifo : List OpKind} {ev : Event}
+    (hterm : ∀ k, isTerminal k ev = false) (herr : isRecoverableError ev = false) :
+    shellStep fifo ev = fifo := by
+  cases fifo with
+  | nil => rfl
+  | cons k rest => exact shellStep_keep (hterm k) herr
+
+private theorem shellStep_drain {k : OpKind} {rest : List OpKind} {f : ErrorFields}
+    (hk : k = .sync ∨ k = .simpleQuery) :
+    shellStep (k :: rest) (.errorResponse f) = k :: rest := by
+  unfold shellStep
+  cases hk with
+  | inl h => subst h; rfl
+  | inr h => subst h; rfl
+
+private theorem shellStep_abort {k : OpKind} {rest : List OpKind} {f : ErrorFields}
+    (hsync : (k == OpKind.sync) = false) (hsimple : (k == OpKind.simpleQuery) = false) :
+    shellStep (k :: rest) (.errorResponse f) = dropUntilSync rest := by
+  unfold shellStep
+  have hterm : isTerminal k (.errorResponse f) = false := by cases k <;> rfl
+  simp only [hterm, hsync, hsimple, isRecoverableError, Bool.not_false, Bool.and_true,
+    Bool.false_eq_true, if_false, if_pos]
+
+private theorem shellStep_nil (ev : Event) : shellStep [] ev = [] := by rfl
+
+private theorem toList_extract_size {α : Type} (a : Array α) (i : Nat) :
+    (a.extract i a.size).toList = a.toList.drop i := by
+  rw [Array.toList_extract, List.extract_eq_take_drop, ← Array.length_toList,
+    ← List.length_drop (i := i) (l := a.toList)]
+  exact List.take_length
+
+private theorem cons_drop_one {α : Type} {l : List α} {k : α} (h : l[0]? = some k) :
+    k :: l.drop 1 = l := by
+  cases l with
+  | nil => cases h
+  | cons a t =>
+    simp only [List.getElem?_cons_zero, Option.some.injEq] at h
+    rw [h]
+    rfl
+
+private theorem pending_cons {pipe : Pipeline} {op : CurrentOp}
+    (hcur : pipe.current = some op) :
+    pipe.pending = op.kind :: pipe.queued.toList := by
+  unfold Pipeline.pending
+  rw [hcur]
+
+private theorem pending_nil {pipe : Pipeline} (hcur : pipe.current = none)
+    (hq : pipe.queued = #[]) : pipe.pending = [] := by
+  unfold Pipeline.pending
+  rw [hcur, hq]
+
+private theorem progressTo_pending {pipe : Pipeline} {op : CurrentOp} {p : Progress} :
+    ({ pipe with current := some { op with progress := p } } : Pipeline).pending
+      = op.kind :: pipe.queued.toList := by rfl
+
+/-- Popping the head promotes the queue verbatim: the FIFO loses exactly its
+head entry. -/
+theorem advance_pending (pipe : Pipeline) :
+    (advance pipe).pending = pipe.queued.toList := by
+  unfold advance
+  split
+  · next k hq =>
+    show k :: (pipe.queued.extract 1 pipe.queued.size).toList = pipe.queued.toList
+    rw [toList_extract_size]
+    exact cons_drop_one (by rw [Array.getElem?_toList]; exact hq)
+  · next hq =>
+    have hqe : pipe.queued = #[] :=
+      Array.eq_empty_of_size_eq_zero (by
+        have := Array.getElem?_eq_none_iff.mp hq
+        omega)
+    show (pipe.queued.toList : List OpKind) = pipe.queued.toList
+    rfl
+
+private theorem dropUntilSync_none {l : List OpKind} (h : ∀ k ∈ l, k ≠ OpKind.sync) :
+    dropUntilSync l = [] := by
+  induction l with
+  | nil => rfl
+  | cons a t ih =>
+    unfold dropUntilSync
+    rw [if_neg (by
+      intro hb
+      exact h a (List.mem_cons_self ..) (opKind_eq_of_beq hb))]
+    exact ih (fun k hk => h k (List.mem_cons_of_mem _ hk))
+
+private theorem dropUntilSync_index : ∀ {l : List OpKind} {i : Nat} (hi : i < l.length),
+    l[i] = OpKind.sync → (∀ j (hj : j < i), l[j]'(Nat.lt_trans hj hi) ≠ OpKind.sync) →
+    dropUntilSync l = l.drop i := by
+  intro l
+  induction l with
+  | nil => intro i hi; exact absurd hi (by simp)
+  | cons a t ih =>
+    intro i hi hsync hmin
+    cases i with
+    | zero =>
+      simp only [List.getElem_cons_zero] at hsync
+      unfold dropUntilSync
+      rw [if_pos (by rw [hsync]; rfl)]
+      rfl
+    | succ i' =>
+      have ha : a ≠ OpKind.sync := by
+        have := hmin 0 (Nat.succ_pos i')
+        simpa using this
+      unfold dropUntilSync
+      rw [if_neg (by intro hb; exact ha (opKind_eq_of_beq hb))]
+      have hi' : i' < t.length := by simpa using hi
+      refine ih hi' ?_ ?_
+      · simpa using hsync
+      · intro j hj
+        have := hmin (j + 1) (Nat.succ_lt_succ hj)
+        simpa using this
+
+/-- The post-error pipeline's FIFO is exactly the shell's drop rule applied to
+the queue: everything up to the next pipelined Sync is cancelled. -/
+theorem abortToSync_pending (pipe : Pipeline) :
+    (abortToSync pipe).pending = dropUntilSync pipe.queued.toList := by
+  unfold abortToSync
+  cases hd : dropAborted (· == OpKind.sync) pipe.queued with
+  | mk rest found =>
+    cases found with
+    | false =>
+      obtain ⟨hrest, hall⟩ := dropAborted_none hd
+      show ([] : List OpKind) = _
+      refine (dropUntilSync_none ?_).symm
+      intro k hk
+      intro hks
+      have := hall k (Array.mem_def.mpr hk)
+      rw [hks] at this
+      cases this
+    | true =>
+      obtain ⟨i, hi, hp, hmin, hrest, -⟩ := dropAborted_found hd
+      have hli : pipe.queued.toList[i]'(by simpa using hi) = OpKind.sync := by
+        rw [Array.getElem_toList]
+        exact opKind_eq_of_beq hp
+      have hlmin : ∀ j (hj : j < i),
+          pipe.queued.toList[j]'(Nat.lt_trans hj (by simpa using hi)) ≠ OpKind.sync := by
+        intro j hj hks
+        rw [Array.getElem_toList] at hks
+        have := hmin j hj
+        rw [hks] at this
+        cases this
+      rw [dropUntilSync_index (by simpa using hi) hli hlmin]
+      show OpKind.sync :: (rest.extract 1 rest.size).toList = _
+      rw [toList_extract_size, hrest, toList_extract_size]
+      refine cons_drop_one ?_
+      rw [List.getElem?_drop, Nat.add_zero,
+        List.getElem?_eq_getElem (by simpa using hi), hli]
+
+private theorem stepRunning_fifo {s : State} {pipe : Pipeline} {m : BackendMsg}
+    (hph : s.phase = .running pipe) (hwf : pipe.WellFormed) :
+    ∀ {s' : State} {evs : Array Event} {out : ByteArray},
+      stepRunning s pipe m = .ok (s', evs, out) →
+      ∃ pipe', s'.phase = .running pipe' ∧ pipe'.pending = shellRun pipe.pending evs := by
+  fun_cases stepRunning s pipe m <;> intro s' evs out h <;> cases h
+  case case1 =>
+    rename_i fields hcur habt
+    refine ⟨pipe, hph, ?_⟩
+    rw [shellRun_single, pending_nil hcur (hwf.1 habt).2, shellStep_nil]
+  case case3 =>
+    rename_i fields op hcur hsimple
+    refine ⟨_, rfl, ?_⟩
+    rw [progressTo_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_drain (Or.inr ?_)).symm
+    unfold isSimple at hsimple
+    exact opKind_eq_of_beq hsimple
+  case case4 =>
+    rename_i fields op hcur hnotsimple hsync
+    refine ⟨_, rfl, ?_⟩
+    rw [progressTo_pending, shellRun_single, pending_cons hcur]
+    exact (shellStep_drain (Or.inl (opKind_eq_of_beq hsync))).symm
+  case case5 =>
+    rename_i fields op hcur hnotsimple hnotsync
+    refine ⟨_, rfl, ?_⟩
+    rw [abortToSync_pending, shellRun_single, pending_cons hcur]
+    unfold isSimple at hnotsimple
+    exact (shellStep_abort (Bool.eq_false_iff.mpr hnotsync)
+      (Bool.eq_false_iff.mpr hnotsimple)).symm
+  case case6 =>
+    rename_i tx op hcur hkind
+    refine ⟨_, rfl, ?_⟩
+    rw [advance_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_pop ?_).symm
+    simp only [Bool.or_eq_true] at hkind
+    cases hkind.imp opKind_eq_of_beq opKind_eq_of_beq with
+    | inl hk => rw [hk]; rfl
+    | inr hk => rw [hk]; rfl
+  case case10 =>
+    rename_i op hcur hguard
+    refine ⟨_, rfl, ?_⟩
+    rw [advance_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_pop ?_).symm
+    simp only [Bool.and_eq_true] at hguard
+    rw [opKind_eq_of_beq hguard.1]
+    rfl
+  case case13 =>
+    rename_i op hcur hguard
+    refine ⟨_, rfl, ?_⟩
+    rw [advance_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_pop ?_).symm
+    simp only [Bool.and_eq_true] at hguard
+    rw [opKind_eq_of_beq hguard.1]
+    rfl
+  case case16 =>
+    rename_i op hcur hguard
+    refine ⟨_, rfl, ?_⟩
+    rw [advance_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_pop ?_).symm
+    simp only [Bool.and_eq_true] at hguard
+    rw [opKind_eq_of_beq hguard.1]
+    rfl
+  case case19 =>
+    rename_i oids op hcur hguard
+    refine ⟨_, rfl, ?_⟩
+    rw [progressTo_pending, shellRun_single, pending_cons hcur]
+    exact (shellStep_keep_all (fun k => by cases k <;> rfl) rfl).symm
+  case case22 =>
+    rename_i columns op hcur hprog hkind
+    refine ⟨_, rfl, ?_⟩
+    rw [advance_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_pop ?_).symm
+    rw [hkind]
+    rfl
+  case case23 =>
+    rename_i columns op hcur hprog hkind
+    refine ⟨_, rfl, ?_⟩
+    rw [advance_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_pop ?_).symm
+    rw [hkind]
+    rfl
+  case case24 =>
+    rename_i columns op hcur hprog hkind
+    refine ⟨_, rfl, ?_⟩
+    rw [progressTo_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_keep ?_ rfl).symm
+    rw [hkind]
+    rfl
+  case case27 =>
+    rename_i op hcur hprog hkind
+    refine ⟨_, rfl, ?_⟩
+    rw [advance_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_pop ?_).symm
+    rw [hkind]
+    rfl
+  case case28 =>
+    rename_i op hcur hprog hkind
+    refine ⟨_, rfl, ?_⟩
+    rw [advance_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_pop ?_).symm
+    rw [hkind]
+    rfl
+  case case31 =>
+    rename_i columns op hcur hprog hkind
+    refine ⟨_, rfl, ?_⟩
+    rw [progressTo_pending, shellRun_single, pending_cons hcur]
+    exact (shellStep_keep_all (fun k => by cases k <;> rfl) rfl).symm
+  case case32 =>
+    rename_i columns op hcur cols hprog hkind
+    refine ⟨_, rfl, ?_⟩
+    rw [shellRun_single]
+    exact (shellStep_keep_all (fun k => by cases k <;> rfl) rfl).symm
+  case case33 =>
+    rename_i columns op hcur hkind n hsize hprog
+    refine ⟨_, rfl, ?_⟩
+    rw [shellRun_single]
+    exact (shellStep_keep_all (fun k => by cases k <;> rfl) rfl).symm
+  case case35 =>
+    rename_i columns op hcur hkind hprog
+    refine ⟨_, rfl, ?_⟩
+    rw [shellRun_single]
+    exact (shellStep_keep_all (fun k => by cases k <;> rfl) rfl).symm
+  case case38 =>
+    rename_i tag op hcur hkind
+    refine ⟨_, rfl, ?_⟩
+    rw [advance_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_pop ?_).symm
+    rw [hkind]
+    rfl
+  case case39 =>
+    rename_i tag op hcur hkind
+    refine ⟨_, rfl, ?_⟩
+    rw [progressTo_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_keep ?_ rfl).symm
+    rw [hkind]
+    rfl
+  case case42 =>
+    rename_i op hcur hkind
+    refine ⟨_, rfl, ?_⟩
+    rw [advance_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_pop ?_).symm
+    rw [hkind]
+    rfl
+  case case43 =>
+    rename_i op hcur hkind
+    refine ⟨_, rfl, ?_⟩
+    rw [progressTo_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_keep ?_ rfl).symm
+    rw [hkind]
+    rfl
+  case case46 =>
+    rename_i op hcur hguard
+    refine ⟨_, rfl, ?_⟩
+    rw [advance_pending, shellRun_single, pending_cons hcur]
+    refine (shellStep_pop ?_).symm
+    rw [opKind_eq_of_beq hguard]
+    rfl
+  case case49 =>
+    rename_i overall formats op hcur hguard hqueue info
+    refine ⟨_, rfl, ?_⟩
+    rw [progressTo_pending, shellRun_single, pending_cons hcur]
+    exact (shellStep_keep_all (fun k => by cases k <;> rfl) rfl).symm
+  case case53 =>
+    rename_i overall formats op hcur hguard hqueue info
+    refine ⟨_, rfl, ?_⟩
+    rw [progressTo_pending, shellRun_single, pending_cons hcur]
+    exact (shellStep_keep_all (fun k => by cases k <;> rfl) rfl).symm
+  case case57 =>
+    rename_i data op hcur info hprog
+    refine ⟨_, rfl, ?_⟩
+    rw [shellRun_single]
+    exact (shellStep_keep_all (fun k => by cases k <;> rfl) rfl).symm
+  case case60 =>
+    rename_i op hcur info hprog
+    refine ⟨_, rfl, ?_⟩
+    rw [progressTo_pending, shellRun_single, pending_cons hcur]
+    exact (shellStep_keep_all (fun k => by cases k <;> rfl) rfl).symm
+
+/-- **FIFO refinement, one message**: from a well-formed running state, the
+machine's pending-op queue evolves exactly as the shell's purely event-driven
+FIFO does (and the connection stays in the running phase). -/
+theorem step_fifo {s : State} {pipe : Pipeline} {msg : RawMessage} {s' : State}
+    {evs : Array Event} {out : ByteArray}
+    (hph : s.phase = .running pipe) (hwf : pipe.WellFormed)
+    (h : step s msg = .ok (s', evs, out)) :
+    ∃ pipe', s'.phase = .running pipe' ∧ pipe'.pending = shellRun pipe.pending evs := by
+  revert h
+  fun_cases step s msg
+  case case3 =>
+    intro h
+    cases h
+    exact ⟨pipe, hph, by
+      rw [shellRun_single]
+      exact (shellStep_keep_all (fun k => by cases k <;> rfl) rfl).symm⟩
+  case case4 =>
+    intro h
+    cases h
+    exact ⟨pipe, hph, by
+      rw [shellRun_single]
+      exact (shellStep_keep_all (fun k => by cases k <;> rfl) rfl).symm⟩
+  case case5 =>
+    intro h
+    cases h
+    exact ⟨pipe, hph, by
+      rw [shellRun_single]
+      exact (shellStep_keep_all (fun k => by cases k <;> rfl) rfl).symm⟩
+  case case6 =>
+    rename_i m hdec auth hph2 hn1 hn2 hn3
+    rw [hph] at hph2
+    cases hph2
+  case case7 =>
+    rename_i m hdec pipe2 hph2 hn1 hn2 hn3
+    rw [hph] at hph2
+    injection hph2 with hp
+    subst hp
+    intro h
+    exact stepRunning_fifo hph hwf h
+  all_goals (intro h; cases h)
+
+private theorem runSteps_fifo_aux :
+    ∀ {msgs : List RawMessage} {s : State} {pipe : Pipeline} {events : Array Event}
+      {out : ByteArray} {r : State × Array Event × ByteArray},
+      s.phase = .running pipe → pipe.WellFormed →
+      runSteps s msgs events out = .ok r →
+      ∃ (evs' : Array Event) (pipe' : Pipeline),
+        r.2.1 = events ++ evs' ∧ r.1.phase = .running pipe' ∧
+        pipe'.pending = shellRun pipe.pending evs' := by
+  intro msgs
+  induction msgs with
+  | nil =>
+    intro s pipe events out r hph hwf h
+    cases h
+    exact ⟨#[], pipe, Array.append_empty.symm, hph, rfl⟩
+  | cons m rest ih =>
+    intro s pipe events out r hph hwf h
+    unfold runSteps at h
+    cases hst : step s m with
+    | error e =>
+      rw [hst] at h
+      cases h
+    | ok res =>
+      obtain ⟨s1, evs1, b1⟩ := res
+      rw [hst] at h
+      obtain ⟨pipe1, hph1, hfifo1⟩ := step_fifo hph hwf hst
+      have hwf1 : pipe1.WellFormed :=
+        pipe_wf_of_running hph1 (step_wellFormed (wf_of_phase_running hph hwf) hst)
+      obtain ⟨evs2, pipe2, hev, hph2, hfifo2⟩ := ih hph1 hwf1 h
+      refine ⟨evs1 ++ evs2, pipe2, ?_, hph2, ?_⟩
+      · rw [hev, Array.append_assoc]
+      · rw [hfifo2, hfifo1, shellRun_append]
+
+/-- **FIFO refinement, whole frame batch**: the machine's pending-op queue
+after stepping a list of frames is exactly the shell's FIFO after folding the
+emitted events through `shellStep`. -/
+theorem runSteps_fifo {msgs : List RawMessage} {s : State} {pipe : Pipeline}
+    {s' : State} {evs : Array Event} {out : ByteArray}
+    (hph : s.phase = .running pipe) (hwf : pipe.WellFormed)
+    (h : runSteps s msgs #[] ByteArray.empty = .ok (s', evs, out)) :
+    ∃ pipe', s'.phase = .running pipe' ∧ pipe'.pending = shellRun pipe.pending evs := by
+  obtain ⟨evs', pipe', hev, hph', hfifo⟩ :=
+    runSteps_fifo_aux (r := (s', evs, out)) hph hwf h
+  have hevs : evs = evs' := by
+    rw [Array.empty_append] at hev
+    exact hev
+  refine ⟨pipe', hph', ?_⟩
+  rw [hevs]
+  exact hfifo
+
+/-- **FIFO refinement, whole TCP chunk**: everything the shell learns from one
+`feed` moves its event-driven FIFO exactly as the machine moved its
+pending-op queue. -/
+theorem feed_fifo {s : State} {pipe : Pipeline} {chunk : ByteArray} {s' : State}
+    {evs : Array Event} {out : ByteArray}
+    (hph : s.phase = .running pipe) (hwf : pipe.WellFormed)
+    (h : feed s chunk = .ok (s', evs, out)) :
+    ∃ pipe', s'.phase = .running pipe' ∧ pipe'.pending = shellRun pipe.pending evs := by
+  unfold feed at h
+  split at h
+  · cases h
+  · split at h
+    rename_i fed hd msgs decode htake
+    exact runSteps_fifo (s := { s with decode := decode }) hph hwf h
+
+/-- **Attribution**: a user-visible success is the terminal reply of the op at
+the *head* of the correlation FIFO, and it removes exactly that one entry — so
+every success is attributed to exactly one submitted operation, in submission
+order. -/
+theorem terminal_pops_head {s : State} {pipe : Pipeline} {msg : RawMessage}
+    {s' : State} {ev : Event} {out : ByteArray} {k : OpKind} {rest : List OpKind}
+    (hph : s.phase = .running pipe) (hwf : pipe.WellFormed)
+    (hfifo : pipe.pending = k :: rest) (hterm : isTerminal k ev = true)
+    (h : step s msg = .ok (s', #[ev], out)) :
+    ∃ pipe', s'.phase = .running pipe' ∧ pipe'.pending = rest := by
+  obtain ⟨pipe', hph', hp⟩ := step_fifo hph hwf h
+  exact ⟨pipe', hph', by rw [hp, shellRun_single, hfifo, shellStep_pop hterm]⟩
+
+/-- Complement: nothing else pops. A reply that is not the head op's terminal
+and not an error leaves every pending request exactly where it was — in
+particular a simple query's per-statement `commandComplete` does not complete
+the query. -/
+theorem nonterminal_preserves_fifo {s : State} {pipe : Pipeline} {msg : RawMessage}
+    {s' : State} {ev : Event} {out : ByteArray} {k : OpKind} {rest : List OpKind}
+    (hph : s.phase = .running pipe) (hwf : pipe.WellFormed)
+    (hfifo : pipe.pending = k :: rest) (hterm : isTerminal k ev = false)
+    (herr : isRecoverableError ev = false)
+    (h : step s msg = .ok (s', #[ev], out)) :
+    ∃ pipe', s'.phase = .running pipe' ∧ pipe'.pending = k :: rest := by
+  obtain ⟨pipe', hph', hp⟩ := step_fifo hph hwf h
+  exact ⟨pipe', hph', by rw [hp, shellRun_single, hfifo, shellStep_keep hterm herr]⟩
+
+/-- An extended-protocol error cancels exactly the expectations up to the next
+pipelined Sync — no more, no less. -/
+theorem error_drops_to_sync {s : State} {pipe : Pipeline} {msg : RawMessage}
+    {s' : State} {fields : ErrorFields} {out : ByteArray} {k : OpKind}
+    {rest : List OpKind}
+    (hph : s.phase = .running pipe) (hwf : pipe.WellFormed)
+    (hfifo : pipe.pending = k :: rest) (hnotsync : k ≠ .sync)
+    (hnotsimple : k ≠ .simpleQuery)
+    (h : step s msg = .ok (s', #[.errorResponse fields], out)) :
+    ∃ pipe', s'.phase = .running pipe' ∧ pipe'.pending = dropUntilSync rest := by
+  obtain ⟨pipe', hph', hp⟩ := step_fifo hph hwf h
+  refine ⟨pipe', hph', ?_⟩
+  rw [hp, shellRun_single, hfifo,
+    shellStep_abort (opKind_beq_eq_false hnotsync) (opKind_beq_eq_false hnotsimple)]
+
+private theorem enqueue_pending {pipe : Pipeline} (hwf : pipe.WellFormed)
+    (kind : OpKind) : (enqueue pipe kind).pending = pipe.pending ++ [kind] := by
+  unfold enqueue
+  split
+  · next hc =>
+    have hq : pipe.queued = #[] := hwf.2.1 hc
+    show kind :: pipe.queued.toList = pipe.pending ++ [kind]
+    rw [pending_nil hc hq, hq]
+    rfl
+  · next op hc =>
+    rw [pending_cons (pipe := { pipe with queued := pipe.queued.push kind }) hc,
+      pending_cons hc, Array.toList_push]
+    rfl
+
+private theorem submitIdle_fifo {s : State} {pipe : Pipeline} {req : Request}
+    (hph : s.phase = .running pipe) (hwf : pipe.WellFormed) :
+    ∀ {s' : State} {out : ByteArray}, submitIdle s pipe req = .ok (s', out) →
+      (∃ pipe', s'.phase = .running pipe' ∧
+        (pipe'.pending = pipe.pending ∨ ∃ k, pipe'.pending = pipe.pending ++ [k])) ∨
+      s'.phase = .closed := by
+  fun_cases submitIdle s pipe req with
+  | case1 habt =>
+    intro s' out h
+    cases h
+    obtain ⟨hc, hq⟩ := hwf.1 habt
+    have hwf' : Pipeline.WellFormed { pipe with aborted := false } := by
+      refine ⟨(fun hh => nomatch hh), (fun _ => hq), ?_⟩
+      show (match pipe.current with
+        | none => True
+        | some op => op.Coherent ∧ _)
+      rw [hc]
+      exact True.intro
+    exact Or.inl ⟨_, rfl, Or.inr ⟨.sync, enqueue_pending hwf' .sync⟩⟩
+  | case2 habt =>
+    intro s' out h
+    cases h
+    exact Or.inr rfl
+  | case3 habt hne =>
+    intro s' out h
+    cases h
+  | case12 hnab =>
+    intro s' out h
+    cases h
+    exact Or.inl ⟨pipe, hph, Or.inl rfl⟩
+  | case14 hnab data =>
+    intro s' out h
+    cases h
+  | case15 hnab =>
+    intro s' out h
+    cases h
+  | case16 hnab reason =>
+    intro s' out h
+    cases h
+  | case17 hnab =>
+    intro s' out h
+    cases h
+    exact Or.inr rfl
+  | _ =>
+    intro s' out h
+    cases h
+    exact Or.inl ⟨_, rfl, Or.inr ⟨_, enqueue_pending hwf _⟩⟩
+
+private theorem submitRunning_fifo {s : State} {pipe : Pipeline} {req : Request}
+    (hph : s.phase = .running pipe) (hwf : pipe.WellFormed) :
+    ∀ {s' : State} {out : ByteArray}, submitRunning s pipe req = .ok (s', out) →
+      (∃ pipe', s'.phase = .running pipe' ∧
+        (pipe'.pending = pipe.pending ∨ ∃ k, pipe'.pending = pipe.pending ++ [k])) ∨
+      s'.phase = .closed := by
+  fun_cases submitRunning s pipe req with
+  | case1 op hcur info hprog data =>
+    intro s' out h
+    cases h
+    exact Or.inl ⟨pipe, hph, Or.inl rfl⟩
+  | case2 op hcur info hprog =>
+    intro s' out h
+    cases h
+    exact Or.inl ⟨_, rfl, Or.inl (by rw [progressTo_pending, pending_cons hcur])⟩
+  | case3 op hcur info hprog reason =>
+    intro s' out h
+    cases h
+    exact Or.inl ⟨_, rfl, Or.inl (by rw [progressTo_pending, pending_cons hcur])⟩
+  | case4 op hcur info hprog =>
+    intro s' out h
+    cases h
+    exact Or.inl ⟨pipe, hph, Or.inl rfl⟩
+  | case5 op hcur info hprog =>
+    intro s' out h
+    cases h
+    exact Or.inr rfl
+  | case6 op hcur info hprog hne =>
+    intro s' out h
+    cases h
+  | case7 =>
+    intro s' out h
+    exact submitIdle_fifo hph hwf h
+  | case8 =>
+    intro s' out h
+    exact submitIdle_fifo hph hwf h
+
+/-- Submissions only ever **append** to the correlation FIFO: one entry per
+accepted request, in submission order (Flush and COPY-data traffic add none;
+Terminate closes the connection). With `feed_fifo` this is the FIFO
+refinement in full — the shell's queue is always exactly the machine's. -/
+theorem submit_fifo {s : State} {pipe : Pipeline} {req : Request} {s' : State}
+    {out : ByteArray} (hph : s.phase = .running pipe) (hwf : pipe.WellFormed)
+    (h : submit s req = .ok (s', out)) :
+    (∃ pipe', s'.phase = .running pipe' ∧
+      (pipe'.pending = pipe.pending ∨ ∃ k, pipe'.pending = pipe.pending ++ [k])) ∨
+    s'.phase = .closed := by
+  revert h
+  fun_cases submit s req
+  case case2 =>
+    intro h
+    cases h
+    exact Or.inr rfl
+  case case4 =>
+    rename_i pipe2 hph2
+    rw [hph] at hph2
+    injection hph2 with hp
+    subst hp
+    intro h
+    exact submitRunning_fifo hph hwf h
+  all_goals (intro h; cases h)
 
 end Machine
 end Protocol
