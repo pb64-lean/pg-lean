@@ -260,16 +260,23 @@ sleep in `Pg/Connection.lean`), and **no `@[extern]` constants at all** —
 the audit. pg-lean's crypto is pure Lean; the only native code it runs is
 `tls13-lean`'s HACL* bindings, audited in that repository.
 
-Beyond the standard three (`propext`, `Classical.choice`, `Quot.sound`) the
-allowed axiom set is exactly seven LRAT-certificate axioms, listed by full name
-in [`assurance.bzl`](assurance.bzl). Lean 4.31's `bv_decide` checks the SAT
-solver's refutation with a natively compiled checker and records that check as
-one axiom per call site; pg-lean uses `bv_decide` only for big-endian byte
-(de)composition (three in `pack_unpack`, one each in `getUInt16?_putUInt16`,
-`getUInt32?_putUInt32`, `rdUInt64_putInt64BE`, and
-`PgInterval.fromBinary_toBinary`). They are enumerated individually rather than
-matched by pattern so that a *new* `bv_decide` call site fails every assurance
-target and has to be justified.
+The allowed axiom set is **exactly the standard three** — `propext`,
+`Classical.choice`, `Quot.sound` — and the scan reports `declared axioms in
+scope: none`. There is no `sorry`, no `native_decide`, and no SAT/LRAT
+certificate anywhere in the trusted surface.
+
+Getting there took removing the last non-standard axioms. Lean 4.31's
+`bv_decide` checks the SAT solver's refutation with a *natively compiled* LRAT
+checker and records that check as one axiom per call site; pg-lean had seven,
+all for big-endian byte (de)composition. They are now proved at the `Nat` level
+instead: `Nat.shiftLeft_add_eq_or_of_lt` turns a disjoint `|||` into `+`
+(`or_add_lt`), after which `omega` decides every extraction identity, because
+it handles `/` and `%` by literal powers of two. See `pack_nat16`/`pack_nat32`/
+`unpack_pack16`/`unpack_pack32` in [`Pg/Protocol/Message.lean`](Pg/Protocol/Message.lean)
+and `pack_nat64`/`unpack_pack64` in [`Pg/Types/Codec.lean`](Pg/Types/Codec.lean);
+neither module imports `Std.Tactic.BVDecide` any more. Keeping the list at
+three means any new axiom, from any tactic, in any module under `Pg`, fails
+every assurance target and has to be justified.
 
 ## Testing (the yardstick)
 

@@ -9,8 +9,6 @@ public import Pg.Types.Interval
 import all Std.Time.Date.PlainDate
 import Std.Data.String.ToNat
 import Std.Data.String.ToInt
-import Std.Tactic.BVDecide
-public meta import Std.Tactic.BVDecide.Reflect
 
 public section
 
@@ -883,6 +881,37 @@ The big-endian binary writers and readers invert each other:
 `rdIntAny` recovers the mathematical integer at every width.
 -/
 
+/-- Disjoint or/add: `b` occupies strictly the low `i` bits, `a * 2 ^ i` only
+bits at or above `i`, so the two combine additively. (`Pg.Protocol` has the
+same helper for the 16/32-bit widths; it is `private` there.) -/
+private theorem or_add_lt {a b i : Nat} (hb : b < 2 ^ i) :
+    a * 2 ^ i ||| b = a * 2 ^ i + b := by
+  rw [show a * 2 ^ i = a <<< i from (Nat.shiftLeft_eq a i).symm,
+    ← Nat.shiftLeft_add_eq_or_of_lt hb]
+
+/-- The numeric value of a big-endian pair of `UInt32` halves. -/
+private theorem pack_nat64 (hi lo : UInt32) :
+    (hi.toUInt64 <<< 32 ||| lo.toUInt64).toNat = hi.toNat * 2 ^ 32 + lo.toNat := by
+  have h0 := hi.toNat_lt
+  have h1 := lo.toNat_lt
+  simp only [UInt64.toNat_or, UInt64.toNat_shiftLeft, UInt32.toNat_toUInt64,
+    show UInt64.toNat 32 % 64 = 32 from rfl, Nat.shiftLeft_eq]
+  rw [show hi.toNat * 2 ^ 32 % 2 ^ 64 = hi.toNat * 2 ^ 32 from by omega,
+    or_add_lt (i := 32)]
+  omega
+
+/-- Splitting a `UInt64` into big-endian `UInt32` halves and repacking is the
+identity — the 64-bit counterpart of `Pg.Protocol.pack_unpack`, proved by
+`omega` over `Nat` rather than by an LRAT certificate. -/
+private theorem unpack_pack64 (u : UInt64) :
+    (u >>> 32).toUInt32.toUInt64 <<< 32 ||| u.toUInt32.toUInt64 = u := by
+  apply UInt64.toNat_inj.mp
+  rw [pack_nat64]
+  have hv := u.toNat_lt
+  simp only [UInt64.toNat_toUInt32, UInt64.toNat_shiftRight,
+    show UInt64.toNat 32 % 64 = 32 from rfl, Nat.shiftRight_eq_div_pow]
+  omega
+
 theorem size_putInt64BE (v : Int64) : (putInt64BE v).size = 8 := by
   unfold putInt64BE
   rw [Protocol.size_putUInt32, Protocol.size_putUInt32, ByteArray.size_empty]
@@ -925,7 +954,7 @@ theorem rdInt32_putInt32 (x : Int32) :
 theorem rdUInt64_putInt64BE (v : Int64) : rdUInt64 (putInt64BE v) = .ok v.toUInt64 := by
   unfold rdUInt64
   simp only [Nat.zero_add, getUInt32?_putInt64BE_0, getUInt32?_putInt64BE_4]
-  exact congrArg Except.ok (by bv_decide)
+  exact congrArg Except.ok (unpack_pack64 v.toUInt64)
 
 theorem rdInt64_putInt64BE (v : Int64) : rdInt64 (putInt64BE v) = .ok v := by
   unfold rdInt64
@@ -1000,8 +1029,7 @@ theorem PgInterval.fromBinary_toBinary (m d : Int32) (u : Int64) :
     simp only [Nat.zero_add, h0, h4]
     show Except.ok ((u.toUInt64 >>> 32).toUInt32.toUInt64 <<< 32 |||
       u.toUInt64.toUInt32.toUInt64).toInt64 = Except.ok u
-    rw [show ((u.toUInt64 >>> 32).toUInt32.toUInt64 <<< 32 |||
-      u.toUInt64.toUInt32.toUInt64) = u.toUInt64 by bv_decide, Int64.toInt64_toUInt64]
+    rw [unpack_pack64 u.toUInt64, Int64.toInt64_toUInt64]
   have hrd8 : rdInt32 b 8 = .ok d := by
     unfold rdInt32
     simp only [h8, Int32.toInt32_toUInt32]

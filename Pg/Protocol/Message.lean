@@ -1,8 +1,5 @@
 module
 
-import Std.Tactic.BVDecide
-public meta import Std.Tactic.BVDecide.Reflect
-
 public section
 
 namespace Pg
@@ -350,6 +347,53 @@ private theorem getUInt32?_spec {bytes : ByteArray} {off : Nat} {v : UInt32}
     get!_eq_getElem (show off + 2 < bytes.size by omega),
     get!_eq_getElem (show off + 3 < bytes.size by omega)]
 
+/-!
+Big-endian byte (de)composition, at the `Nat` level.
+
+`Nat.shiftLeft_add_eq_or_of_lt` turns a disjoint `|||` into `+` whenever the
+low operand fits below the shift, which is exactly the situation in a
+big-endian recomposition. Once every `|||` is an `+`, `omega` decides the
+extraction identities (it handles `/` and `%` by literal powers of two). This
+replaces `bv_decide`, whose LRAT certificate would be an extra axiom.
+-/
+
+/-- Disjoint or/add: `b` occupies strictly the low `i` bits, `a * 2 ^ i` only
+bits at or above `i`, so the two combine additively. -/
+private theorem or_add_lt {a b i : Nat} (hb : b < 2 ^ i) :
+    a * 2 ^ i ||| b = a * 2 ^ i + b := by
+  rw [show a * 2 ^ i = a <<< i from (Nat.shiftLeft_eq a i).symm,
+    ← Nat.shiftLeft_add_eq_or_of_lt hb]
+
+/-- The numeric value of a big-endian 2-byte packing. -/
+private theorem pack_nat16 (b0 b1 : UInt8) :
+    (b0.toUInt16 <<< 8 ||| b1.toUInt16).toNat = b0.toNat * 2 ^ 8 + b1.toNat := by
+  have h0 := b0.toNat_lt
+  have h1 := b1.toNat_lt
+  simp only [UInt16.toNat_or, UInt16.toNat_shiftLeft, UInt8.toNat_toUInt16,
+    show UInt16.toNat 8 % 16 = 8 from rfl, Nat.shiftLeft_eq]
+  rw [show b0.toNat * 2 ^ 8 % 2 ^ 16 = b0.toNat * 2 ^ 8 from by omega,
+    or_add_lt (i := 8)]
+  omega
+
+/-- The numeric value of a big-endian 4-byte packing. -/
+private theorem pack_nat32 (b0 b1 b2 b3 : UInt8) :
+    (b0.toUInt32 <<< 24 ||| b1.toUInt32 <<< 16 ||| b2.toUInt32 <<< 8 |||
+      b3.toUInt32).toNat =
+      b0.toNat * 2 ^ 24 + (b1.toNat * 2 ^ 16 + (b2.toNat * 2 ^ 8 + b3.toNat)) := by
+  have h0 := b0.toNat_lt
+  have h1 := b1.toNat_lt
+  have h2 := b2.toNat_lt
+  have h3 := b3.toNat_lt
+  simp only [UInt32.toNat_or, UInt32.toNat_shiftLeft, UInt8.toNat_toUInt32,
+    show UInt32.toNat 24 % 32 = 24 from rfl, show UInt32.toNat 16 % 32 = 16 from rfl,
+    show UInt32.toNat 8 % 32 = 8 from rfl, Nat.shiftLeft_eq]
+  rw [show b0.toNat * 2 ^ 24 % 2 ^ 32 = b0.toNat * 2 ^ 24 from by omega,
+    show b1.toNat * 2 ^ 16 % 2 ^ 32 = b1.toNat * 2 ^ 16 from by omega,
+    show b2.toNat * 2 ^ 8 % 2 ^ 32 = b2.toNat * 2 ^ 8 from by omega,
+    Nat.or_assoc, Nat.or_assoc, or_add_lt (i := 8), or_add_lt (i := 16),
+    or_add_lt (i := 24)]
+  all_goals omega
+
 /-- Big-endian packing then unpacking each byte is the identity. -/
 private theorem pack_unpack (b0 b1 b2 b3 : UInt8) :
     (((b0.toUInt32 <<< 24 ||| b1.toUInt32 <<< 16 ||| b2.toUInt32 <<< 8 |||
@@ -360,7 +404,38 @@ private theorem pack_unpack (b0 b1 b2 b3 : UInt8) :
         b3.toUInt32) >>> 8).toUInt8 = b2) ∧
     ((b0.toUInt32 <<< 24 ||| b1.toUInt32 <<< 16 ||| b2.toUInt32 <<< 8 |||
         b3.toUInt32).toUInt8 = b3) := by
-  refine ⟨?_, ?_, ?_, ?_⟩ <;> bv_decide
+  have h0 := b0.toNat_lt
+  have h1 := b1.toNat_lt
+  have h2 := b2.toNat_lt
+  have h3 := b3.toNat_lt
+  have hp := pack_nat32 b0 b1 b2 b3
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> apply UInt8.toNat_inj.mp <;>
+    simp only [UInt32.toNat_toUInt8, UInt32.toNat_shiftRight,
+      show UInt32.toNat 24 % 32 = 24 from rfl, show UInt32.toNat 16 % 32 = 16 from rfl,
+      show UInt32.toNat 8 % 32 = 8 from rfl, Nat.shiftRight_eq_div_pow, hp] <;>
+    omega
+
+/-- Splitting a `UInt16` into big-endian bytes and repacking is the identity. -/
+private theorem unpack_pack16 (v : UInt16) :
+    (v >>> 8).toUInt8.toUInt16 <<< 8 ||| v.toUInt8.toUInt16 = v := by
+  apply UInt16.toNat_inj.mp
+  rw [pack_nat16]
+  have hv := v.toNat_lt
+  simp only [UInt16.toNat_toUInt8, UInt16.toNat_shiftRight,
+    show UInt16.toNat 8 % 16 = 8 from rfl, Nat.shiftRight_eq_div_pow]
+  omega
+
+/-- Splitting a `UInt32` into big-endian bytes and repacking is the identity. -/
+private theorem unpack_pack32 (v : UInt32) :
+    (v >>> 24).toUInt8.toUInt32 <<< 24 ||| (v >>> 16).toUInt8.toUInt32 <<< 16 |||
+      (v >>> 8).toUInt8.toUInt32 <<< 8 ||| v.toUInt8.toUInt32 = v := by
+  apply UInt32.toNat_inj.mp
+  rw [pack_nat32]
+  have hv := v.toNat_lt
+  simp only [UInt32.toNat_toUInt8, UInt32.toNat_shiftRight,
+    show UInt32.toNat 24 % 32 = 24 from rfl, show UInt32.toNat 16 % 32 = 16 from rfl,
+    show UInt32.toNat 8 % 32 = 8 from rfl, Nat.shiftRight_eq_div_pow]
+  omega
 
 private theorem putUInt32_empty (v : UInt32) :
     putUInt32 ByteArray.empty v =
@@ -409,7 +484,7 @@ theorem getUInt16?_putUInt16 (v : UInt16) :
   rw [get!_eq_getElem (by omega), get!_eq_getElem (by omega)]
   simp only [List.getElem_toByteArray, List.getElem_cons_zero, List.getElem_cons_succ]
   congr 1
-  bv_decide
+  exact unpack_pack16 v
 
 theorem putInt32_eq (a : ByteArray) (v : Int32) :
     putInt32 a v = putUInt32 a v.toUInt32 := by rfl
@@ -431,7 +506,7 @@ theorem getUInt32?_putUInt32 (v : UInt32) :
     get!_eq_getElem (by omega), get!_eq_getElem (by omega)]
   simp only [List.getElem_toByteArray, List.getElem_cons_zero, List.getElem_cons_succ]
   congr 1
-  bv_decide
+  exact unpack_pack32 v
 
 /-- A decoded frame re-encodes to exactly the bytes it was cut from. -/
 private theorem encode_extract {buffered : ByteArray} {len32 : UInt32}
