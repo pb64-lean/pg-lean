@@ -212,29 +212,20 @@ def clientHelloExtensions (hello : Handshake.Message) :
   -- so this test checks the shipped parser rather than a hand-rolled copy.
   Handshake.parseExtensions extensionBytes
 
-structure OfferedKeyShare where
-  group : Handshake.NamedGroup
-  keyExchange : ByteArray
-  deriving Inhabited, BEq
-
 def extractClientHelloShares (hello : Handshake.Message) :
-    Except String (Array OfferedKeyShare) := do
+    Except String (Array Handshake.ClientKeyShare) := do
   let extensions ← clientHelloExtensions hello
   let some keyShare := extensions.find? (·.extensionType == Handshake.keyShareExtension)
     | throw "missing client key_share"
   let keyReader : Handshake.Reader := { bytes := keyShare.data }
   let (shares, keyReader) ← keyReader.readVector16
   keyReader.requireEnd "client key_share extension"
-  let mut shareReader : Handshake.Reader := { bytes := shares }
-  let mut out : Array OfferedKeyShare := #[]
-  while !shareReader.atEnd do
-    let (groupId, shareReader') ← shareReader.readUInt16
-    let some group := Handshake.NamedGroup.ofUInt16? groupId
-      | throw s!"unknown client key-share group {groupId}"
-    let (keyExchange, shareReader') ← shareReader'.readVector16
-    out := out.push { group, keyExchange }
-    shareReader := shareReader'
-  pure out
+  -- tls13-lean's own key_share parser (proved: `parseKeyShareEntries_keyShareEntriesBytes`
+  -- and `parseKeyShareEntries_image`), so this test checks the shipped parser
+  -- rather than a hand-rolled copy. Unknown/GREASE groups are retained only as
+  -- identifiers, which is why the entries come back paired with the id list.
+  let (_, entries) ← Handshake.parseKeyShareEntries shares
+  pure entries
 
 def extractClientHelloKey (hello : Handshake.Message) : Except String ByteArray := do
   let shares ← extractClientHelloShares hello
@@ -252,15 +243,11 @@ def extractClientHelloGroups (hello : Handshake.Message) :
   let reader : Handshake.Reader := { bytes := supportedGroups.data }
   let (encodedGroups, reader) ← reader.readVector16
   reader.requireEnd "supported_groups extension"
-  let mut groupsReader : Handshake.Reader := { bytes := encodedGroups }
-  let mut groups : Array Handshake.NamedGroup := #[]
-  while !groupsReader.atEnd do
-    let (groupId, groupsReader') ← groupsReader.readUInt16
-    let some group := Handshake.NamedGroup.ofUInt16? groupId
-      | throw s!"unknown supported group {groupId}"
-    groups := groups.push group
-    groupsReader := groupsReader'
-  pure groups
+  -- tls13-lean's own uint16-vector parser (proved: `parseUInt16List_uint16ListBytes`,
+  -- `parseUInt16List_image`, `parseUInt16List_injective`) plus its `knownGroups`
+  -- projection, rather than a hand-rolled copy.
+  let ids ← Handshake.parseUInt16List encodedGroups
+  pure (Handshake.knownGroups ids.toList)
 
 def makeServerHelloForGroup (random publicKey : ByteArray)
     (group : Handshake.NamedGroup)
