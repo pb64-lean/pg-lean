@@ -586,6 +586,24 @@ theorem getUInt32?_append_right {a b : ByteArray} {off : Nat} (h : a.size ≤ of
     rw [e1, e2, e3]
   · rw [if_neg (by omega), if_neg hle]
 
+/-- The 16-bit reader ignores a suffix it does not reach. -/
+theorem getUInt16?_append_left {a b : ByteArray} {off : Nat} (h : off + 2 ≤ a.size) :
+    getUInt16? (a ++ b) off = getUInt16? a off := by
+  unfold getUInt16?
+  rw [if_pos h, if_pos (show off + 2 ≤ (a ++ b).size by rw [ByteArray.size_append]; omega)]
+  rw [get!_append_left (by omega), get!_append_left (by omega)]
+
+/-- Reading past a prefix reads the suffix. -/
+theorem getUInt16?_append_right {a b : ByteArray} {off : Nat} (h : a.size ≤ off) :
+    getUInt16? (a ++ b) off = getUInt16? b (off - a.size) := by
+  unfold getUInt16?
+  rw [ByteArray.size_append]
+  by_cases hle : off - a.size + 2 ≤ b.size
+  · rw [if_pos (by omega), if_pos hle]
+    rw [get!_append_right (by omega) (by omega), get!_append_right (by omega) (by omega),
+      show off + 1 - a.size = off - a.size + 1 from by omega]
+  · rw [if_neg (by omega), if_neg hle]
+
 private theorem extract_append_left_of_le {a b : ByteArray} {i j : Nat}
     (hij : i ≤ j) (hj : j ≤ a.size) : (a ++ b).extract i j = a.extract i j := by
   rw [ByteArray.extract_append,

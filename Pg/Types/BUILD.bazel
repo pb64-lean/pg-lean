@@ -47,6 +47,11 @@ lean_assurance_test(
         "Pg.rdIntAny_putInt32",
         "Pg.rdIntAny_putInt64BE",
         "Pg.PgInterval.fromBinary_toBinary",
+        # numeric: no precision is lost in the base-10000 binary form.
+        "Pg.PgNumeric.fromBinary_toBinary",
+        "Pg.PgNumeric.fromBinary_toBinary_special",
+        "Pg.readNumericDigits_putUInt16s",
+        "Pg.getUInt16?_putUInt16s",
     ],
     deps = [":types"],
 )

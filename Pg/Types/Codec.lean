@@ -432,47 +432,71 @@ instance : PgEncode Timestamp where
 
 -- ── numeric and interval ───────────────────────────────────────────────────
 
+/-!
+Binary `numeric` is a sequence of big-endian 16-bit fields: digit count,
+weight, sign, display scale, then that many base-10000 digits. Both directions
+are written as explicit recursion over a `List UInt16` rather than the `for`
+loops they replace — a loop body is a `forIn` the kernel cannot unfold, and
+`PgNumeric.fromBinary_toBinary` needs to walk the buffer field by field.
+-/
+
+/-- A big-endian sequence of 16-bit fields — the whole `numeric` wire shape. -/
+def putUInt16s : List UInt16 → ByteArray
+  | [] => ByteArray.empty
+  | v :: rest => Protocol.putUInt16 ByteArray.empty v ++ putUInt16s rest
+
+/-- The sign-field sentinel PostgreSQL uses for each non-finite value. -/
+def PgNumeric.specialSign : PgNumeric.Special → UInt16
+  | .nan => 0xC000
+  | .posInf => 0xD000
+  | .negInf => 0xF000
+
+/-- The wire fields of a `numeric`: the four header words, then the digits.
+Special values (NaN, ±Infinity) carry the sentinel sign and no digits. -/
+def PgNumeric.wireFields (n : PgNumeric) : List UInt16 :=
+  match n.special with
+  | some sp => [0, 0, PgNumeric.specialSign sp, 0]
+  | none =>
+    UInt16.ofNat n.digits.size :: (Int16.ofInt n.weight).toUInt16 ::
+      (if n.neg then 0x4000 else 0) :: UInt16.ofNat n.dscale :: n.digits.toList
+
+def PgNumeric.toBinary (n : PgNumeric) : ByteArray := putUInt16s n.wireFields
+
+/-- Read `count` base-10000 digits from `off` onwards, rejecting out-of-range
+digits and truncation. Structural recursion on the count. -/
+def readNumericDigits (b : ByteArray) :
+    Nat → Nat → Array UInt16 → Except String (Array UInt16)
+  | _, 0, acc => .ok acc
+  | off, count + 1, acc =>
+    match Protocol.getUInt16? b off with
+    | some d =>
+      if d < 10000 then readNumericDigits b (off + 2) count (acc.push d)
+      else .error s!"numeric digit {d} out of range"
+    | none => .error "truncated numeric digits"
+
+/-- Decode the binary `numeric` representation. A plain match chain (no `do`
+binds) so each field read is a single rewrite in the roundtrip proof. -/
+def PgNumeric.fromBinary (b : ByteArray) : Except String PgNumeric :=
+  match Protocol.getUInt16? b 0, Protocol.getUInt16? b 2,
+      Protocol.getUInt16? b 4, Protocol.getUInt16? b 6 with
+  | some nd, some wt, some sign, some sc =>
+    match sign.toNat with
+    | 0xC000 => .ok { special := some .nan }
+    | 0xD000 => .ok { special := some .posInf }
+    | 0xF000 => .ok { special := some .negInf }
+    | s' =>
+      if s' == 0 || s' == 0x4000 then
+        match readNumericDigits b 8 nd.toInt16.toInt.toNat #[] with
+        | .ok digits =>
+          .ok { neg := s' == 0x4000, digits, weight := wt.toInt16.toInt,
+                dscale := sc.toInt16.toInt.toNat }
+        | .error e => .error e
+      else .error s!"bad numeric sign {s'}"
+  | _, _, _, _ => .error "truncated numeric"
+
 instance : PgDecode PgNumeric where
   decodeText _ s := PgNumeric.fromString s
-  decodeBinary _ b := do
-    let ndigits := (← rdInt16 b 0).toInt.toNat
-    let weight := (← rdInt16 b 2).toInt
-    let sign := (← Protocol.getUInt16? b 4 |>.elim (throw "truncated numeric") pure)
-    let dscale := (← rdInt16 b 6).toInt.toNat
-    match sign.toNat with
-    | 0xC000 => return { special := some .nan }
-    | 0xD000 => return { special := some .posInf }
-    | 0xF000 => return { special := some .negInf }
-    | s' =>
-      unless s' == 0 || s' == 0x4000 do throw s!"bad numeric sign {s'}"
-      let mut digits : Array UInt16 := #[]
-      for i in [0:ndigits] do
-        match Protocol.getUInt16? b (8 + 2 * i) with
-        | some d =>
-          unless d < 10000 do throw s!"numeric digit {d} out of range"
-          digits := digits.push d
-        | none => throw "truncated numeric digits"
-      pure { neg := s' == 0x4000, digits, weight, dscale }
-
-def PgNumeric.toBinary (n : PgNumeric) : ByteArray := Id.run do
-  let mut out := ByteArray.empty
-  match n.special with
-  | some sp =>
-    out := Protocol.putUInt16 out 0
-    out := Protocol.putUInt16 out 0
-    out := Protocol.putUInt16 out (match sp with
-      | .nan => 0xC000
-      | .posInf => 0xD000
-      | .negInf => 0xF000)
-    out := Protocol.putUInt16 out 0
-  | none =>
-    out := Protocol.putUInt16 out (UInt16.ofNat n.digits.size)
-    out := Protocol.putUInt16 out (Int16.ofInt n.weight).toUInt16
-    out := Protocol.putUInt16 out (if n.neg then 0x4000 else 0)
-    out := Protocol.putUInt16 out (UInt16.ofNat n.dscale)
-    for d in n.digits do
-      out := Protocol.putUInt16 out d
-  return out
+  decodeBinary _ b := PgNumeric.fromBinary b
 
 instance : PgEncode PgNumeric where
   typeOid := Oid.numeric
@@ -827,5 +851,211 @@ theorem PgInterval.fromBinary_toBinary (m d : Int32) (u : Int64) :
     rfl
   unfold PgInterval.fromBinary
   rw [hsize, if_pos rfl, hrd64, hrd8, hrd12]
+
+/-!
+### `numeric`: the lossless base-10000 roundtrip
+
+`numeric` is the type where a silent precision bug would be worst — it is
+PostgreSQL's exact decimal, and pg-lean keeps the server's own representation
+verbatim rather than converting through a float. These laws say the binary
+form is faithful: every field and every base-10000 digit comes back unchanged.
+-/
+
+theorem size_putUInt16s : ∀ l : List UInt16, (putUInt16s l).size = 2 * l.length := by
+  intro l
+  induction l with
+  | nil => rfl
+  | cons v t ih =>
+    simp only [putUInt16s, ByteArray.size_append, ih, Protocol.size_putUInt16,
+      ByteArray.size_empty, List.length_cons]
+    omega
+
+theorem putUInt16s_append : ∀ a b : List UInt16,
+    putUInt16s (a ++ b) = putUInt16s a ++ putUInt16s b := by
+  intro a b
+  induction a with
+  | nil => simp only [List.nil_append, putUInt16s, ByteArray.empty_append]
+  | cons v t ih => simp only [List.cons_append, putUInt16s, ih, ByteArray.append_assoc]
+
+/-- Field `i` of a written 16-bit sequence reads back as itself, at any offset
+into a preceding buffer. This one lemma serves both the four header words and
+the digits. -/
+theorem getUInt16?_putUInt16s : ∀ (l : List UInt16) (pre : ByteArray) (i : Nat)
+    (h : i < l.length),
+    Protocol.getUInt16? (pre ++ putUInt16s l) (pre.size + 2 * i) = some l[i] := by
+  intro l
+  induction l with
+  | nil => intro pre i h; exact absurd h (by simp)
+  | cons v t ih =>
+    intro pre i h
+    have hp : (pre ++ Protocol.putUInt16 ByteArray.empty v).size = pre.size + 2 := by
+      rw [ByteArray.size_append, Protocol.size_putUInt16, ByteArray.size_empty]
+    cases i with
+    | zero =>
+      simp only [putUInt16s, ← ByteArray.append_assoc, Nat.mul_zero, Nat.add_zero,
+        List.getElem_cons_zero]
+      rw [Protocol.getUInt16?_append_left (by omega),
+        Protocol.getUInt16?_append_right (Nat.le_refl _), Nat.sub_self,
+        Protocol.getUInt16?_putUInt16]
+    | succ j =>
+      have hih := ih (pre ++ Protocol.putUInt16 ByteArray.empty v) j
+        (by simp only [List.length_cons] at h; omega)
+      rw [hp] at hih
+      simp only [putUInt16s, ← ByteArray.append_assoc, List.getElem_cons_succ]
+      rw [show pre.size + 2 * (j + 1) = pre.size + 2 + 2 * j from by omega]
+      exact hih
+
+/-- The digit reader recovers exactly the digits that were written. -/
+theorem readNumericDigits_putUInt16s : ∀ (ds : List UInt16) (pre : ByteArray)
+    (acc : Array UInt16), (∀ d ∈ ds, d < 10000) →
+    readNumericDigits (pre ++ putUInt16s ds) pre.size ds.length acc
+      = .ok (acc ++ ds.toArray) := by
+  intro ds
+  induction ds with
+  | nil =>
+    intro pre acc _
+    show Except.ok acc = Except.ok (acc ++ (List.nil (α := UInt16)).toArray)
+    exact congrArg Except.ok (Array.append_empty (xs := acc)).symm
+  | cons d t ih =>
+    intro pre acc hlt
+    have hp : (pre ++ Protocol.putUInt16 ByteArray.empty d).size = pre.size + 2 := by
+      rw [ByteArray.size_append, Protocol.size_putUInt16, ByteArray.size_empty]
+    have hhead : Protocol.getUInt16? (pre ++ putUInt16s (d :: t)) pre.size = some d := by
+      have := getUInt16?_putUInt16s (d :: t) pre 0 (by simp)
+      simpa using this
+    have hih := ih (pre ++ Protocol.putUInt16 ByteArray.empty d) (acc.push d)
+      (fun x hx => hlt x (List.mem_cons_of_mem _ hx))
+    rw [hp] at hih
+    have hsplit : pre ++ putUInt16s (d :: t)
+        = (pre ++ Protocol.putUInt16 ByteArray.empty d) ++ putUInt16s t := by
+      show pre ++ (Protocol.putUInt16 ByteArray.empty d ++ putUInt16s t) = _
+      rw [ByteArray.append_assoc]
+    rw [← hsplit] at hih
+    simp only [List.length_cons, readNumericDigits, hhead,
+      if_pos (hlt d (List.mem_cons_self ..)), hih]
+    exact congrArg Except.ok List.push_append_toArray
+
+/-- A field of a written 16-bit sequence, read at its own offset from the front
+of a longer buffer. -/
+theorem getUInt16?_putUInt16s_prefix (l : List UInt16) (rest : ByteArray) (i : Nat)
+    (h : i < l.length) :
+    Protocol.getUInt16? (putUInt16s l ++ rest) (2 * i) = some l[i] := by
+  rw [Protocol.getUInt16?_append_left (by rw [size_putUInt16s]; omega)]
+  have := getUInt16?_putUInt16s l ByteArray.empty i h
+  rw [ByteArray.empty_append, ByteArray.size_empty, Nat.zero_add] at this
+  exact this
+
+/-- A field of a written 16-bit sequence, read from the buffer it alone
+occupies. -/
+theorem getUInt16?_putUInt16s_alone (l : List UInt16) (i : Nat) (h : i < l.length) :
+    Protocol.getUInt16? (putUInt16s l) (2 * i) = some l[i] := by
+  have := getUInt16?_putUInt16s_prefix l ByteArray.empty i h
+  rwa [ByteArray.append_empty] at this
+
+/-- A 16-bit wire field written from a `Nat` below `2^15` reads back as that
+`Nat` through the wire's signed interpretation. -/
+theorem toInt16_toInt_ofNat {k : Nat} (h : k < 32768) :
+    (UInt16.ofNat k).toInt16.toInt = (k : Int) := by
+  rw [show (UInt16.ofNat k) = (Int16.ofNat k).toUInt16 from rfl, Int16.toInt16_toUInt16]
+  exact Int16.toInt_ofNat_of_lt h
+
+/-- **Binary `numeric` roundtrips losslessly.** Every field of a finite
+`numeric` — sign, weight, display scale, and each base-10000 digit — is
+recovered exactly. The hypotheses are the wire's own limits: the three header
+counts are `int16` fields and PostgreSQL's digits are below 10000. -/
+theorem PgNumeric.fromBinary_toBinary {neg : Bool} {digits : Array UInt16}
+    {weight : Int} {dscale : Nat}
+    (hcount : digits.size < 32768)
+    (hweightLo : -32768 ≤ weight) (hweightHi : weight < 32768)
+    (hscale : dscale < 32768)
+    (hdigits : ∀ d ∈ digits, d < 10000) :
+    PgNumeric.fromBinary (PgNumeric.toBinary ⟨neg, digits, weight, dscale, none⟩) =
+      .ok ⟨neg, digits, weight, dscale, none⟩ := by
+  have hbin : PgNumeric.toBinary ⟨neg, digits, weight, dscale, none⟩ =
+      putUInt16s [UInt16.ofNat digits.size, (Int16.ofInt weight).toUInt16,
+        (if neg then 0x4000 else 0), UInt16.ofNat dscale] ++ putUInt16s digits.toList := by
+    show putUInt16s ([UInt16.ofNat digits.size, (Int16.ofInt weight).toUInt16,
+      (if neg then 0x4000 else 0), UInt16.ofNat dscale] ++ digits.toList) = _
+    exact putUInt16s_append _ _
+  -- The four header words read back.
+  have h0 : Protocol.getUInt16? (PgNumeric.toBinary ⟨neg, digits, weight, dscale, none⟩) 0
+      = some (UInt16.ofNat digits.size) := by
+    rw [hbin]; simpa using getUInt16?_putUInt16s_prefix _ _ 0 (by simp)
+  have h2 : Protocol.getUInt16? (PgNumeric.toBinary ⟨neg, digits, weight, dscale, none⟩) 2
+      = some (Int16.ofInt weight).toUInt16 := by
+    rw [hbin]; simpa using getUInt16?_putUInt16s_prefix _ _ 1 (by simp)
+  have h4 : Protocol.getUInt16? (PgNumeric.toBinary ⟨neg, digits, weight, dscale, none⟩) 4
+      = some (if neg then 0x4000 else 0) := by
+    rw [hbin]; simpa using getUInt16?_putUInt16s_prefix _ _ 2 (by simp)
+  have h6 : Protocol.getUInt16? (PgNumeric.toBinary ⟨neg, digits, weight, dscale, none⟩) 6
+      = some (UInt16.ofNat dscale) := by
+    rw [hbin]; simpa using getUInt16?_putUInt16s_prefix _ _ 3 (by simp)
+  -- The digits read back.
+  have hdig : readNumericDigits (PgNumeric.toBinary ⟨neg, digits, weight, dscale, none⟩) 8
+      digits.size #[] = .ok digits := by
+    have hpre := readNumericDigits_putUInt16s digits.toList
+      (putUInt16s [UInt16.ofNat digits.size, (Int16.ofInt weight).toUInt16,
+        (if neg then 0x4000 else 0), UInt16.ofNat dscale]) #[]
+      (fun d hd => hdigits d (by simpa using hd))
+    rw [show (putUInt16s [UInt16.ofNat digits.size, (Int16.ofInt weight).toUInt16,
+        (if neg then 0x4000 else 0), UInt16.ofNat dscale]).size = 8 from by
+      rw [size_putUInt16s]; rfl] at hpre
+    rw [← hbin, Array.length_toList] at hpre
+    simpa using hpre
+  -- Header fields decode to the values they were built from.
+  have hcnt : (UInt16.ofNat digits.size).toInt16.toInt.toNat = digits.size := by
+    rw [toInt16_toInt_ofNat hcount]; exact Int.toNat_natCast _
+  have hwt : ((Int16.ofInt weight).toUInt16).toInt16.toInt = weight := by
+    rw [Int16.toInt16_toUInt16]; exact Int16.toInt_ofInt_of_le hweightLo hweightHi
+  have hsc : (UInt16.ofNat dscale).toInt16.toInt.toNat = dscale := by
+    rw [toInt16_toInt_ofNat hscale]; exact Int.toNat_natCast _
+  unfold PgNumeric.fromBinary
+  rw [h0, h2, h4, h6]
+  cases neg with
+  | false =>
+    rw [if_neg (by decide : ¬((false : Bool) = true))]
+    show (if (0 : UInt16).toNat == 0 || (0 : UInt16).toNat == 0x4000 then
+      match readNumericDigits _ 8 (UInt16.ofNat digits.size).toInt16.toInt.toNat #[] with
+      | .ok ds => Except.ok (PgNumeric.mk ((0 : UInt16).toNat == 0x4000) ds
+          ((Int16.ofInt weight).toUInt16.toInt16.toInt)
+          ((UInt16.ofNat dscale).toInt16.toInt.toNat) none)
+      | .error e => .error e
+    else .error s!"bad numeric sign {(0 : UInt16).toNat}") = _
+    rw [if_pos (by decide), hcnt, hdig, hwt, hsc]
+    rfl
+  | true =>
+    rw [if_pos rfl]
+    show (if (0x4000 : UInt16).toNat == 0 || (0x4000 : UInt16).toNat == 0x4000 then
+      match readNumericDigits _ 8 (UInt16.ofNat digits.size).toInt16.toInt.toNat #[] with
+      | .ok ds => Except.ok (PgNumeric.mk ((0x4000 : UInt16).toNat == 0x4000) ds
+          ((Int16.ofInt weight).toUInt16.toInt16.toInt)
+          ((UInt16.ofNat dscale).toInt16.toInt.toNat) none)
+      | .error e => .error e
+    else .error s!"bad numeric sign {(0x4000 : UInt16).toNat}") = _
+    rw [if_pos (by decide), hcnt, hdig, hwt, hsc]
+    rfl
+
+/-- Reading a written four-word header back, word by word. -/
+theorem getUInt16?_putUInt16s4 (a b c d : UInt16) :
+    Protocol.getUInt16? (putUInt16s [a, b, c, d]) 0 = some a ∧
+    Protocol.getUInt16? (putUInt16s [a, b, c, d]) 2 = some b ∧
+    Protocol.getUInt16? (putUInt16s [a, b, c, d]) 4 = some c ∧
+    Protocol.getUInt16? (putUInt16s [a, b, c, d]) 6 = some d := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · simpa using getUInt16?_putUInt16s_alone [a, b, c, d] 0 (by simp)
+  · simpa using getUInt16?_putUInt16s_alone [a, b, c, d] 1 (by simp)
+  · simpa using getUInt16?_putUInt16s_alone [a, b, c, d] 2 (by simp)
+  · simpa using getUInt16?_putUInt16s_alone [a, b, c, d] 3 (by simp)
+
+/-- The three special values roundtrip too: their sentinel signs are exactly
+the ones `fromBinary` recognizes. -/
+theorem PgNumeric.fromBinary_toBinary_special (sp : PgNumeric.Special) :
+    PgNumeric.fromBinary (PgNumeric.toBinary { special := some sp }) =
+      .ok { special := some sp } := by
+  have h := getUInt16?_putUInt16s4 0 0 (PgNumeric.specialSign sp) 0
+  show PgNumeric.fromBinary (putUInt16s [0, 0, PgNumeric.specialSign sp, 0]) = _
+  unfold PgNumeric.fromBinary
+  rw [h.1, h.2.1, h.2.2.1, h.2.2.2]
+  cases sp <;> rfl
 
 end Pg
