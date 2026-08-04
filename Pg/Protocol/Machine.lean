@@ -730,14 +730,18 @@ def submit (s : State) (req : Request) : Except PgError (State × ByteArray) := 
     | _ => throw (.rejectedInvalid "connection still starting up")
   | .running pipe => submitRunning s pipe req
 
-def submitAll (s : State) (reqs : Array Request) : Except PgError (State × ByteArray) := do
-  let mut cur := s
-  let mut out := ByteArray.empty
-  for req in reqs do
-    let (s', bytes) ← submit cur req
-    cur := s'
-    out := out ++ bytes
-  pure (cur, out)
+/-- `submit` each request in order, accumulating output bytes. -/
+private def submitList (s : State) (reqs : List Request) (out : ByteArray) :
+    Except PgError (State × ByteArray) :=
+  match reqs with
+  | [] => pure (s, out)
+  | req :: rest =>
+    match submit s req with
+    | .error e => .error e
+    | .ok (s', bytes) => submitList s' rest (out ++ bytes)
+
+def submitAll (s : State) (reqs : Array Request) : Except PgError (State × ByteArray) :=
+  submitList s reqs.toList ByteArray.empty
 
 /-!
 ### Machine invariant
@@ -1069,6 +1073,63 @@ theorem submit_error_rejection {s : State} {req : Request} {e : PgError}
       | (cases h <;> first
           | exact Or.inl rfl
           | exact Or.inr ⟨_, rfl⟩)
+
+private theorem submitList_wf :
+    ∀ {reqs : List Request} {s : State} {out : ByteArray} {r : State × ByteArray},
+      s.WellFormed → submitList s reqs out = .ok r → r.1.WellFormed := by
+  intro reqs
+  induction reqs with
+  | nil =>
+    intro s out r hwf h
+    cases h
+    exact hwf
+  | cons req rest ih =>
+    intro s out r hwf h
+    unfold submitList at h
+    cases hsub : submit s req with
+    | error e =>
+      rw [hsub] at h
+      cases h
+    | ok res =>
+      obtain ⟨s1, b1⟩ := res
+      rw [hsub] at h
+      exact ih (submit_wellFormed hwf hsub) h
+
+/-- `submitAll` preserves well-formedness across a whole batch of requests. -/
+theorem submitAll_wellFormed {s : State} {reqs : Array Request} {s' : State}
+    {out : ByteArray} (hwf : s.WellFormed) (h : submitAll s reqs = .ok (s', out)) :
+    s'.WellFormed := by
+  unfold submitAll at h
+  exact submitList_wf hwf h
+
+/-- A failed `submitAll` is the rejection of the first offending request:
+always `rejectedInvalid`/`rejectedAborted`, never a poisoning error class. -/
+theorem submitAll_error_rejection {s : State} {reqs : Array Request} {e : PgError}
+    (h : submitAll s reqs = .error e) :
+    e = .rejectedAborted ∨ ∃ why, e = .rejectedInvalid why := by
+  unfold submitAll at h
+  revert h
+  have go : ∀ {l : List Request} {s₀ : State} {out : ByteArray},
+      submitList s₀ l out = .error e →
+      e = .rejectedAborted ∨ ∃ why, e = .rejectedInvalid why := by
+    intro l
+    induction l with
+    | nil =>
+      intro s₀ out h
+      cases h
+    | cons req rest ih =>
+      intro s₀ out h
+      unfold submitList at h
+      cases hsub : submit s₀ req with
+      | error e' =>
+        rw [hsub] at h
+        cases h
+        exact submit_error_rejection hsub
+      | ok res =>
+        obtain ⟨s1, b1⟩ := res
+        rw [hsub] at h
+        exact ih h
+  exact go
 
 private theorem aborted_false_of_current {pipe : Pipeline} (hwf : pipe.WellFormed)
     {op : CurrentOp} (hcur : pipe.current = some op) : pipe.aborted = false := by
