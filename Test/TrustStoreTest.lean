@@ -78,9 +78,36 @@ private def testFileLoading : IO Unit := do
     (some (path "definitely-does-not-exist.pem"))
   check "require skips configured root file" skipped.isNone
 
+/-- The parts of the TLS decision table the laws deliberately leave open:
+which transport each opportunistic mode starts with and retries with. The
+safety properties themselves (chain ⇒ encryption, hostname ⇒ chain, no
+insecure fallback) are kernel-checked in `Pg/Config.lean`. -/
+private def testTlsPolicyTable : IO Unit := do
+  check "disable starts plaintext" (SslMode.disable.initialAttempt == .plaintext)
+  check "allow starts plaintext" (SslMode.allow.initialAttempt == .plaintext)
+  check "prefer starts optional TLS"
+    (SslMode.prefer.initialAttempt == .negotiateTls false)
+  check "require starts required TLS"
+    (SslMode.require.initialAttempt == .negotiateTls true)
+  check "verify-full starts required TLS"
+    (SslMode.verifyFull.initialAttempt == .negotiateTls true)
+  check "allow retries with required TLS"
+    (SslMode.allow.fallbackAttempt == some (.negotiateTls true))
+  check "prefer retries in plaintext"
+    (SslMode.prefer.fallbackAttempt == some .plaintext)
+  check "require never retries" (SslMode.require.fallbackAttempt == none)
+  check "verify-ca never retries" (SslMode.verifyCa.fallbackAttempt == none)
+  check "verify-full never retries" (SslMode.verifyFull.fallbackAttempt == none)
+  check "verify-full checks the hostname"
+    (SslMode.verifyFull.policy).requireHostname
+  check "verify-ca does not check the hostname"
+    (!(SslMode.verifyCa.policy).requireHostname)
+  check "require validates no chain" (!(SslMode.require.policy).requireChain)
+
 def run : IO Unit := do
   testPureSelection
   testFileLoading
+  testTlsPolicyTable
   IO.println "all TLS trust-store assertions passed"
 
 end Test

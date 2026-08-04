@@ -37,6 +37,13 @@ def verificationRequested : SslMode → Bool
   | .verifyCa | .verifyFull => true
   | _ => false
 
+/-- The trust-store gate is exactly the policy table's chain requirement:
+`select`/`resolve`/`loadForVerification` load anchors for precisely the modes
+`SslMode.policy` says must validate a chain. -/
+theorem verificationRequested_eq_policy (mode : SslMode) :
+    verificationRequested mode = (mode.policy).requireChain := by
+  cases mode <;> rfl
+
 private def checkedSelection (source : Source) (path : System.FilePath) :
     Except String Selection := do
   if path.toString.isEmpty then
@@ -70,6 +77,17 @@ def select
       unless defaultExists do
         throw s!"TLS root certificate file does not exist: {path}"
       pure (some { source := .default, path })
+
+/-- Trust anchors are never even looked up for a mode that does not require a
+validated chain (`select` returns `none` before inspecting any input). -/
+theorem select_none_of_not_requireChain {mode : SslMode}
+    (h : (mode.policy).requireChain = false)
+    (configured environment home : Option System.FilePath) (defaultExists : Bool) :
+    select mode configured environment home defaultExists = .ok none := by
+  unfold select
+  rw [show verificationRequested mode = false from
+    by rw [verificationRequested_eq_policy]; exact h]
+  rfl
 
 /-- Resolve the trust file without touching environment or filesystem state
 for non-verifying modes. Explicit configuration also avoids consulting the

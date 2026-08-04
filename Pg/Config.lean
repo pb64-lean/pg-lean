@@ -20,6 +20,107 @@ inductive SslMode where
   | verifyFull
   deriving Repr, BEq, Inhabited
 
+/-- What a connection must achieve before any application byte flows, decided
+by `sslmode` alone.
+
+* `requireEncryption` — a plaintext transport is never acceptable.
+* `requireChain` — the server certificate must chain to a configured trust
+  anchor, with every certificate inside its validity window
+  (`TLS13.X509.Chain.validate` checks both).
+* `requireHostname` — the chained leaf must additionally match the connection
+  host (`TLS13.X509.Hostname.verifyHostname`).
+* `allowsFallback` — the connection may retry with a different transport when
+  the server rejects the first attempt.
+-/
+structure TlsPolicy where
+  requireEncryption : Bool
+  requireChain : Bool
+  requireHostname : Bool
+  allowsFallback : Bool
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- The single TLS decision table. `Connection.connect` (transport choice and
+retry), `Connection.verifyTlsPeer` (chain + hostname), and
+`Tls.TrustStore.verificationRequested` (trust-store loading) all read their
+behaviour off this one function; the laws below pin down what each mode
+guarantees. -/
+@[expose] def SslMode.policy : SslMode → TlsPolicy
+  | .disable =>
+    { requireEncryption := false, requireChain := false,
+      requireHostname := false, allowsFallback := false }
+  | .allow =>
+    { requireEncryption := false, requireChain := false,
+      requireHostname := false, allowsFallback := true }
+  | .prefer =>
+    { requireEncryption := false, requireChain := false,
+      requireHostname := false, allowsFallback := true }
+  | .require =>
+    { requireEncryption := true, requireChain := false,
+      requireHostname := false, allowsFallback := false }
+  | .verifyCa =>
+    { requireEncryption := true, requireChain := true,
+      requireHostname := false, allowsFallback := false }
+  | .verifyFull =>
+    { requireEncryption := true, requireChain := true,
+      requireHostname := true, allowsFallback := false }
+
+/-!
+### TLS policy laws
+
+Per-mode guarantees, and the coherence conditions that make the table safe:
+a mode that checks identity also checks the chain, a mode that checks the
+chain also demands encryption, and no mode that demands encryption is ever
+allowed to retry in a weaker transport.
+-/
+
+/-- `verify-full` ⇒ encryption + chain (with validity time) + hostname. -/
+theorem verifyFull_policy :
+    SslMode.verifyFull.policy =
+      { requireEncryption := true, requireChain := true,
+        requireHostname := true, allowsFallback := false } := by rfl
+
+/-- `verify-ca` ⇒ encryption + chain (with validity time), no host identity. -/
+theorem verifyCa_policy :
+    SslMode.verifyCa.policy =
+      { requireEncryption := true, requireChain := true,
+        requireHostname := false, allowsFallback := false } := by rfl
+
+/-- `require` ⇒ encryption without any certificate identity check. -/
+theorem require_policy :
+    SslMode.require.policy =
+      { requireEncryption := true, requireChain := false,
+        requireHostname := false, allowsFallback := false } := by rfl
+
+/-- Identity implies chain: hostname verification is never performed against
+an unvalidated certificate. -/
+theorem policy_hostname_implies_chain (m : SslMode) :
+    (m.policy).requireHostname = true → (m.policy).requireChain = true := by
+  intro h
+  cases m <;> first | rfl | exact absurd h (by decide)
+
+/-- Chain implies encryption: certificate validation is never claimed for a
+plaintext transport. -/
+theorem policy_chain_implies_encryption (m : SslMode) :
+    (m.policy).requireChain = true → (m.policy).requireEncryption = true := by
+  intro h
+  cases m <;> first | rfl | exact absurd h (by decide)
+
+/-- **No insecure fallback**: no mode that demands encryption is permitted to
+retry in a weaker transport, so no failure path can silently downgrade. -/
+theorem policy_no_insecure_fallback (m : SslMode) :
+    (m.policy).requireEncryption = true → (m.policy).allowsFallback = false := by
+  intro h
+  cases m <;> first | rfl | exact absurd h (by decide)
+
+/-- Only the two opportunistic modes may retry at all. -/
+theorem policy_fallback_iff (m : SslMode) :
+    (m.policy).allowsFallback = true ↔ (m = .allow ∨ m = .prefer) := by
+  cases m <;>
+    first
+      | exact ⟨fun _ => Or.inl rfl, fun _ => rfl⟩
+      | exact ⟨fun _ => Or.inr rfl, fun _ => rfl⟩
+      | exact ⟨fun h => absurd h (by decide), fun h => by rcases h with h | h <;> cases h⟩
+
 structure ConnectConfig where
   host : String := "localhost"
   port : UInt16 := 5432

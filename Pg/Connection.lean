@@ -114,7 +114,7 @@ is still owned by startup. The TLS engine has already strict-parsed the exact
 Certificate-list bytes and verified CertificateVerify proof of possession. -/
 private def verifyTlsPeer (cfg : ConnectConfig) (state : Tls.Client.State) :
     IO Unit := do
-  unless Tls.TrustStore.verificationRequested cfg.sslMode do
+  unless (cfg.sslMode.policy).requireChain do
     return
   let some loaded ←
       Tls.TrustStore.loadForVerification cfg.sslMode cfg.sslRootCert
@@ -132,7 +132,7 @@ private def verifyTlsPeer (cfg : ConnectConfig) (state : Tls.Client.State) :
     | .ok verified => pure verified
     | .error failure =>
       throw (IO.userError (toString (Error.tlsChainVerification failure)))
-  if cfg.sslMode == .verifyFull then
+  if (cfg.sslMode.policy).requireHostname then
     match TLS13.X509.Hostname.verifyHostname cfg.host verified.leaf with
     | .ok () => pure ()
     | .error failure =>
@@ -313,9 +313,29 @@ private def startTls (socket : TCP.Socket.Client) (cfg : ConnectConfig)
   verifyTlsPeer cfg state
   IO.mkRef state
 
-private inductive ConnectPolicy where
+/-- The transport an individual connection attempt uses. -/
+inductive ConnectPolicy where
   | plaintext
   | negotiateTls (required : Bool)
+  deriving Repr, BEq, DecidableEq, Inhabited
+
+/-- The transport a mode attempts first — read straight off `SslMode.policy`
+(`initialAttempt_of_requireEncryption`). -/
+def SslMode.initialAttempt : SslMode → ConnectPolicy
+  | .disable => .plaintext
+  | .allow => .plaintext
+  | .prefer => .negotiateTls false
+  | .require => .negotiateTls true
+  | .verifyCa => .negotiateTls true
+  | .verifyFull => .negotiateTls true
+
+/-- The transport a mode may retry with after the server rejects its first
+attempt — `none` for every mode that requires encryption
+(`fallbackAttempt_of_requireEncryption`). -/
+def SslMode.fallbackAttempt : SslMode → Option ConnectPolicy
+  | .allow => some (.negotiateTls true)
+  | .prefer => some .plaintext
+  | _ => none
 
 private def negotiateTransport (socket : TCP.Socket.Client) (cfg : ConnectConfig)
     (policy : ConnectPolicy) (deadline : Option Nat) :
@@ -422,6 +442,52 @@ private def indicatesTlsRejected (fields : ErrorFields) : Bool :=
   fields.sqlState? == some "28000" &&
     (fields.message?.map (·.endsWith "SSL encryption")).getD false
 
+/-- The server error that licenses a mode's retry: `prefer` retries in
+plaintext when the server rejected SSL, `allow` retries with TLS when the
+server demanded encryption. Modes without a fallback never retry. -/
+def SslMode.fallbackTriggered : SslMode → ErrorFields → Bool
+  | .prefer, fields => indicatesTlsRejected fields
+  | .allow, fields => indicatesTlsRequired fields
+  | _, _ => false
+
+/-!
+### Transport-policy laws
+
+`connect` makes exactly two decisions — which transport to attempt, and
+whether to retry — and both are these pure tables, so the guarantees of
+`SslMode.policy` carry into the connect path.
+-/
+
+/-- A mode that requires encryption demands TLS on its first attempt. -/
+theorem initialAttempt_of_requireEncryption {m : SslMode}
+    (h : (m.policy).requireEncryption = true) :
+    m.initialAttempt = .negotiateTls true := by
+  cases m <;> first | rfl | exact absurd h (by decide)
+
+/-- **No insecure fallback in the connect path**: a mode that requires
+encryption has no retry at all, so no failure can downgrade it to plaintext. -/
+theorem fallbackAttempt_of_requireEncryption {m : SslMode}
+    (h : (m.policy).requireEncryption = true) : m.fallbackAttempt = none := by
+  cases m <;> first | rfl | exact absurd h (by decide)
+
+/-- The retry table agrees with the policy table. -/
+theorem fallbackAttempt_isSome (m : SslMode) :
+    (m.fallbackAttempt).isSome = (m.policy).allowsFallback := by
+  cases m <;> rfl
+
+/-- Nothing is ever retried for a mode with no fallback. -/
+theorem fallbackTriggered_of_no_fallback {m : SslMode}
+    (h : m.fallbackAttempt = none) (fields : ErrorFields) :
+    m.fallbackTriggered fields = false := by
+  cases m <;> first | rfl | exact absurd h (by simp [SslMode.fallbackAttempt])
+
+/-- A retry never gives up encryption a mode already achieved: the only
+plaintext fallback belongs to `prefer`, which does not require encryption. -/
+theorem fallback_plaintext_only_unencrypted {m : SslMode}
+    (h : m.fallbackAttempt = some .plaintext) :
+    (m.policy).requireEncryption = false := by
+  cases m <;> first | rfl | exact absurd h (by simp [SslMode.fallbackAttempt])
+
 private def finishConnectAttempt (result : Except Machine.PgError Connection) :
     IO Connection :=
   match result with
@@ -434,36 +500,27 @@ private def finishConnectAttempt (result : Except Machine.PgError Connection) :
 proof of possession but deliberately does not validate certificate identity.
 `verify-ca` additionally validates a path to the configured trust store;
 `verify-full` also verifies the connection hostname. Fatal problems throw
-`IO.Error`; `onNotice` receives server notices for the connection lifetime. -/
+`IO.Error`; `onNotice` receives server notices for the connection lifetime.
+
+Both transport decisions come from the pure tables `SslMode.initialAttempt`
+and `SslMode.fallbackAttempt`, which are proved to follow `SslMode.policy` —
+in particular no encryption-requiring mode has any retry
+(`fallbackAttempt_of_requireEncryption`). -/
 def connect (cfg : ConnectConfig) (onNotice : ErrorFields → IO Unit := fun _ => pure ()) :
     IO Connection := do
-  match cfg.sslMode with
-  | .disable =>
-    finishConnectAttempt (← connectAttempt cfg onNotice .plaintext)
-  | .require =>
-    finishConnectAttempt (← connectAttempt cfg onNotice (.negotiateTls true))
-  | .prefer =>
-    match ← connectAttempt cfg onNotice (.negotiateTls false) with
-    | .ok conn => pure conn
-    | .error (.serverFatal fields) =>
-      if indicatesTlsRejected fields then
-        finishConnectAttempt (← connectAttempt cfg onNotice .plaintext)
-      else
-        finishConnectAttempt (.error (.serverFatal fields))
-    | .error e => finishConnectAttempt (.error e)
-  | .allow =>
-    match ← connectAttempt cfg onNotice .plaintext with
-    | .ok conn => pure conn
-    | .error (.serverFatal fields) =>
-      if indicatesTlsRequired fields then
-        finishConnectAttempt (← connectAttempt cfg onNotice (.negotiateTls true))
-      else
-        finishConnectAttempt (.error (.serverFatal fields))
-    | .error e => finishConnectAttempt (.error e)
-  | .verifyCa =>
-    finishConnectAttempt (← connectAttempt cfg onNotice (.negotiateTls true))
-  | .verifyFull =>
-    finishConnectAttempt (← connectAttempt cfg onNotice (.negotiateTls true))
+  match ← connectAttempt cfg onNotice cfg.sslMode.initialAttempt with
+  | .ok conn => pure conn
+  | .error e =>
+    match cfg.sslMode.fallbackAttempt with
+    | none => finishConnectAttempt (.error e)
+    | some fallback =>
+      match e with
+      | .serverFatal fields =>
+        if cfg.sslMode.fallbackTriggered fields then
+          finishConnectAttempt (← connectAttempt cfg onNotice fallback)
+        else
+          finishConnectAttempt (.error e)
+      | _ => finishConnectAttempt (.error e)
 
 /-- Connect from a `postgres://` URL. -/
 def connectUri (uri : String) (onNotice : ErrorFields → IO Unit := fun _ => pure ()) :
