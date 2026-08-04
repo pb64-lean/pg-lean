@@ -52,6 +52,14 @@ lean_assurance_test(
         "Pg.PgNumeric.fromBinary_toBinary_special",
         "Pg.readNumericDigits_putUInt16s",
         "Pg.getUInt16?_putUInt16s",
+        # Decimal fields: what the renderer wrote is what the parser reads.
+        "Pg.natOfDigits_padDigits",
+        "Pg.parseNatField_padDigits",
+        # Temporal text: date, time-of-day, and the timestamp split.
+        "Pg.dateFields_renderDate",
+        "Pg.parseDate_renderDate",
+        "Pg.parseTimeNanos_renderTimeNanos",
+        "Pg.timestampFields_renderTimestamp",
     ],
     deps = [":types"],
 )

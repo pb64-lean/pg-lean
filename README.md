@@ -156,7 +156,9 @@ Sans-IO core + thin async shell (the grpc-lean/PostgresNIO pattern):
   pure, incremental TLS codecs, authenticated record layer, transcript/key
   schedule, sans-IO client machine, and libpq-style trust-store resolution
   over `tls13-lean`'s HACL* and X.509 primitives.
-- `Pg/Types/*` — OIDs, `PgDecode`/`PgEncode`, `PgNumeric`, `PgInterval`.
+- `Pg/Types/*` — OIDs, `PgDecode`/`PgEncode`, `PgNumeric`, `PgInterval`. Every
+  codec is explicit recursion, not a `for` loop over mutable state: a `forIn`
+  body is opaque to the kernel, so the roundtrip laws would not be statable.
 - `Pg/Connection.lean` — async shell over `Std.Async.TCP`: DNS, Mutex-held
   exchanges, notification queue (`recvSelector` raced against timers via
   `Selectable.one`), PostgreSQL SSL negotiation and TLS transport, COPY pumps,
@@ -208,8 +210,27 @@ section docstring states its scope.
   `applyQueryParam_unknown` and `applyQueryPairs_render` (unknown query
   parameters can neither fail the parse nor disturb a recognized setting, and
   land in `parameters` in order).
-- **Codecs** (`Pg/Types/Codec.lean`) — text and binary integer roundtrips,
-  `PgInterval.fromBinary_toBinary`.
+- **Codecs** (`Pg/Types/Codec.lean`) — text and binary integer roundtrips and
+  `PgInterval.fromBinary_toBinary`; `PgNumeric.fromBinary_toBinary` — **binary
+  `numeric` is lossless**: sign, weight, display scale and every base-10000
+  digit are recovered exactly, under the wire's own limits (the three header
+  counts are `int16` fields, digits are below 10000), with
+  `fromBinary_toBinary_special` for NaN/±Infinity; and the temporal text
+  codecs — `parseDate_renderDate` (a rendered AD date parses back to the same
+  `PlainDate`), `parseTimeNanos_renderTimeNanos` (a rendered time-of-day parses
+  back to the same nanosecond count, at PostgreSQL's microsecond resolution),
+  and `timestampFields_renderTimestamp` (a rendered timestamp splits back into
+  that date and those nanoseconds). Underneath them, `parseNatField_padDigits`:
+  a zero-padded decimal field reads back as the number it was rendered from, at
+  any width.
+
+  Two gaps are deliberate. **Floats are excluded**: `toString`/`parseFloat` is
+  not an unconditional IEEE-754 roundtrip, and stating the true law needs
+  real-arithmetic support this repository does not have (core + Std only). And
+  the temporal laws stop where `Std.Time` begins: `PlainTime.ofNanoseconds` and
+  the `Timestamp` epoch conversions are not reasoned about (`Std.Time` ships no
+  lemmas and does not expose its definitions), so the laws cover the text
+  codecs pg-lean actually owns.
 
 ### Mechanically enforced
 
@@ -219,7 +240,7 @@ time, so a regression is a red build rather than a stale claim:
 | target | scope |
 | --- | --- |
 | `//Pg/Protocol:protocol_assurance` | framing, `State.WellFormed`, FIFO attribution, byte accounting, progress/recovery, startup order, the ten `completes_*` |
-| `//Pg/Types:types_assurance` | codec roundtrips |
+| `//Pg/Types:types_assurance` | codec roundtrips (integers, `numeric`, `interval`, temporal text) |
 | `//Pg/Sasl:sasl_assurance` | SCRAM construction and mutual authentication |
 | `//:pg_lean_assurance` | the whole client: `sslmode` policy, trust-store gate, connection-string roundtrips |
 

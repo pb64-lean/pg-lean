@@ -6,6 +6,7 @@ public import Pg.Crypto.Hex
 public import Pg.Types.Oid
 public import Pg.Types.Numeric
 public import Pg.Types.Interval
+import all Std.Time.Date.PlainDate
 import Std.Data.String.ToNat
 import Std.Data.String.ToInt
 import Std.Tactic.BVDecide
@@ -207,6 +208,13 @@ instance : PgDecode Float where
       | none => throw "truncated float4"
     | n => throw s!"unexpected float width {n}"
 
+/-- No `parseFloat (toString v) = v` law is stated, and that is deliberate:
+IEEE-754 text roundtripping is not unconditionally true (`toString` prints a
+shortest decimal and `parseFloat` re-rounds it, so the claim needs
+`Float.ofScientific`'s rounding to be proved a left inverse of shortest-form
+printing). That is a real-arithmetic development this repository does not have
+— core + Std only, no Mathlib. The live matrix covers `float4`/`float8` by
+example instead. -/
 instance : PgEncode Float where
   typeOid := Oid.float8
   encode v := some (toString v).toUTF8
@@ -298,15 +306,17 @@ def natOfDigits (acc : Nat) : List Char → Option Nat
   | c :: rest =>
     if isAsciiDigit c then natOfDigits (acc * 10 + (c.toNat - 48)) rest else none
 
+/-- A whole decimal field: at least one character, all of them digits. -/
+def natOfDigitsFull : List Char → Option Nat
+  | [] => none
+  | chars => natOfDigits 0 chars
+
 -- ── temporal types ─────────────────────────────────────────────────────────
 
 def parseNatField (s : String) (what : String) : Except String Nat :=
-  match s.toList with
-  | [] => throw s!"bad {what}: {s}"
-  | chars =>
-    match natOfDigits 0 chars with
-    | some v => pure v
-    | none => throw s!"bad {what}: {s}"
+  match natOfDigitsFull s.toList with
+  | some v => pure v
+  | none => throw s!"bad {what}: {s}"
 
 def rejectInfinity (s : String) : Except String Unit := do
   if s == "infinity" || s == "-infinity" then
@@ -333,16 +343,23 @@ def dateFields (s : String) : Except String (Nat × Nat × Nat) :=
     | _, _, .error e => .error e
   | _ => throw s!"cannot parse date {s} (BC dates unsupported)"
 
-def parseDate (s : String) : Except String PlainDate := do
-  rejectInfinity s
-  let (y, m, d) ← dateFields s
-  let some mo := Std.Time.Internal.Bounded.LE.ofInt (Int.ofNat m)
-    | throw s!"month out of range: {m}"
-  let some da := Std.Time.Internal.Bounded.LE.ofInt (Int.ofNat d)
-    | throw s!"day out of range: {d}"
-  match PlainDate.ofYearMonthDay? (Int.ofNat y) mo da with
-  | some date => pure date
-  | none => throw s!"invalid date {s}"
+/-- `infinity` and `-infinity` fail `dateFields` anyway; reporting them
+separately only replaces the message, so the check sits on the error path. -/
+def parseDate (s : String) : Except String PlainDate :=
+  match dateFields s with
+  | .error e =>
+    match rejectInfinity s with
+    | .error e' => .error e'
+    | .ok _ => .error e
+  | .ok (y, m, d) =>
+    match Std.Time.Internal.Bounded.LE.ofInt (Int.ofNat m),
+        Std.Time.Internal.Bounded.LE.ofInt (Int.ofNat d) with
+    | some mo, some da =>
+      match PlainDate.ofYearMonthDay? (Int.ofNat y) mo da with
+      | some date => .ok date
+      | none => .error s!"invalid date {s}"
+    | none, _ => .error s!"month out of range: {m}"
+    | _, none => .error s!"day out of range: {d}"
 
 /-- Fractional seconds text → nanoseconds: right-pad to 9 digits and read. -/
 def fracNanos (frac : String) : Except String Nat :=
@@ -427,24 +444,39 @@ def dateTimeOfPgMicros (micros : Int) : PlainDateTime :=
   PlainDateTime.ofTimestampAssumingUTC
     (Timestamp.ofNanosecondsSinceUnixEpoch (uv ((micros + pgEpochSeconds * 1000000) * 1000)))
 
+/-- The calendar date and the nanoseconds-since-midnight of a `YYYY-MM-DD
+HH:MM:SS[.ffffff]` timestamp. Both halves are pg-lean's own text codecs;
+turning the nanoseconds into a `PlainTime` is `Std.Time`'s job. -/
+def timestampFields (s : String) : Except String (PlainDate × Int) :=
+  match splitOnChar ' ' s with
+  | [d, t] =>
+    match parseDate d, parseTimeNanos t with
+    | .ok date, .ok nanos => .ok (date, nanos)
+    | .error e, _ => .error e
+    | _, .error e => .error e
+  | _ => .error s!"cannot parse timestamp {s}"
+
 instance : PgDecode PlainDateTime where
-  decodeText _ s := do
-    rejectInfinity s
-    match s.splitOn " " with
-    | [d, t] =>
-      let date ← parseDate d
-      let nanos ← parseTimeNanos t
-      pure { date, time := PlainTime.ofNanoseconds (uv nanos) }
-    | _ => throw s!"cannot parse timestamp {s}"
+  decodeText _ s :=
+    match timestampFields s with
+    | .error e =>
+      match rejectInfinity s with
+      | .error e' => .error e'
+      | .ok _ => .error e
+    | .ok (date, nanos) => .ok { date, time := PlainTime.ofNanoseconds (uv nanos) }
   decodeBinary _ b := do
     let micros := (← rdInt64 b).toInt
     timestampSentinel micros
     pure (dateTimeOfPgMicros micros)
 
+/-- `YYYY-MM-DD HH:MM:SS[.ffffff]` — the date and time-of-day renderings
+joined by the separator space. -/
+def renderTimestamp (d : PlainDate) (nanos : Nat) : String :=
+  String.ofList (dateChars d ++ ' ' :: timeChars nanos)
+
 instance : PgEncode PlainDateTime where
   typeOid := Oid.timestamp
-  encode dt :=
-    some s!"{renderDate dt.date} {renderTimeNanos dt.time.toNanoseconds.toInt.toNat}".toUTF8
+  encode dt := some (renderTimestamp dt.date dt.time.toNanoseconds.toInt.toNat).toUTF8
 
 /-- Length of the trailing zone offset, scanning the reversed text: stop at the
 first `+`/`-` (that is the sign) or at the date/time separator space. -/
@@ -483,7 +515,7 @@ instance : PgDecode Timestamp where
   decodeText _ s := do
     rejectInfinity s
     let (body, offsetSecs) ← splitZoneSuffix s
-    match body.splitOn " " with
+    match splitOnChar ' ' body with
     | [d, t] =>
       let date ← parseDate d
       let nanos ← parseTimeNanos t
@@ -943,6 +975,385 @@ theorem PgInterval.fromBinary_toBinary (m d : Int32) (u : Int64) :
     rfl
   unfold PgInterval.fromBinary
   rw [hsize, if_pos rfl, hrd64, hrd8, hrd12]
+
+/-!
+### Decimal digit strings
+
+The temporal text codecs are proved through these: `natOfDigits` reads back
+exactly what `natDigits`/`padDigits` wrote, at any padding width.
+-/
+
+theorem toNat_ofNat_ascii {n : Nat} (h : n ≤ 127) : (Char.ofNat n).toNat = n := by
+  show (Char.ofNat n).val.toNat = n
+  unfold Char.ofNat
+  rw [dif_pos (by unfold Nat.isValidChar; omega)]
+  unfold Char.ofNatAux
+  simp [UInt32.toNat]
+
+theorem toNat_digitChar {d : Nat} (h : d < 10) : (digitChar d).toNat = 48 + d := by
+  unfold digitChar
+  rw [Nat.mod_eq_of_lt h, toNat_ofNat_ascii (by omega)]
+
+theorem isAsciiDigit_digitChar {d : Nat} (h : d < 10) :
+    isAsciiDigit (digitChar d) = true := by
+  unfold isAsciiDigit
+  rw [toNat_digitChar h]
+  simp only [Bool.and_eq_true, decide_eq_true_eq]
+  omega
+
+theorem natOfDigits_append : ∀ (l₁ : List Char) (acc : Nat) (l₂ : List Char),
+    natOfDigits acc (l₁ ++ l₂)
+      = (natOfDigits acc l₁).bind (fun a => natOfDigits a l₂) := by
+  intro l₁
+  induction l₁ with
+  | nil => intro acc l₂; rfl
+  | cons c t ih =>
+    intro acc l₂
+    simp only [List.cons_append, natOfDigits]
+    split
+    · exact ih _ _
+    · rfl
+
+/-- `natDigits` is never empty, so a rendered field always has a digit. -/
+theorem natDigits_ne_nil (n : Nat) : natDigits n ≠ [] := by
+  unfold natDigits
+  split
+  · exact List.cons_ne_nil _ _
+  · exact List.append_ne_nil_of_right_ne_nil _ (List.cons_ne_nil _ _)
+
+theorem natOfDigits_natDigits : ∀ (n : Nat) (acc : Nat),
+    natOfDigits acc (natDigits n) = some (acc * 10 ^ (natDigits n).length + n) := by
+  intro n
+  induction n using Nat.strongRecOn with
+  | _ n ih =>
+    intro acc
+    by_cases h : n < 10
+    · have hd : natDigits n = [digitChar n] := by rw [natDigits, if_pos h]
+      rw [hd]
+      simp only [natOfDigits, isAsciiDigit_digitChar h, if_pos, List.length_cons,
+        List.length_nil, toNat_digitChar h]
+      congr 1
+      omega
+    · have h10 : 10 ≤ n := by omega
+      have hmod : n % 10 < 10 := Nat.mod_lt _ (by omega)
+      have hd : natDigits n = natDigits (n / 10) ++ [digitChar (n % 10)] := by
+        rw [natDigits, if_neg h]
+      rw [hd, natOfDigits_append, ih (n / 10) (Nat.div_lt_self (by omega) (by omega)) acc]
+      simp only [Option.bind_some, natOfDigits, isAsciiDigit_digitChar hmod, if_pos,
+        toNat_digitChar hmod, List.length_append, List.length_cons, List.length_nil]
+      congr 1
+      rw [show 48 + n % 10 - 48 = n % 10 from by omega, Nat.pow_succ,
+        Nat.add_mul, Nat.mul_assoc, Nat.add_assoc, Nat.div_add_mod']
+
+theorem natOfDigits_zeros : ∀ (k acc : Nat),
+    natOfDigits acc (List.replicate k '0') = some (acc * 10 ^ k) := by
+  intro k
+  induction k with
+  | zero => intro acc; simp only [List.replicate_zero, natOfDigits, Nat.pow_zero, Nat.mul_one]
+  | succ j ih =>
+    intro acc
+    have hz : ('0' : Char).toNat = 48 := by decide
+    have hdig : isAsciiDigit '0' = true := by decide
+    rw [List.replicate_succ]
+    simp only [natOfDigits, hdig, if_pos, hz]
+    rw [ih (acc * 10 + (48 - 48))]
+    congr 1
+    rw [show (48 : Nat) - 48 = 0 from rfl, Nat.add_zero, Nat.pow_succ, Nat.mul_assoc,
+      Nat.mul_comm (10 : Nat) (10 ^ j)]
+
+/-- **A padded decimal field reads back as the number it was rendered from**,
+at any width. -/
+theorem natOfDigits_padDigits (width n : Nat) :
+    natOfDigits 0 (padDigits width n) = some n := by
+  unfold padDigits
+  rw [natOfDigits_append, natOfDigits_zeros, Option.bind_some, natOfDigits_natDigits]
+  simp
+
+theorem natOfDigitsFull_padDigits (width n : Nat) :
+    natOfDigitsFull (padDigits width n) = some n := by
+  have hval := natOfDigits_padDigits width n
+  cases hl : padDigits width n with
+  | nil => exact absurd (List.append_eq_nil_iff.mp hl).2 (natDigits_ne_nil n)
+  | cons c t =>
+    rw [hl] at hval
+    exact hval
+
+theorem parseNatField_padDigits (width n : Nat) (what : String) :
+    parseNatField (String.ofList (padDigits width n)) what = .ok n := by
+  unfold parseNatField
+  rw [String.toList_ofList, natOfDigitsFull_padDigits]
+  rfl
+
+/-- Every character of a rendered decimal field is a digit — which is what
+makes the `-`, `:` and `.` separators unambiguous. -/
+theorem isAsciiDigit_of_mem_natDigits : ∀ (n : Nat) (c : Char),
+    c ∈ natDigits n → isAsciiDigit c = true := by
+  intro n
+  induction n using Nat.strongRecOn with
+  | _ n ih =>
+    intro c hc
+    by_cases h : n < 10
+    · rw [natDigits, if_pos h] at hc
+      rcases List.mem_singleton.mp hc with rfl
+      exact isAsciiDigit_digitChar h
+    · rw [natDigits, if_neg h] at hc
+      rcases List.mem_append.mp hc with hc | hc
+      · exact ih (n / 10) (Nat.div_lt_self (by omega) (by omega)) c hc
+      · rcases List.mem_singleton.mp hc with rfl
+        exact isAsciiDigit_digitChar (Nat.mod_lt _ (by omega))
+
+theorem isAsciiDigit_of_mem_padDigits {width n : Nat} {c : Char}
+    (hc : c ∈ padDigits width n) : isAsciiDigit c = true := by
+  unfold padDigits at hc
+  rcases List.mem_append.mp hc with hc | hc
+  · rw [List.eq_of_mem_replicate hc]; decide
+  · exact isAsciiDigit_of_mem_natDigits n c hc
+
+/-- A separator that is not a digit never occurs inside a rendered field. -/
+theorem ne_of_mem_padDigits {width n : Nat} {sep : Char}
+    (hsep : isAsciiDigit sep = false) : ∀ c ∈ padDigits width n, c ≠ sep := by
+  intro c hc heq
+  have hd := isAsciiDigit_of_mem_padDigits hc
+  rw [heq, hsep] at hd
+  exact Bool.false_ne_true hd
+
+/-- A decimal rendering of `n < 10^(k+1)` is at most `k+1` characters. -/
+theorem natDigits_length_le : ∀ (k n : Nat), n < 10 ^ (k + 1) →
+    (natDigits n).length ≤ k + 1 := by
+  intro k
+  induction k with
+  | zero =>
+    intro n h
+    rw [Nat.pow_one] at h
+    rw [natDigits, if_pos h]
+    simp
+  | succ j ih =>
+    intro n h
+    by_cases hs : n < 10
+    · rw [natDigits, if_pos hs]
+      simp only [List.length_cons, List.length_nil]
+      omega
+    · rw [natDigits, if_neg hs]
+      have hdiv : n / 10 < 10 ^ (j + 1) := by
+        have : (10 : Nat) ^ (j + 1 + 1) = 10 ^ (j + 1) * 10 := Nat.pow_succ ..
+        omega
+      have := ih (n / 10) hdiv
+      simp only [List.length_append, List.length_cons, List.length_nil]
+      omega
+
+theorem padDigits_length {width n : Nat} (h : (natDigits n).length ≤ width) :
+    (padDigits width n).length = width := by
+  unfold padDigits
+  rw [List.length_append, List.length_replicate]
+  omega
+
+theorem padDigits_ne_nil (width n : Nat) : padDigits width n ≠ [] :=
+  fun h => absurd (List.append_eq_nil_iff.mp h).2 (natDigits_ne_nil n)
+
+theorem not_mem_padDigits {width n : Nat} {sep : Char}
+    (hsep : isAsciiDigit sep = false) : sep ∉ padDigits width n :=
+  fun hmem => (ne_of_mem_padDigits hsep sep hmem) rfl
+
+/-!
+### Temporal text roundtrips
+
+PostgreSQL renders `date` and `time` as fixed-width decimal fields; these laws
+say pg-lean's parser recovers exactly what its renderer wrote. Floats are
+deliberately absent: `toString`/`parseFloat` is *not* an unconditional IEEE-754
+roundtrip (shortest-representation printing plus decimal-to-binary rounding),
+and stating the true law needs real-arithmetic support this repository does not
+have (core + Std only, no Mathlib).
+-/
+
+theorem splitOnChar_singleton {c : Char} {s : String} (h : c ∉ s.toList) :
+    splitOnChar c s = [s] := by
+  unfold splitOnChar
+  rw [List.splitOn_eq_singleton h]
+  simp only [List.map_cons, List.map_nil, String.ofList_toList]
+
+theorem splitOnChar_cons {c : Char} {p rest : List Char} (h : c ∉ p) :
+    splitOnChar c (String.ofList (p ++ c :: rest)) =
+      String.ofList p :: splitOnChar c (String.ofList rest) := by
+  unfold splitOnChar
+  rw [String.toList_ofList, List.splitOn_append_cons_self_of_not_mem h,
+    String.toList_ofList, List.map_cons]
+
+/-- **A rendered date parses back to its own three fields.** -/
+theorem dateFields_renderDate {d : PlainDate} (hyear : 0 ≤ d.year) :
+    dateFields (renderDate d) = .ok (d.year.natAbs, d.month.toNat, d.day.toNat) := by
+  have hdash : isAsciiDigit '-' = false := by decide
+  have hchars : dateChars d = padDigits 4 d.year.natAbs ++
+      '-' :: (padDigits 2 d.month.toNat ++ '-' :: padDigits 2 d.day.toNat) := by
+    unfold dateChars yearChars
+    split
+    · rename_i hc; exact absurd hyear (Int.not_le.mpr hc)
+    · rfl
+  unfold dateFields renderDate
+  rw [hchars, splitOnChar_cons (not_mem_padDigits hdash),
+    splitOnChar_cons (not_mem_padDigits hdash),
+    splitOnChar_singleton (by rw [String.toList_ofList]; exact not_mem_padDigits hdash)]
+  simp only [parseNatField_padDigits]
+
+theorem month_ofInt_toNat (m : Std.Time.Month.Ordinal) :
+    Std.Time.Internal.Bounded.LE.ofInt (Int.ofNat m.toNat) = some m := by
+  obtain ⟨v, hv⟩ := m
+  cases v with
+  | ofNat k =>
+    show Std.Time.Internal.Bounded.LE.ofInt (Int.ofNat k) = _
+    unfold Std.Time.Internal.Bounded.LE.ofInt
+    rw [dif_pos hv]
+    rfl
+  | negSucc k => exact absurd hv.1 (by omega)
+
+theorem day_ofInt_toNat (d : Std.Time.Day.Ordinal) :
+    Std.Time.Internal.Bounded.LE.ofInt (Int.ofNat d.toNat) = some d := by
+  obtain ⟨v, hv⟩ := d
+  cases v with
+  | ofNat k =>
+    show Std.Time.Internal.Bounded.LE.ofInt (Int.ofNat k) = _
+    unfold Std.Time.Internal.Bounded.LE.ofInt
+    rw [dif_pos hv]
+    rfl
+  | negSucc k => exact absurd hv.1 (by omega)
+
+/-- **A rendered `date` parses back to the same `PlainDate`** (AD dates: BC
+years render with a leading `-`, which PostgreSQL spells `... BC` and pg-lean
+does not accept). -/
+theorem parseDate_renderDate {d : PlainDate} (hyear : 0 ≤ d.year) :
+    parseDate (renderDate d) = .ok d := by
+  have hnat : Int.ofNat d.year.natAbs = d.year := Int.natAbs_of_nonneg hyear
+  unfold parseDate
+  rw [dateFields_renderDate hyear]
+  simp only [month_ofInt_toNat, day_ofInt_toNat, hnat]
+  unfold PlainDate.ofYearMonthDay?
+  rw [dif_pos d.valid]
+
+theorem fracNanos_padDigits {x : Nat} (hx : x < 1000000) :
+    fracNanos (String.ofList (padDigits 6 x)) = .ok (x * 1000) := by
+  have hlen : (padDigits 6 x).length = 6 :=
+    padDigits_length (by have := natDigits_length_le 5 x (by simpa using hx); omega)
+  have hne : (String.ofList (padDigits 6 x)).isEmpty = false := by
+    refine String.isEmpty_eq_false_iff.mpr (fun hc => ?_)
+    have hto := congrArg String.toList hc
+    rw [String.toList_ofList] at hto
+    exact absurd (hto.trans (by rfl)) (padDigits_ne_nil 6 x)
+  unfold fracNanos
+  rw [if_neg (by simp [hne]), String.toList_ofList,
+    show List.take 9 (padDigits 6 x ++ List.replicate 9 '0')
+        = padDigits 6 x ++ List.replicate 3 '0' from by
+      rw [List.take_append, hlen, List.take_of_length_le (by omega), List.take_replicate]
+      rfl]
+  unfold parseNatField
+  rw [String.toList_ofList]
+  have hval : natOfDigits 0 (padDigits 6 x ++ List.replicate 3 '0') = some (x * 1000) := by
+    rw [natOfDigits_append, natOfDigits_padDigits, Option.bind_some, natOfDigits_zeros]
+  cases hp : padDigits 6 x ++ List.replicate 3 '0' with
+  | nil => exact absurd (List.append_eq_nil_iff.mp hp).1 (padDigits_ne_nil 6 x)
+  | cons a t =>
+    rw [hp] at hval
+    rw [show natOfDigitsFull (a :: t) = some (x * 1000) from hval]
+    rfl
+
+/-- `HH:MM:SS` fields render and parse back, whatever the fraction carries. -/
+theorem hmsNanos_render {h m sec : Nat} (hh : h < 24) (hm : m < 60) (hs : sec < 61)
+    {frac : String} {f : Nat} (hf : fracNanos frac = .ok f) :
+    hmsNanos
+        (String.ofList (padDigits 2 h ++ ':' :: (padDigits 2 m ++ ':' :: padDigits 2 sec)))
+        frac
+      = .ok (Int.ofNat (((h * 3600 + m * 60 + sec) * 1000000000) + f)) := by
+  have hcolon : isAsciiDigit ':' = false := by decide
+  unfold hmsNanos
+  rw [splitOnChar_cons (not_mem_padDigits hcolon),
+    splitOnChar_cons (not_mem_padDigits hcolon),
+    splitOnChar_singleton (by rw [String.toList_ofList]; exact not_mem_padDigits hcolon)]
+  simp only [parseNatField_padDigits, hf]
+  rw [if_pos (by simp only [Bool.and_eq_true, decide_eq_true_eq]; exact ⟨⟨hh, hm⟩, hs⟩)]
+
+/-- **A rendered time-of-day parses back to the same nanosecond count**, at
+PostgreSQL's microsecond resolution (`time` stores microseconds, so a value
+with sub-microsecond nanoseconds cannot survive any text form). -/
+theorem parseTimeNanos_renderTimeNanos {n : Nat} (hlt : n < 86400000000000)
+    (hmicro : n % 1000 = 0) :
+    parseTimeNanos (renderTimeNanos n) = .ok (Int.ofNat n) := by
+  have hdot : isAsciiDigit '.' = false := by decide
+  have hh : n / 1000000000 / 3600 < 24 := by omega
+  have hm : n / 1000000000 / 60 % 60 < 60 := by omega
+  have hs : n / 1000000000 % 60 < 61 := by omega
+  by_cases hsub : n % 1000000000 = 0
+  · have hchars : timeChars n = padDigits 2 (n / 1000000000 / 3600) ++
+        ':' :: (padDigits 2 (n / 1000000000 / 60 % 60) ++
+          ':' :: padDigits 2 (n / 1000000000 % 60)) := by
+      unfold timeChars
+      rw [if_pos (by simp [hsub]), List.append_nil]
+    have hstep := hmsNanos_render hh hm hs (frac := "") (f := 0) rfl
+    unfold parseTimeNanos renderTimeNanos
+    rw [hchars,
+      splitOnChar_singleton (by
+        rw [String.toList_ofList]
+        simp only [List.mem_append, List.mem_cons, not_or]
+        exact ⟨not_mem_padDigits hdot, by decide, not_mem_padDigits hdot, by decide,
+          not_mem_padDigits hdot⟩)]
+    refine hstep.trans ?_
+    congr 1
+    exact congrArg Int.ofNat (by omega)
+  · have hchars : timeChars n =
+        (padDigits 2 (n / 1000000000 / 3600) ++
+          ':' :: (padDigits 2 (n / 1000000000 / 60 % 60) ++
+            ':' :: padDigits 2 (n / 1000000000 % 60))) ++
+          '.' :: padDigits 6 (n % 1000000000 / 1000) := by
+      unfold timeChars
+      rw [if_neg (by simp [hsub])]
+      simp [List.append_assoc]
+    have hstep := hmsNanos_render hh hm hs
+      (fracNanos_padDigits (x := n % 1000000000 / 1000) (by omega))
+    unfold parseTimeNanos renderTimeNanos
+    rw [hchars,
+      splitOnChar_cons (by
+        simp only [List.mem_append, List.mem_cons, not_or]
+        exact ⟨not_mem_padDigits hdot, by decide, not_mem_padDigits hdot, by decide,
+          not_mem_padDigits hdot⟩),
+      splitOnChar_singleton (by rw [String.toList_ofList]; exact not_mem_padDigits hdot)]
+    refine hstep.trans ?_
+    congr 1
+    exact congrArg Int.ofNat (by omega)
+
+theorem not_mem_dateChars {sep : Char} (hsep : isAsciiDigit sep = false)
+    (hdash : sep ≠ '-') (d : PlainDate) : sep ∉ dateChars d := by
+  unfold dateChars yearChars
+  simp only [List.mem_append, List.mem_cons, not_or]
+  refine ⟨?_, hdash, not_mem_padDigits hsep, hdash, not_mem_padDigits hsep⟩
+  split
+  · simp only [List.mem_cons, not_or]
+    exact ⟨hdash, not_mem_padDigits hsep⟩
+  · exact not_mem_padDigits hsep
+
+theorem not_mem_timeChars {sep : Char} (hsep : isAsciiDigit sep = false)
+    (hcolon : sep ≠ ':') (hdot : sep ≠ '.') (n : Nat) : sep ∉ timeChars n := by
+  unfold timeChars
+  simp only [List.mem_append, List.mem_cons, not_or]
+  refine ⟨not_mem_padDigits hsep, hcolon, not_mem_padDigits hsep, hcolon,
+    not_mem_padDigits hsep, ?_⟩
+  split
+  · exact List.not_mem_nil
+  · simp only [List.mem_cons, not_or]
+    exact ⟨hdot, not_mem_padDigits hsep⟩
+
+/-- **A rendered timestamp splits back into the same date and the same
+nanoseconds-since-midnight.** (Turning those nanoseconds into a `PlainTime`
+is `Std.Time`'s `ofNanoseconds`, which this repository does not reason
+about.) -/
+theorem timestampFields_renderTimestamp {d : PlainDate} {n : Nat}
+    (hyear : 0 ≤ d.year) (hlt : n < 86400000000000) (hmicro : n % 1000 = 0) :
+    timestampFields (renderTimestamp d n) = .ok (d, Int.ofNat n) := by
+  have hspace : isAsciiDigit ' ' = false := by decide
+  unfold timestampFields renderTimestamp
+  rw [splitOnChar_cons (not_mem_dateChars hspace (by decide) d),
+    splitOnChar_singleton (by
+      rw [String.toList_ofList]
+      exact not_mem_timeChars hspace (by decide) (by decide) n)]
+  simp only [show String.ofList (dateChars d) = renderDate d from rfl,
+    show String.ofList (timeChars n) = renderTimeNanos n from rfl,
+    parseDate_renderDate hyear, parseTimeNanos_renderTimeNanos hlt hmicro]
 
 /-!
 ### `numeric`: the lossless base-10000 roundtrip
