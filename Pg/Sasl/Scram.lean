@@ -114,6 +114,16 @@ prefix. Public so the SCRAM laws can speak about parsed attribute values. -/
 def valueAfterPrefix (part : String) : String :=
   (String.fromUTF8? (part.toUTF8.extract 2 part.toUTF8.size)).getD ""
 
+/-- Split a message into attributes at a separator character.
+
+Deliberately *not* `String.splitOn`: `String.splitOnAux` is `@[irreducible]`
+and core 4.31 ships no lemmas about it whatsoever, so a `String.splitOn`-based
+parser is opaque to the kernel. `List.splitOn` has a full lemma set, and the
+two agree for a single-character separator — that is what makes
+`parseServerFirst_render` provable. -/
+def splitOnChar (c : Char) (s : String) : List String :=
+  (s.toList.splitOn c).map String.ofList
+
 /-- Returns the sub-machine and client-first message for an explicit GS2
 channel-binding choice. PostgreSQL ignores the `n=` field (it uses the
 startup-message user), but sending it costs nothing and makes the exchange
@@ -138,7 +148,7 @@ structure ServerFirst where
   deriving Inhabited
 
 def parseServerFirst (ourNonce : String) (msg : String) : Except Error ServerFirst :=
-  match msg.splitOn "," with
+  match splitOnChar ',' msg with
   | r :: s :: i :: _ =>
     if r.startsWith "m=" then throw .unsupportedExtension
     else if !r.startsWith "r=" then throw (.malformedServerMessage "expected r=")
@@ -189,7 +199,7 @@ def verifyServerFinal (c : Client) (serverFinal : String) : Except Error Unit :=
   match c.phase with
   | .sentFirst => throw (.malformedServerMessage "server-final before client-final")
   | .sentFinal expected =>
-    match serverFinal.splitOn "," with
+    match splitOnChar ',' serverFinal with
     | [] => throw (.malformedServerMessage "expected v= or e=")
     | first :: _ =>
       if first.startsWith "e=" then throw (.serverRejected (valueAfterPrefix first))
@@ -224,6 +234,10 @@ implementation of those interfaces, in particular the concrete lawful one:
   server-first has `r=`,`s=`,`i=` attributes in order, in-range iterations,
   and a server nonce that **extends the client nonce** — nonce substitution
   is rejected.
+- `parseServerFirst_render`: the converse direction — a rendered server-first
+  message (`renderServerFirst`) parses back to exactly the nonce, salt and
+  iteration count that were rendered, given RFC 5802's own comma-free
+  restriction on attribute values.
 - `clientFinal_spec`: the exact RFC 5802 client-final message and expected
   server signature: `c=<b64(gs2+cbind)>,r=<server nonce>,p=<b64 proof>`
   with the signature over exactly
@@ -269,7 +283,7 @@ theorem parseServerFirst_spec {ourNonce msg : String} {sf : ServerFirst}
     (h : parseServerFirst ourNonce msg = .ok sf) :
     sf.nonce.startsWith ourNonce = true ∧
     0 < sf.iterations ∧ sf.iterations ≤ maxIterations ∧
-    ∃ r s i rest, msg.splitOn "," = r :: s :: i :: rest ∧
+    ∃ r s i rest, splitOnChar ',' msg = r :: s :: i :: rest ∧
       r.startsWith "r=" = true ∧ s.startsWith "s=" = true ∧ i.startsWith "i=" = true ∧
       sf.nonce = valueAfterPrefix r ∧
       Crypto.Base64.decode? (valueAfterPrefix s) = some sf.salt ∧
@@ -340,6 +354,98 @@ private theorem bytesEq_iff {a b : ByteArray} : bytesEq a b = true ↔ a = b := 
   · intro he
     rw [he]
 
+/-- The RFC 5802 server-first message on the wire, from its three attribute
+values. -/
+def renderServerFirst (nonce salt64 iterations : String) : String :=
+  "r=" ++ nonce ++ ",s=" ++ salt64 ++ ",i=" ++ iterations
+
+private theorem splitOnChar_singleton {c : Char} {s : String} (h : c ∉ s.toList) :
+    splitOnChar c s = [s] := by
+  unfold splitOnChar
+  rw [List.splitOn_eq_singleton h]
+  simp only [List.map_cons, List.map_nil, String.ofList_toList]
+
+private theorem splitOnChar_cons {c : Char} {p rest : List Char} (h : c ∉ p) :
+    splitOnChar c (String.ofList (p ++ c :: rest)) =
+      String.ofList p :: splitOnChar c (String.ofList rest) := by
+  unfold splitOnChar
+  rw [String.toList_ofList, List.splitOn_append_cons_self_of_not_mem h,
+    String.toList_ofList, List.map_cons]
+
+private theorem startsWith_self (p v : String) : (p ++ v).startsWith p = true := by
+  rw [String.startsWith_string_iff, String.toList_append]
+  exact List.prefix_append _ _
+
+private theorem startsWith_m_of_r (v : String) : ("r=" ++ v).startsWith "m=" = false := by
+  rw [String.startsWith_string_eq_false_iff, String.toList_append,
+    show ("m=" : String).toList = ['m', '='] from by decide,
+    show ("r=" : String).toList = ['r', '='] from by decide]
+  intro hpre
+  obtain ⟨t, ht⟩ := hpre
+  simp only [List.cons_append] at ht
+  injection ht with h1 _
+  exact absurd h1 (by decide)
+
+/-- The comma split of a rendered server-first message is exactly its three
+attributes, provided the values are comma-free (RFC 5802's `value-safe-char`
+grammar). -/
+private theorem splitOnChar_render {nonce salt64 iters : String}
+    (hn : ',' ∉ nonce.toList) (hs : ',' ∉ salt64.toList) (hi : ',' ∉ iters.toList) :
+    splitOnChar ',' (renderServerFirst nonce salt64 iters) =
+      ["r=" ++ nonce, "s=" ++ salt64, "i=" ++ iters] := by
+  have hren : renderServerFirst nonce salt64 iters =
+      String.ofList (("r=" ++ nonce).toList ++ ',' ::
+        (("s=" ++ salt64).toList ++ ',' :: ("i=" ++ iters).toList)) := by
+    rw [show ((("r=" ++ nonce).toList ++ ',' ::
+        (("s=" ++ salt64).toList ++ ',' :: ("i=" ++ iters).toList)) : List Char) =
+      (renderServerFirst nonce salt64 iters).toList from by
+      unfold renderServerFirst
+      simp only [String.toList_append,
+        show ("r=" : String).toList = ['r', '='] from by decide,
+        show (",s=" : String).toList = [',', 's', '='] from by decide,
+        show (",i=" : String).toList = [',', 'i', '='] from by decide]
+      simp [List.append_assoc]]
+    exact String.ofList_toList.symm
+  have hmemr : ',' ∉ ("r=" ++ nonce).toList := by
+    rw [String.toList_append, show ("r=" : String).toList = ['r', '='] from by decide]
+    simpa using hn
+  have hmems : ',' ∉ ("s=" ++ salt64).toList := by
+    rw [String.toList_append, show ("s=" : String).toList = ['s', '='] from by decide]
+    simpa using hs
+  have hmemi : ',' ∉ ("i=" ++ iters).toList := by
+    rw [String.toList_append, show ("i=" : String).toList = ['i', '='] from by decide]
+    simpa using hi
+  rw [hren, splitOnChar_cons hmemr, splitOnChar_cons hmems]
+  simp only [String.ofList_toList]
+  rw [splitOnChar_singleton hmemi]
+
+/-- **Render→parse roundtrip**: a well-formed server-first message parses back
+to exactly the values that were rendered. The comma-freeness hypotheses are
+RFC 5802's own `value-safe-char` restriction on attribute values (real nonces
+and salts are base64, the iteration count decimal), not a proof artifact. -/
+theorem parseServerFirst_render {ourNonce nonce salt64 iters : String}
+    {salt : ByteArray} {iterations : Nat}
+    (hn : ',' ∉ nonce.toList) (hs : ',' ∉ salt64.toList) (hi : ',' ∉ iters.toList)
+    (hnonce : nonce.startsWith ourNonce = true)
+    (hsalt : Crypto.Base64.decode? salt64 = some salt)
+    (hiter : iters.toNat? = some iterations)
+    (hpos : 0 < iterations) (hmax : iterations ≤ maxIterations) :
+    parseServerFirst ourNonce (renderServerFirst nonce salt64 iters) =
+      .ok { nonce, salt, iterations } := by
+  have hvr : valueAfterPrefix ("r=" ++ nonce) = nonce := valueAfterPrefix_append _ _ rfl
+  have hvs : valueAfterPrefix ("s=" ++ salt64) = salt64 := valueAfterPrefix_append _ _ rfl
+  have hvi : valueAfterPrefix ("i=" ++ iters) = iters := valueAfterPrefix_append _ _ rfl
+  have h0 : (iterations == 0) = false := by
+    simp only [beq_eq_false_iff_ne, ne_eq]
+    omega
+  have hgt : decide (iterations > maxIterations) = false := by
+    simp only [decide_eq_false_iff_not, Nat.not_lt]
+    omega
+  unfold parseServerFirst
+  rw [splitOnChar_render hn hs hi]
+  simp only [startsWith_m_of_r, startsWith_self, hvr, hvs, hvi, hnonce, hsalt, hiter,
+    h0, hgt, Bool.not_true, Bool.false_eq_true, if_false, Bool.or_self]
+
 /-- Mutual authentication is byte-exact: verification succeeds only for a
 `v=` first attribute whose base64 payload is exactly the server signature
 computed in `clientFinal`. -/
@@ -347,7 +453,7 @@ theorem verifyServerFinal_spec {c : Client} {serverFinal : String}
     (h : verifyServerFinal c serverFinal = .ok ()) :
     ∃ expected first rest,
       c.phase = .sentFinal expected ∧
-      serverFinal.splitOn "," = first :: rest ∧
+      splitOnChar ',' serverFinal = first :: rest ∧
       first.startsWith "v=" = true ∧
       Crypto.Base64.decode? (valueAfterPrefix first) = some expected := by
   revert h
