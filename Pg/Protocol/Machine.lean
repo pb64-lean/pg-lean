@@ -640,8 +640,9 @@ def step (s : State) (msg : RawMessage) : Except PgError (State × Array Event �
         | .running pipe => stepRunning s pipe m
         | .closed => throw (.protocol "unreachable")
 
-/-- `step` each frame in order, accumulating events and output bytes. -/
-private def runSteps (s : State) (msgs : List RawMessage) (events : Array Event)
+/-- `step` each frame in order, accumulating events and output bytes. Public
+because the framing-bridge theorems (`feed_frames`) factor `feed` through it. -/
+def runSteps (s : State) (msgs : List RawMessage) (events : Array Event)
     (out : ByteArray) : Except PgError (State × Array Event × ByteArray) :=
   match msgs with
   | [] => pure (s, events, out)
@@ -1375,6 +1376,143 @@ theorem feed_wellFormed {s : State} {chunk : ByteArray} {s' : State}
   · split at h
     rename_i fed hd msgs decode htake
     exact runSteps_wf (s := { s with decode := decode }) (r := (s', evs, out)) hwf h
+
+/-!
+### Bridging framing conservation to the machine
+
+`feed` is the composition of two proved layers: the framing decoder
+(`DecodeState.feed`, which conserves bytes — `DecodeState.feed_conservation`)
+and per-frame stepping (`runSteps`/`step`, which never touches the decoder).
+`feed_frames` makes the factoring explicit: every successful `feed` exhibits
+the exact frame sequence it stepped, and re-encoding those frames plus the
+retained buffer reproduces the bytes fed. Since `start`, `submit`, and `step`
+leave the decoder's drained-message queue empty (`start_messages_drained`,
+`submit_decode`, `step_decode`) and `feed` re-drains it
+(`feed_messages_drained`), the byte accounting is exact on every reachable
+state (`feed_byte_accounting`).
+-/
+
+private theorem stepStartup_decode {s : State} {auth : AuthState} {m : BackendMsg}
+    {s' : State} {evs : Array Event} {out : ByteArray}
+    (h : stepStartup s auth m = .ok (s', evs, out)) : s'.decode = s.decode := by
+  revert h
+  fun_cases stepStartup s auth m <;> intro h <;> cases h <;> rfl
+
+private theorem stepRunning_decode {s : State} {pipe : Pipeline} {m : BackendMsg}
+    {s' : State} {evs : Array Event} {out : ByteArray}
+    (h : stepRunning s pipe m = .ok (s', evs, out)) : s'.decode = s.decode := by
+  revert h
+  fun_cases stepRunning s pipe m <;> intro h <;> cases h <;> rfl
+
+/-- `step` never touches the framing decoder — frame boundaries and message
+semantics live in separate layers. -/
+theorem step_decode {s : State} {msg : RawMessage} {s' : State} {evs : Array Event}
+    {out : ByteArray} (h : step s msg = .ok (s', evs, out)) : s'.decode = s.decode := by
+  revert h
+  fun_cases step s msg
+  case case3 => intro h; cases h; rfl
+  case case4 => intro h; cases h; rfl
+  case case5 => intro h; cases h; rfl
+  case case6 => intro h; exact stepStartup_decode h
+  case case7 => intro h; exact stepRunning_decode h
+  all_goals (intro h; cases h)
+
+/-- Neither does `submit`. -/
+theorem submit_decode {s : State} {req : Request} {s' : State} {out : ByteArray}
+    (h : submit s req = .ok (s', out)) : s'.decode = s.decode := by
+  have idle : ∀ (s₀ : State) (pipe : Pipeline) (req₀ : Request),
+      s₀.decode = s.decode →
+      submitIdle s₀ pipe req₀ = .ok (s', out) → s'.decode = s.decode := by
+    intro s₀ pipe req₀ hdec
+    fun_cases submitIdle s₀ pipe req₀ <;> intro h' <;> cases h' <;> exact hdec
+  have running : ∀ (s₀ : State) (pipe : Pipeline) (req₀ : Request),
+      s₀.decode = s.decode →
+      submitRunning s₀ pipe req₀ = .ok (s', out) → s'.decode = s.decode := by
+    intro s₀ pipe req₀ hdec
+    fun_cases submitRunning s₀ pipe req₀ <;> intro h' <;>
+      first
+        | exact idle _ _ _ hdec h'
+        | (cases h' <;> exact hdec)
+  revert h
+  fun_cases submit s req <;> intro h <;>
+    first
+      | exact running _ _ _ rfl h
+      | (cases h <;> rfl)
+
+theorem runSteps_decode :
+    ∀ {msgs : List RawMessage} {s : State} {events : Array Event} {out : ByteArray}
+      {r : State × Array Event × ByteArray},
+      runSteps s msgs events out = .ok r → r.1.decode = s.decode := by
+  intro msgs
+  induction msgs with
+  | nil =>
+    intro s events out r h
+    cases h
+    rfl
+  | cons m rest ih =>
+    intro s events out r h
+    unfold runSteps at h
+    cases hst : step s m with
+    | error e =>
+      rw [hst] at h
+      cases h
+    | ok res =>
+      obtain ⟨s1, evs1, b1⟩ := res
+      rw [hst] at h
+      rw [ih h, step_decode hst]
+
+theorem start_messages_drained (cfg : Config) :
+    (start cfg).1.decode.messages = #[] := by rfl
+
+/-- **Machine/framing bridge**: a successful `feed` factors into one framing
+step and pure message stepping — it exhibits the exact frames stepped, leaves
+the drained decoder, and conserves bytes: re-encoding the stepped frames plus
+the retained buffer reproduces everything buffered plus the chunk. -/
+theorem feed_frames {s : State} {chunk : ByteArray} {s' : State} {evs : Array Event}
+    {out : ByteArray} (h : feed s chunk = .ok (s', evs, out)) :
+    ∃ msgs : Array RawMessage,
+      s.decode.feed chunk = .ok { buffered := s'.decode.buffered, messages := msgs } ∧
+      runSteps { s with decode := { buffered := s'.decode.buffered } }
+        msgs.toList #[] ByteArray.empty = .ok (s', evs, out) ∧
+      s'.decode.messages = #[] ∧
+      encodeMessages msgs ++ s'.decode.buffered =
+        encodeMessages s.decode.messages ++ (s.decode.buffered ++ chunk) := by
+  unfold feed at h
+  cases hd : s.decode.feed chunk with
+  | error e =>
+    rw [hd] at h
+    cases h
+  | ok fed =>
+    rw [hd] at h
+    simp only [DecodeState.take_eq] at h
+    have hdec : s'.decode = { fed with messages := #[] } :=
+      runSteps_decode (r := (s', evs, out)) h
+    have hbuf : s'.decode.buffered = fed.buffered := by rw [hdec]
+    refine ⟨fed.messages, ?_, ?_, ?_, ?_⟩
+    · rw [hbuf]
+    · rw [hbuf]
+      exact h
+    · rw [hdec]
+    · rw [hbuf]
+      exact DecodeState.feed_conservation hd
+
+/-- `feed` re-drains the decoder's completed-message queue. -/
+theorem feed_messages_drained {s : State} {chunk : ByteArray} {s' : State}
+    {evs : Array Event} {out : ByteArray} (h : feed s chunk = .ok (s', evs, out)) :
+    s'.decode.messages = #[] :=
+  (feed_frames h).choose_spec.2.2.1
+
+/-- Exact byte accounting on a drained state (every reachable state is one):
+the frames the machine stepped, re-encoded, plus the bytes it retained, are
+exactly the bytes it was holding plus the chunk it was fed. -/
+theorem feed_byte_accounting {s : State} {chunk : ByteArray} {s' : State}
+    {evs : Array Event} {out : ByteArray}
+    (hm : s.decode.messages = #[]) (h : feed s chunk = .ok (s', evs, out)) :
+    ∃ msgs : Array RawMessage,
+      encodeMessages msgs ++ s'.decode.buffered = s.decode.buffered ++ chunk := by
+  obtain ⟨msgs, -, -, -, hc⟩ := feed_frames h
+  refine ⟨msgs, ?_⟩
+  rwa [hm, encodeMessages_nil, ByteArray.empty_append] at hc
 
 /-- Async messages (NoticeResponse / ParameterStatus / NotificationResponse)
 never advance the pending pipeline: the phase — including the whole op queue

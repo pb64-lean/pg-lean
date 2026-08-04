@@ -164,6 +164,9 @@ def DecodeState.feed (state : DecodeState) (chunk : ByteArray) :
 def DecodeState.take (state : DecodeState) : Array RawMessage × DecodeState :=
   (state.messages, { state with messages := #[] })
 
+theorem DecodeState.take_eq (state : DecodeState) :
+    state.take = (state.messages, { state with messages := #[] }) := by rfl
+
 /-- Backend message tags a client must recognize (protocol 3.0). -/
 inductive BackendTag where
   | authentication          -- 'R'
@@ -318,6 +321,8 @@ def encodeMessages (msgs : Array RawMessage) : ByteArray :=
 theorem encodeMessages_push (msgs : Array RawMessage) (m : RawMessage) :
     encodeMessages (msgs.push m) = encodeMessages msgs ++ m.encode := by
   simp [encodeMessages]
+
+theorem encodeMessages_nil : encodeMessages #[] = ByteArray.empty := by rfl
 
 theorem get!_eq_getElem {a : ByteArray} {i : Nat} (h : i < a.size) :
     a.get! i = a[i] := by
