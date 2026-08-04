@@ -148,63 +148,156 @@ structure ConnectConfig where
 
 namespace ConnectConfig
 
-private def hexVal? (b : UInt8) : Option UInt8 :=
-  if b ≥ 48 && b ≤ 57 then some (b - 48)
-  else if b ≥ 97 && b ≤ 102 then some (b - 87)
-  else if b ≥ 65 && b ≤ 70 then some (b - 55)
-  else none
+/-!
+### Provable string surgery
 
-private def utf8Sub (raw : ByteArray) (lo hi : Nat) : String :=
-  (String.fromUTF8? (raw.extract lo hi)).getD ""
+Every split below goes through `List Char`. `String.splitOn` is a dead end for
+proofs — `String.splitOnAux` is `@[irreducible]`, its `eq_def` is private to
+core, and core 4.31 ships no lemmas about it — whereas `List` has a full set.
+The delimiters a `postgres://` URI uses (`: @ / ? & = %`) are all ASCII and
+UTF-8 continuation bytes are all `≥ 0x80`, so splitting on a `Char` is exactly
+the byte split this parser performed before.
+-/
 
-/-- Split at the first occurrence of an ASCII delimiter (safe under UTF-8:
-continuation bytes are ≥ 0x80). -/
-private def splitFirst (s : String) (c : UInt8) : Option (String × String) := Id.run do
-  let raw := s.toUTF8
-  for i in [0:raw.size] do
-    if raw.get! i == c then
-      return some (utf8Sub raw 0 i, utf8Sub raw (i + 1) raw.size)
-  return none
-
-private def splitLast (s : String) (c : UInt8) : Option (String × String) := Id.run do
-  let raw := s.toUTF8
-  for k in [0:raw.size] do
-    let i := raw.size - 1 - k
-    if raw.get! i == c then
-      return some (utf8Sub raw 0 i, utf8Sub raw (i + 1) raw.size)
-  return none
-
-private def afterPrefix (s prefix' : String) : Option String :=
-  if s.startsWith prefix' then
-    let raw := s.toUTF8
-    some (utf8Sub raw prefix'.toUTF8.size raw.size)
-  else none
-
-def percentDecode (s : String) : String := Id.run do
-  let raw := s.toUTF8
-  let mut out := ByteArray.empty
-  let mut i := 0
-  while i < raw.size do
-    let b := raw.get! i
-    if b == 37 && i + 2 < raw.size then  -- '%'
-      match hexVal? (raw.get! (i + 1)), hexVal? (raw.get! (i + 2)) with
-      | some hi, some lo =>
-        out := out.push (hi <<< 4 ||| lo)
-        i := i + 3
-      | _, _ =>
-        out := out.push b
-        i := i + 1
+private def splitFirstAux (c : Char) : List Char → Option (List Char × List Char)
+  | [] => none
+  | a :: rest =>
+    if a == c then some ([], rest)
     else
-      out := out.push b
-      i := i + 1
-  (String.fromUTF8? out).getD s
+      match splitFirstAux c rest with
+      | some (pre, post) => some (a :: pre, post)
+      | none => none
 
-private def parsePort (s : String) : Except String UInt16 := do
-  let some n := s.toNat? | throw s!"invalid port {s}"
-  unless n > 0 && n ≤ 65535 do throw s!"invalid port {s}"
-  pure (UInt16.ofNat n)
+private def splitLastAux (c : Char) : List Char → Option (List Char × List Char)
+  | [] => none
+  | a :: rest =>
+    match splitLastAux c rest with
+    | some (pre, post) => some (a :: pre, post)
+    | none => if a == c then some ([], rest) else none
 
-private def applyQueryParam (cfg : ConnectConfig) (key value : String) :
+/-- Split at the first occurrence of an ASCII delimiter. -/
+def splitFirstChar (c : Char) (s : String) : Option (String × String) :=
+  match splitFirstAux c s.toList with
+  | some (pre, post) => some (String.ofList pre, String.ofList post)
+  | none => none
+
+/-- Split at the last occurrence of an ASCII delimiter. -/
+def splitLastChar (c : Char) (s : String) : Option (String × String) :=
+  match splitLastAux c s.toList with
+  | some (pre, post) => some (String.ofList pre, String.ofList post)
+  | none => none
+
+private theorem splitFirstAux_length : ∀ {c : Char} {l pre post : List Char},
+    splitFirstAux c l = some (pre, post) → post.length < l.length := by
+  intro c l
+  induction l with
+  | nil => intro pre post h; cases h
+  | cons a t ih =>
+    intro pre post h
+    unfold splitFirstAux at h
+    split at h
+    · cases h
+      exact Nat.lt_succ_self _
+    · split at h
+      · next p q hq =>
+        cases h
+        exact Nat.lt_succ_of_lt (ih hq)
+      · cases h
+
+set_option linter.unusedVariables false in
+private def splitAllAux (c : Char) (l : List Char) : List (List Char) :=
+  match h : splitFirstAux c l with
+  | some (pre, post) =>
+    have hlt : post.length < l.length := splitFirstAux_length h
+    pre :: splitAllAux c post
+  | none => [l]
+  termination_by l.length
+  decreasing_by exact hlt
+
+/-- Split into every field separated by an ASCII delimiter — the `&` of a URI
+query string. Agrees with `String.splitOn` for a one-character separator. -/
+def splitAllChar (c : Char) (s : String) : List String :=
+  (splitAllAux c s.toList).map String.ofList
+
+/-- Everything after a literal ASCII prefix, when the string carries it. -/
+private def afterPrefix (s pre : String) : Option String :=
+  if s.startsWith pre then
+    some (String.ofList (s.toList.drop pre.toList.length))
+  else none
+
+/-!
+### Percent-encoding
+
+Decoding happens on UTF-8 *bytes*, not characters: `%C3%A4` is the two-byte
+encoding of `ä`, so a character-level decoder would corrupt every non-ASCII
+password or database name. `percentEncode` is the inverse (`percentDecode_percentEncode`),
+escaping everything outside RFC 3986's unreserved set — which covers every
+delimiter this parser splits on and every non-ASCII byte.
+-/
+
+/-- Bytes RFC 3986 leaves unescaped: ALPHA / DIGIT / `-` / `.` / `_` / `~`. -/
+private def unreservedByte (b : UInt8) : Bool :=
+  let v := b.toNat
+  (48 ≤ v && v ≤ 57) || (65 ≤ v && v ≤ 90) || (97 ≤ v && v ≤ 122) ||
+    v == 45 || v == 46 || v == 95 || v == 126
+
+/-- Nibble value of an ASCII hex digit (upper or lower case). -/
+private def hexVal? (b : UInt8) : Option Nat :=
+  let v := b.toNat
+  if 48 ≤ v && v ≤ 57 then some (v - 48)
+  else if 97 ≤ v && v ≤ 102 then some (v - 87)
+  else if 65 ≤ v && v ≤ 70 then some (v - 55)
+  else none
+
+/-- ASCII byte of a nibble, upper case (`0`-`9`, `A`-`F`). -/
+private def hexDigitByte (n : Nat) : UInt8 :=
+  if n < 10 then UInt8.ofNat (48 + n) else UInt8.ofNat (55 + n)
+
+private def percentEncodeBytes : List UInt8 → List UInt8
+  | [] => []
+  | b :: rest =>
+    if unreservedByte b then b :: percentEncodeBytes rest
+    else 37 :: hexDigitByte (b.toNat / 16) :: hexDigitByte (b.toNat % 16) ::
+      percentEncodeBytes rest
+
+private def percentDecodeBytes : List UInt8 → List UInt8
+  | b :: h :: l :: tail =>
+    if b == 37 then
+      match hexVal? h, hexVal? l with
+      | some hi, some lo => UInt8.ofNat (hi * 16 + lo) :: percentDecodeBytes tail
+      | _, _ => b :: percentDecodeBytes (h :: l :: tail)
+    else b :: percentDecodeBytes (h :: l :: tail)
+  | b :: rest => b :: percentDecodeBytes rest
+  | [] => []
+  termination_by xs => xs.length
+  decreasing_by all_goals simp only [List.length_cons]; omega
+
+private def asciiChars (l : List UInt8) : List Char :=
+  l.map (fun b => Char.ofNat b.toNat)
+
+/-- Percent-decode a URI component. Invalid escapes are left verbatim (libpq
+does the same), and a decode that would not be valid UTF-8 yields the input
+unchanged rather than a lossy string. -/
+def percentDecode (s : String) : String :=
+  (String.fromUTF8? (percentDecodeBytes s.toUTF8.data.toList).toByteArray).getD s
+
+/-- Percent-encode a URI component: every byte outside RFC 3986's unreserved
+set — every delimiter, and every byte of a non-ASCII character — becomes
+`%XX`. `percentDecode_percentEncode` proves this is a faithful inverse. -/
+def percentEncode (s : String) : String :=
+  String.ofList (asciiChars (percentEncodeBytes s.toUTF8.data.toList))
+
+private def parsePort (s : String) : Except String UInt16 :=
+  match s.toNat? with
+  | none => .error s!"invalid port {s}"
+  | some n =>
+    if 0 < n && n ≤ 65535 then .ok (UInt16.ofNat n) else .error s!"invalid port {s}"
+
+/-- Interpret one `key=value` query parameter. Recognized keys set the
+corresponding field; every other key becomes a startup parameter, which
+`applyQueryParam_unknown` proves can neither fail nor disturb a recognized
+setting. -/
+def applyQueryParam (cfg : ConnectConfig) (key value : String) :
     Except String ConnectConfig := do
   match key with
   | "user" => pure { cfg with user := value }
@@ -239,50 +332,92 @@ private def applyQueryParam (cfg : ConnectConfig) (key value : String) :
     | _ => throw s!"unknown protocol version {value} (3.0 or 3.2)"
   | _ => pure { cfg with parameters := cfg.parameters.push (key, value) }
 
+/-- The `user[:password]` part of the authority. -/
+def applyUserInfo (cfg : ConnectConfig) (userinfo : String) : ConnectConfig :=
+  match splitFirstChar ':' userinfo with
+  | some (u, pw) =>
+    { cfg with user := percentDecode u, password := some (percentDecode pw) }
+  | none => { cfg with user := percentDecode userinfo }
+
+/-- The `host[:port]` part of the authority. -/
+def applyHostPort (cfg : ConnectConfig) (hostport : String) :
+    Except String ConnectConfig :=
+  if hostport.startsWith "[" then
+    .error "IPv6 bracket literals are not supported"
+  else
+    match splitLastChar ':' hostport with
+    | some (h, p) =>
+      match parsePort p with
+      | .error e => .error e
+      | .ok port =>
+        if h.isEmpty then .ok { cfg with port } else .ok { cfg with host := h, port }
+    | none =>
+      if hostport.isEmpty then .ok cfg else .ok { cfg with host := hostport }
+
+/-- The `/dbname` part of the path. -/
+def applyPath (cfg : ConnectConfig) (path : String) : ConnectConfig :=
+  let db := percentDecode path
+  if db.isEmpty then cfg else { cfg with database := some db }
+
+/-- Fold the `&`-separated fields of a query string, left to right. Empty
+fields are skipped (`?a=1&&b=2` is accepted, as libpq accepts it). -/
+def applyQueryPairs (cfg : ConnectConfig) : List String → Except String ConnectConfig
+  | [] => .ok cfg
+  | field :: rest =>
+    if field.isEmpty then applyQueryPairs cfg rest
+    else
+      match splitFirstChar '=' field with
+      | some (k, v) =>
+        match applyQueryParam cfg (percentDecode k) (percentDecode v) with
+        | .error e => .error e
+        | .ok cfg' => applyQueryPairs cfg' rest
+      | none => .error s!"malformed query parameter {field}"
+
 /-- `postgres://user[:password]@host[:port][/dbname][?key=value&...]`.
 
 Subset of libpq's syntax: single host, no IPv6 bracket literals, no unix
 sockets. Recognized query keys: user, password, dbname, host, port, sslmode
 (disable/allow/prefer/require/verify-ca/verify-full), sslrootcert, and
 channel_binding (prefer/require/disable);
-everything else becomes a startup parameter. -/
-def parseUri (uri : String) : Except String ConnectConfig := do
-  let some rest := (afterPrefix uri "postgresql://").orElse (fun _ => afterPrefix uri "postgres://")
-    | throw "URL must start with postgres:// or postgresql://"
-  let (beforeQuery, query?) := match splitFirst rest 63 with  -- '?'
-    | some (b, q) => (b, some q)
-    | none => (rest, none)
-  let (authority, path?) := match splitFirst beforeQuery 47 with  -- '/'
-    | some (a, p) => (a, some p)
-    | none => (beforeQuery, none)
-  let (userinfo?, hostport) := match splitLast authority 64 with  -- '@'
-    | some (u, hp) => (some u, hp)
-    | none => (none, authority)
-  let mut cfg : ConnectConfig := {}
-  if let some userinfo := userinfo? then
-    match splitFirst userinfo 58 with  -- ':'
-    | some (u, pw) => cfg := { cfg with user := percentDecode u, password := some (percentDecode pw) }
-    | none => cfg := { cfg with user := percentDecode userinfo }
-  if hostport.startsWith "[" then
-    throw "IPv6 bracket literals are not supported"
-  match splitLast hostport 58 with  -- ':'
-  | some (h, p) =>
-    cfg := { cfg with port := ← parsePort p }
-    if !h.isEmpty then cfg := { cfg with host := h }
-  | none =>
-    if !hostport.isEmpty then cfg := { cfg with host := hostport }
-  if let some path := path? then
-    let db := percentDecode path
-    if !db.isEmpty then cfg := { cfg with database := some db }
-  if let some query := query? then
-    for pair in query.splitOn "&" do
-      if pair.isEmpty then continue
-      match splitFirst pair 61 with  -- '='
-      | some (k, v) => cfg ← applyQueryParam cfg (percentDecode k) (percentDecode v)
-      | none => throw s!"malformed query parameter {pair}"
-  if cfg.user.isEmpty then
-    throw "no user in URL (postgres://user@host/db)"
-  pure cfg
+everything else becomes a startup parameter.
+
+Written as a pure `match` chain over the split helpers above (not a `do`
+block with `let mut`) so `parseUri_renderUri` can evaluate it. -/
+def parseUri (uri : String) : Except String ConnectConfig :=
+  match (afterPrefix uri "postgresql://").orElse
+      (fun _ => afterPrefix uri "postgres://") with
+  | none => .error "URL must start with postgres:// or postgresql://"
+  | some rest =>
+    match splitFirstChar '?' rest with
+    | some (beforeQuery, query) => parseAuthority beforeQuery (some query)
+    | none => parseAuthority rest none
+where
+  /-- Everything after the scheme, with the query string already separated. -/
+  parseAuthority (beforeQuery : String) (query? : Option String) :
+      Except String ConnectConfig :=
+    let (authority, path?) := match splitFirstChar '/' beforeQuery with
+      | some (a, p) => (a, some p)
+      | none => (beforeQuery, none)
+    let (userinfo?, hostport) := match splitLastChar '@' authority with
+      | some (u, hp) => (some u, hp)
+      | none => (none, authority)
+    let cfg0 : ConnectConfig := match userinfo? with
+      | some userinfo => applyUserInfo {} userinfo
+      | none => {}
+    match applyHostPort cfg0 hostport with
+    | .error e => .error e
+    | .ok cfg1 =>
+      let cfg2 := match path? with
+        | some path => applyPath cfg1 path
+        | none => cfg1
+      match (match query? with
+             | some query => applyQueryPairs cfg2 (splitAllChar '&' query)
+             | none => .ok cfg2) with
+      | .error e => .error e
+      | .ok cfg3 =>
+        if cfg3.user.isEmpty then
+          .error "no user in URL (postgres://user@host/db)"
+        else .ok cfg3
 
 end ConnectConfig
 
