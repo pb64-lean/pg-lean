@@ -1574,15 +1574,24 @@ reply and the backend sends a message of the expected class, `step` succeeds
 classes are exactly PostgreSQL's documented reply sets per request type.
 `step_errorResponse_progress` complements it: an ErrorResponse is always
 accepted while an op is pending — server errors during a pipeline can never
-poison the connection.
+poison the connection. `expectedReply_nonempty` turns preservation +
+progress into liveness: a coherent head op always *has* an expected reply, so
+the table is nowhere vacuous and the machine can always be driven forward.
 -/
+
+/-- The queue restriction a COPY start requires: nothing may be pipelined
+behind the COPY beyond a trailing Sync, since the backend would consume those
+frontend messages as COPY data. -/
+def CopyStartGate (pipe : Pipeline) : Prop :=
+  (pipe.queued.all (· == OpKind.sync) && pipe.queued.size ≤ 1) = true
 
 /-- Backend messages that legitimately answer the pipeline's head op in its
 current reply-progress state. Async messages are always accepted
-(`step_async_preserves_pipeline`), ErrorResponse is always accepted while an
-op is pending (`step_errorResponse_progress`), and the COPY-start responses
-additionally depend on the queued pipeline, so they are not listed here. -/
-def ExpectedReply (op : CurrentOp) (m : BackendMsg) : Prop :=
+(`step_async_preserves_pipeline`) and ErrorResponse is always accepted while
+an op is pending (`step_errorResponse_progress`), so neither is listed here.
+The COPY-start responses additionally depend on the queue behind the head op,
+which is why this takes the whole pipeline. -/
+def ExpectedReply (pipe : Pipeline) (op : CurrentOp) (m : BackendMsg) : Prop :=
   match op.kind, op.progress, m with
   | .parse, .start, .parseComplete => True
   | .bind, .start, .bindComplete => True
@@ -1596,17 +1605,22 @@ def ExpectedReply (op : CurrentOp) (m : BackendMsg) : Prop :=
   | .execute, .rows none, .dataRow _ => True
   | .execute, .start, .commandComplete _ => True
   | .execute, .rows none, .commandComplete _ => True
+  | .execute, .copyIn _ _, .commandComplete _ => True
   | .execute, .start, .emptyQueryResponse => True
   | .execute, .start, .portalSuspended => True
   | .execute, .rows none, .portalSuspended => True
+  | .execute, .start, .copyInResponse _ _ => CopyStartGate pipe
+  | .execute, .start, .copyOutResponse _ _ => CopyStartGate pipe
   | .sync, _, .readyForQuery _ => True
   | .simpleQuery, .start, .rowDescription _ => True
   | .simpleQuery, .start, .commandComplete _ => True
+  | .simpleQuery, .copyIn _ _, .commandComplete _ => True
   | .simpleQuery, .start, .emptyQueryResponse => True
-  | .simpleQuery, .start, .readyForQuery _ => True
+  | .simpleQuery, _, .readyForQuery _ => True
   | .simpleQuery, .rows (some n), .dataRow cols => cols.size = n
   | .simpleQuery, .rows _, .commandComplete _ => True
-  | .simpleQuery, .rows _, .readyForQuery _ => True
+  | .simpleQuery, .start, .copyInResponse _ _ => CopyStartGate pipe
+  | .simpleQuery, .start, .copyOutResponse _ _ => CopyStartGate pipe
   | _, .copyOut _, .copyData _ => True
   | _, .copyOut _, .copyDone => True
   | _, _, _ => False
@@ -1615,15 +1629,70 @@ def ExpectedReply (op : CurrentOp) (m : BackendMsg) : Prop :=
 theorem step_progress {s : State} {pipe : Pipeline} {op : CurrentOp}
     {msg : RawMessage} {m : BackendMsg}
     (hph : s.phase = .running pipe) (hcur : pipe.current = some op)
-    (hdec : Backend.decode msg = .ok m) (hexp : ExpectedReply op m) :
+    (hdec : Backend.decode msg = .ok m) (hexp : ExpectedReply pipe op m) :
     ∃ r, step s msg = .ok r := by
   revert hexp
-  fun_cases ExpectedReply op m <;> intro hexp <;>
+  fun_cases ExpectedReply pipe op m <;> intro hexp <;>
     first
       | exact hexp.elim
       | (unfold step stepRunning
          simp only [*, beq_self_eq_true]
          exact ⟨_, rfl⟩)
+      | (unfold CopyStartGate at hexp
+         unfold step stepRunning
+         simp only [*]
+         exact ⟨_, rfl⟩)
+
+/-- **Liveness**: every coherent head op has some reply the machine accepts —
+the expected-reply table is nowhere empty, so `step_progress` is a genuine
+progress statement and not vacuously true for some reachable head. -/
+theorem expectedReply_nonempty {pipe : Pipeline} {op : CurrentOp}
+    (hcoh : op.Coherent) : ∃ m, ExpectedReply pipe op m := by
+  unfold CurrentOp.Coherent at hcoh
+  cases hp : op.progress with
+  | start =>
+    cases hk : op.kind with
+    | parse => exact ⟨.parseComplete, by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+    | bind => exact ⟨.bindComplete, by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+    | close => exact ⟨.closeComplete, by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+    | describeStatement =>
+      exact ⟨.parameterDescription #[], by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+    | describePortal => exact ⟨.noData, by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+    | execute => exact ⟨.portalSuspended, by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+    | sync =>
+      exact ⟨.readyForQuery .idle, by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+    | simpleQuery =>
+      exact ⟨.readyForQuery .idle, by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+  | descParams =>
+    rw [hp] at hcoh
+    exact ⟨.noData, by unfold ExpectedReply; rw [hcoh, hp]; exact True.intro⟩
+  | rows cols =>
+    cases cols with
+    | some n =>
+      rw [hp] at hcoh
+      exact ⟨.readyForQuery .idle, by unfold ExpectedReply; rw [hcoh, hp]; exact True.intro⟩
+    | none =>
+      rw [hp] at hcoh
+      exact ⟨.portalSuspended, by unfold ExpectedReply; rw [hcoh, hp]; exact True.intro⟩
+  | copyIn info done =>
+    rw [hp] at hcoh
+    cases hcoh with
+    | inl hk =>
+      exact ⟨.commandComplete "", by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+    | inr hk =>
+      exact ⟨.commandComplete "", by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+  | copyOut info =>
+    rw [hp] at hcoh
+    cases hcoh with
+    | inl hk => exact ⟨.copyDone, by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+    | inr hk => exact ⟨.copyDone, by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+  | drainError =>
+    rw [hp] at hcoh
+    cases hcoh with
+    | inl hk =>
+      exact ⟨.readyForQuery .idle, by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
+    | inr hk =>
+      exact ⟨.readyForQuery .idle, by unfold ExpectedReply; rw [hk, hp]; exact True.intro⟩
 
 /-- An ErrorResponse is always accepted while an op is pending: recoverable
 server errors can never poison a mid-pipeline connection. -/
