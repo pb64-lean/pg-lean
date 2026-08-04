@@ -411,8 +411,9 @@ private def stepStartup (s : State) (auth : AuthState) (m : BackendMsg) :
   | .errorResponse fields => throw (.serverFatal fields)
   | other => throw (.protocol s!"unexpected message during startup: {repr other}")
 
-/-- Pop the current op, promoting the next queued kind. -/
-private def advance (pipe : Pipeline) : Pipeline :=
+/-- Pop the current op, promoting the next queued kind. Public so the
+recovery/alignment theorems can characterize the post-`ReadyForQuery` state. -/
+def advance (pipe : Pipeline) : Pipeline :=
   match pipe.queued[0]? with
   | some kind => { pipe with current := some { kind }, queued := pipe.queued.extract 1 pipe.queued.size }
   | none => { pipe with current := none }
@@ -432,8 +433,9 @@ private def progressTo (s : State) (pipe : Pipeline) (op : CurrentOp) (p : Progr
 
 /-- Extended-protocol error recovery: cancel expectations up to the next Sync.
 If one is queued it becomes the current (draining) op; otherwise the pipeline
-is aborted until the user submits a Sync. -/
-private def abortToSync (pipe : Pipeline) : Pipeline :=
+is aborted until the user submits a Sync. Public so the error-recovery
+theorems can characterize the post-error state. -/
+def abortToSync (pipe : Pipeline) : Pipeline :=
   match dropAborted (· == OpKind.sync) pipe.queued with
   | (rest, true) =>
     { pipe with
@@ -1631,6 +1633,259 @@ theorem step_errorResponse_progress {s : State} {pipe : Pipeline} {op : CurrentO
     (unfold step stepRunning
      simp only [hph, hdec, hcur, hsimple, hsync]
      exact ⟨_, rfl⟩)
+
+/-!
+### Error/Sync recovery attribution
+
+After an extended-protocol `ErrorResponse`, PostgreSQL discards frontend
+messages until a Sync. These theorems pin down the client-side mirror of that
+rule, so no backend response can ever be attributed to the wrong request:
+
+- `dropAborted_found`/`dropAborted_none`: the cancellation rule partitions the
+  queue exactly at the first Sync — every dropped expectation is accounted
+  for, and none of the dropped ones was a recovery boundary.
+- `error_enters_drain_until_sync`: an error on an extended-protocol head op
+  moves the machine to `abortToSync pipe` and emits exactly the error event.
+- `abortToSync_found`/`abortToSync_none`: the post-error pipeline is exactly
+  "drain to the first queued Sync" or "fully aborted awaiting a user Sync".
+- `drained_operation_cannot_succeed`: while draining, the machine accepts
+  *only* ReadyForQuery, further errors, and async messages — no
+  operation-success message can be mis-attributed to a cancelled op.
+- `readyForQuery_clears_recovery_state` /
+  `readyForQuery_restores_pipeline_alignment`: the Sync's ReadyForQuery pops
+  the draining head and promotes exactly the next queued op, fresh at
+  `.start`, in queue order.
+- `sync_clears_aborted`: on a fully aborted pipeline, submitting Sync is
+  accepted, re-arms the pipeline with exactly that Sync pending, and writes
+  the Sync bytes.
+
+Trace-level statement (future work, stated precisely): for any run
+`start cfg → (submit | step)*` from a well-formed initial state, define the
+correlation FIFO as the sequence of submitted ops minus those cancelled by
+`dropAborted` at each extended-protocol error. Then every success-terminal
+event (`parseComplete`, `bindComplete`, `closeComplete`, `noData`/
+`rowDescription` for describe, `commandComplete`/`emptyQuery`/
+`portalSuspended` for execute, `ready` for sync/simpleQuery) is emitted
+exactly when its op is at the FIFO head, and pops it — i.e. every
+user-visible success corresponds to exactly one submitted operation, in
+submission order. The theorems above are the per-step cases of that
+induction; the missing piece is the trace-level FIFO refinement relation.
+-/
+
+private theorem opKind_beq_eq_false {a b : OpKind} (h : a ≠ b) : (a == b) = false := by
+  cases hab : a == b
+  · rfl
+  · exact absurd (opKind_eq_of_beq hab) h
+
+/-- `dropAborted` found a Sync: the queue splits exactly there — every dropped
+entry precedes it and is not a Sync, and the remainder starts with it. -/
+theorem dropAborted_found {α : Type} {isSync : α → Bool} {queue rest : Array α}
+    (h : dropAborted isSync queue = (rest, true)) :
+    ∃ i, ∃ (hi : i < queue.size),
+      isSync (queue[i]'hi) = true ∧
+      (∀ j (hj : j < i), isSync (queue[j]'(Nat.lt_trans hj hi)) = false) ∧
+      rest = queue.extract i queue.size ∧
+      queue.extract 0 i ++ rest = queue := by
+  unfold dropAborted at h
+  cases hf : queue.findIdx? isSync with
+  | none =>
+    rw [hf] at h
+    injection h with _ h2
+    cases h2
+  | some i =>
+    rw [hf] at h
+    injection h with h1 _
+    obtain ⟨hi, hp, hmin⟩ := Array.findIdx?_eq_some_iff_getElem.mp hf
+    refine ⟨i, hi, hp, ?_, h1.symm, ?_⟩
+    · intro j hj
+      have := hmin j hj
+      rwa [Bool.not_eq_true] at this
+    · rw [← h1, Array.extract_append_extract,
+        Nat.min_eq_left (Nat.zero_le i), Nat.max_eq_right (Nat.le_of_lt hi)]
+      exact Array.extract_size
+
+/-- `dropAborted` found no Sync: everything is dropped and indeed none of the
+queued expectations was a recovery boundary. -/
+theorem dropAborted_none {α : Type} {isSync : α → Bool} {queue rest : Array α}
+    (h : dropAborted isSync queue = (rest, false)) :
+    rest = #[] ∧ ∀ x ∈ queue, isSync x = false := by
+  unfold dropAborted at h
+  cases hf : queue.findIdx? isSync with
+  | none =>
+    rw [hf] at h
+    injection h with h1 _
+    exact ⟨h1.symm, Array.findIdx?_eq_none_iff.mp hf⟩
+  | some i =>
+    rw [hf] at h
+    injection h with _ h2
+    cases h2
+
+/-- An extended-protocol error (head op is neither simpleQuery nor Sync)
+moves the machine to exactly `abortToSync pipe`, emits exactly the error
+event, and writes nothing. -/
+theorem error_enters_drain_until_sync {s : State} {pipe : Pipeline} {op : CurrentOp}
+    {msg : RawMessage} {fields : ErrorFields} {s' : State} {evs : Array Event}
+    {out : ByteArray}
+    (hph : s.phase = .running pipe) (hcur : pipe.current = some op)
+    (hnotsimple : op.kind ≠ .simpleQuery) (hnotsync : op.kind ≠ .sync)
+    (hdec : Backend.decode msg = .ok (.errorResponse fields))
+    (h : step s msg = .ok (s', evs, out)) :
+    s'.phase = .running (abortToSync pipe) ∧ evs = #[.errorResponse fields] ∧
+      out = ByteArray.empty := by
+  unfold step stepRunning at h
+  simp only [hph, hdec, hcur, isSimple, opKind_beq_eq_false hnotsimple,
+    opKind_beq_eq_false hnotsync] at h
+  cases h
+  exact ⟨rfl, rfl, rfl⟩
+
+/-- The post-error pipeline when a Sync was queued at index `i`: everything
+before it is dropped (none of it a Sync), the Sync becomes the draining head,
+and the queue resumes right after it. -/
+theorem abortToSync_found {pipe : Pipeline} {i : Nat} (hi : i < pipe.queued.size)
+    (hsync : pipe.queued[i]'hi = .sync)
+    (hbefore : ∀ j (hj : j < i), pipe.queued[j]'(Nat.lt_trans hj hi) ≠ .sync) :
+    abortToSync pipe =
+      { pipe with
+        current := some { kind := .sync, progress := .drainError }
+        queued := pipe.queued.extract (i + 1) pipe.queued.size } := by
+  unfold abortToSync
+  cases hd : dropAborted (· == OpKind.sync) pipe.queued with
+  | mk rest found =>
+    cases found with
+    | false =>
+      obtain ⟨-, hall⟩ := dropAborted_none hd
+      have := hall (pipe.queued[i]'hi) (Array.getElem_mem hi)
+      rw [hsync] at this
+      cases this
+    | true =>
+      obtain ⟨i', hi', hp', hmin', hrest, -⟩ := dropAborted_found hd
+      have hii : i' = i := by
+        rcases Nat.lt_trichotomy i' i with hlt | heq | hgt
+        · exact absurd (opKind_eq_of_beq hp') (hbefore i' hlt)
+        · exact heq
+        · have := hmin' i hgt
+          rw [hsync] at this
+          cases this
+      subst hii hrest
+      simp only
+      congr 1
+      rw [Array.extract_extract]
+      congr 1
+      have hsz : (pipe.queued.extract i' pipe.queued.size).size =
+          pipe.queued.size - i' := by
+        rw [Array.size_extract, Nat.min_eq_right (Nat.le_refl _)]
+      rw [hsz]
+      omega
+
+/-- The post-error pipeline when no Sync was queued: every queued expectation
+is dropped and the pipeline is gated (`aborted`) until the user submits a
+Sync. -/
+theorem abortToSync_none {pipe : Pipeline}
+    (hnone : ∀ k, k ∈ pipe.queued → k ≠ OpKind.sync) :
+    abortToSync pipe = { pipe with current := none, queued := #[], aborted := true } := by
+  unfold abortToSync
+  cases hd : dropAborted (· == OpKind.sync) pipe.queued with
+  | mk rest found =>
+    cases found with
+    | false => rfl
+    | true =>
+      obtain ⟨i, hi, hp, -, -, -⟩ := dropAborted_found hd
+      exact absurd (opKind_eq_of_beq hp) (hnone _ (Array.getElem_mem hi))
+
+/-- While the head is a draining Sync, the machine accepts **only**
+ReadyForQuery (ending recovery), further ErrorResponses, and async messages.
+Every operation-success message is rejected, so no backend success can be
+attributed to a cancelled operation. -/
+theorem drained_operation_cannot_succeed {s : State} {pipe : Pipeline}
+    {op : CurrentOp} {msg : RawMessage} {m : BackendMsg} {s' : State}
+    {evs : Array Event} {out : ByteArray}
+    (hph : s.phase = .running pipe) (hcur : pipe.current = some op)
+    (hkind : op.kind = .sync) (hprog : op.progress = .drainError)
+    (hdec : Backend.decode msg = .ok m)
+    (h : step s msg = .ok (s', evs, out)) :
+    (∃ tx, m = .readyForQuery tx) ∨ (∃ f, m = .errorResponse f) ∨
+    (∃ f, m = .noticeResponse f) ∨ (∃ n v, m = .parameterStatus n v) ∨
+    (∃ p c pl, m = .notificationResponse p c pl) := by
+  cases m <;>
+    first
+      | exact Or.inl ⟨_, rfl⟩
+      | exact Or.inr (Or.inl ⟨_, rfl⟩)
+      | exact Or.inr (Or.inr (Or.inl ⟨_, rfl⟩))
+      | exact Or.inr (Or.inr (Or.inr (Or.inl ⟨_, _, rfl⟩)))
+      | exact Or.inr (Or.inr (Or.inr (Or.inr ⟨_, _, _, rfl⟩)))
+      | (unfold step stepRunning at h
+         simp +decide [hph, hdec, hcur, hkind, hprog] at h)
+
+/-- ReadyForQuery on a Sync/simpleQuery head ends its cycle: the head —
+draining or not — is popped, the transaction status is adopted, exactly one
+`ready` event is emitted, and nothing is written. -/
+theorem readyForQuery_clears_recovery_state {s : State} {pipe : Pipeline}
+    {op : CurrentOp} {msg : RawMessage} {tx : TxStatus} {s' : State}
+    {evs : Array Event} {out : ByteArray}
+    (hph : s.phase = .running pipe) (hcur : pipe.current = some op)
+    (hkind : op.kind = .sync ∨ op.kind = .simpleQuery)
+    (hdec : Backend.decode msg = .ok (.readyForQuery tx))
+    (h : step s msg = .ok (s', evs, out)) :
+    s'.phase = .running (advance pipe) ∧ s'.txStatus = tx ∧
+      evs = #[.ready tx] ∧ out = ByteArray.empty := by
+  have hguard : (op.kind == OpKind.sync || op.kind == OpKind.simpleQuery) = true := by
+    cases hkind with
+    | inl hk => rw [hk]; rfl
+    | inr hk => rw [hk]; rfl
+  unfold step stepRunning at h
+  simp only [hph, hdec, hcur, hguard] at h
+  cases h
+  exact ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Alignment after ReadyForQuery: the promoted head is exactly the next
+queued op — fresh at `.start` — and the rest of the queue keeps its order
+(or the pipeline is idle when nothing was queued). The abort gate is
+untouched. -/
+theorem readyForQuery_restores_pipeline_alignment {s : State} {pipe : Pipeline}
+    {op : CurrentOp} {msg : RawMessage} {tx : TxStatus} {s' : State}
+    {evs : Array Event} {out : ByteArray}
+    (hph : s.phase = .running pipe) (hcur : pipe.current = some op)
+    (hkind : op.kind = .sync ∨ op.kind = .simpleQuery)
+    (hdec : Backend.decode msg = .ok (.readyForQuery tx))
+    (h : step s msg = .ok (s', evs, out)) :
+    s'.phase = .running (advance pipe) ∧
+    (advance pipe).aborted = pipe.aborted ∧
+    ((∃ (h0 : 0 < pipe.queued.size),
+        (advance pipe).current = some { kind := pipe.queued[0]'h0 } ∧
+        (advance pipe).queued = pipe.queued.extract 1 pipe.queued.size) ∨
+      (pipe.queued = #[] ∧ (advance pipe).current = none ∧
+        (advance pipe).queued = #[])) := by
+  refine ⟨(readyForQuery_clears_recovery_state hph hcur hkind hdec h).1, ?_, ?_⟩
+  · unfold advance
+    cases hq : pipe.queued[0]? <;> rfl
+  · unfold advance
+    cases hq : pipe.queued[0]? with
+    | none =>
+      have hqe : pipe.queued = #[] := by
+        have := Array.getElem?_eq_none_iff.mp hq
+        exact Array.eq_empty_of_size_eq_zero (by omega)
+      exact Or.inr ⟨hqe, rfl, hqe⟩
+    | some k =>
+      obtain ⟨h0, hk⟩ := Array.getElem?_eq_some_iff.mp hq
+      exact Or.inl ⟨h0, by rw [hk], rfl⟩
+
+/-- Submitting Sync on a fully aborted pipeline is accepted: the gate clears,
+exactly that Sync becomes the pending head, and the Sync bytes are written. -/
+theorem sync_clears_aborted {s : State} {pipe : Pipeline} {s' : State}
+    {out : ByteArray}
+    (hph : s.phase = .running pipe) (hab : pipe.aborted = true) (hwf : s.WellFormed)
+    (h : submit s .sync = .ok (s', out)) :
+    s'.phase = .running
+      { current := some { kind := .sync }, queued := #[], aborted := false } ∧
+    out = Frontend.sync := by
+  obtain ⟨hc, hq⟩ := (pipe_wf_of_running hph hwf).1 hab
+  unfold submit submitRunning submitIdle enqueue at h
+  simp only [hph, hc, hab] at h
+  cases h
+  refine ⟨?_, rfl⟩
+  show Phase.running _ = _
+  congr 1
+  simp only [hq]
 
 end Machine
 end Protocol
