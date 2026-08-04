@@ -225,6 +225,12 @@ section docstring states its scope.
   a zero-padded decimal field reads back as the number it was rendered from, at
   any width.
 
+  For `interval`, the text side matches the binary one:
+  `PgInterval.fromString_toString` — **a rendered interval parses back to the
+  same triple**, unconditionally. Months, days and microseconds are
+  independent (a month is not a fixed number of days), the sign and the
+  sub-second fraction survive, and no side condition is needed.
+
   For 1-D arrays, `decode_encode_array`: an array of element texts sent as a
   text parameter is read back by `decodeValue` as the same array, NULLs
   included — and an element whose text is literally `NULL` stays a value,

@@ -31,16 +31,21 @@ namespace PgInterval
 @[expose] def intChars (v : Int) : List Char :=
   if v < 0 then '-' :: natDigits v.natAbs else natDigits v.natAbs
 
-/-- `[-]HH:MM:SS`, each field at least two digits, plus `.ffffff` when there is
-a microsecond remainder. Hours are not capped: an interval is a duration, not a
-time of day. -/
+/-- `HH:MM:SS`, each field at least two digits. Hours are not capped: an
+interval is a duration, not a time of day. -/
+@[expose] def hmsChars (us : Nat) : List Char :=
+  padDigits 2 (us / 3600000000) ++
+    ':' :: (padDigits 2 (us / 60000000 % 60) ++
+      ':' :: padDigits 2 (us / 1000000 % 60))
+
+/-- The time piece without its sign: `HH:MM:SS`, plus `.ffffff` when there is a
+microsecond remainder. Right-associated on purpose — that is the shape
+`List.splitOn`'s lemmas match. -/
+@[expose] def timeBody (us : Nat) : List Char :=
+  hmsChars us ++ (if us % 1000000 = 0 then [] else '.' :: padDigits 6 (us % 1000000))
+
 @[expose] def timeChars (micros : Int) : List Char :=
-  (if micros < 0 then ['-'] else []) ++
-    padDigits 2 (micros.natAbs / 3600000000) ++
-    ':' :: padDigits 2 (micros.natAbs / 60000000 % 60) ++
-    ':' :: padDigits 2 (micros.natAbs / 1000000 % 60) ++
-    (if micros.natAbs % 1000000 = 0 then []
-      else '.' :: padDigits 6 (micros.natAbs % 1000000))
+  (if micros < 0 then ['-'] else []) ++ timeBody micros.natAbs
 
 /-- The space-separated tokens of the rendering. A zero component is omitted,
 except that an all-zero interval still renders its time piece. -/
@@ -62,12 +67,19 @@ protected def toString (iv : PgInterval) : String := String.ofList iv.chars
 
 instance : ToString PgInterval := ⟨PgInterval.toString⟩
 
+/-- The rendering, at the character level (`toString` itself is not exposed). -/
+theorem toString_eq (iv : PgInterval) :
+    iv.toString = String.ofList (joinSpace iv.tokens) := by rfl
+
 /-! ### Parsing -/
 
-/-- Optional sign, then a decimal field. Matches `String.toInt?`. -/
+/-- Optional sign, then a decimal field. Matches `String.toInt?`. Written with
+an `if` rather than a character pattern so that proofs can rewrite it. -/
 @[expose] def intOfChars : List Char → Option Int
-  | '-' :: rest => (natOfDigitsFull rest).map (fun n => -Int.ofNat n)
-  | cs => (natOfDigitsFull cs).map Int.ofNat
+  | [] => none
+  | c :: rest =>
+    if c == '-' then (natOfDigitsFull rest).map (fun n => -Int.ofNat n)
+    else (natOfDigitsFull (c :: rest)).map Int.ofNat
 
 /-- `HH:MM:SS` plus an already-parsed microsecond remainder. -/
 @[expose] def hmsMicros (orig : String) (hms : List Char) (frac : Nat) :
@@ -94,9 +106,11 @@ is 500000 microseconds. -/
   | _ => .error s!"interval: cannot parse time {orig}"
 
 @[expose] def parseTime (orig : String) : List Char → Except String Int
-  | '-' :: rest => (timeMagnitude orig rest).map (fun v => -v)
-  | '+' :: rest => timeMagnitude orig rest
-  | body => timeMagnitude orig body
+  | [] => timeMagnitude orig []
+  | c :: rest =>
+    if c == '-' then (timeMagnitude orig rest).map (fun v => -v)
+    else if c == '+' then timeMagnitude orig rest
+    else timeMagnitude orig (c :: rest)
 
 /-- One token at a time, carrying the accumulated interval and a number
 awaiting its unit word. Explicit recursion — the `for` loop this replaces had
@@ -130,7 +144,7 @@ two mutable variables and was opaque to the kernel. -/
 
 /-- Parses the default `postgres` output style, e.g.
 `"1 year 2 mons 3 days 04:05:06.789"`, `"-00:00:01.5"`, `"00:00:00"`. -/
-def fromString (s : String) : Except String PgInterval :=
+@[expose] def fromString (s : String) : Except String PgInterval :=
   step s {} none (((trimAsciiChars s.toList).splitOn ' ').filter (fun t => !t.isEmpty))
 
 end PgInterval

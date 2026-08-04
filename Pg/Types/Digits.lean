@@ -262,4 +262,45 @@ theorem splitOnChar_cons {c : Char} {p rest : List Char} (h : c ∉ p) :
   rw [String.toList_ofList, List.splitOn_append_cons_self_of_not_mem h,
     String.toList_ofList, List.map_cons]
 
+/-- `natOfDigitsFull` reads back the digits `natDigits` wrote. -/
+theorem natOfDigitsFull_natDigits (n : Nat) : natOfDigitsFull (natDigits n) = some n := by
+  have hval := natOfDigits_natDigits n 0
+  cases hl : natDigits n with
+  | nil => exact absurd hl (natDigits_ne_nil n)
+  | cons c t =>
+    rw [hl] at hval
+    rw [show natOfDigitsFull (c :: t) = natOfDigits 0 (c :: t) from rfl, hval]
+    simp
+
+/-- A non-digit separator never occurs inside a rendered decimal. -/
+theorem not_mem_natDigits {n : Nat} {sep : Char} (hsep : isAsciiDigit sep = false) :
+    sep ∉ natDigits n := by
+  intro hmem
+  have hd := isAsciiDigit_of_mem_natDigits n sep hmem
+  rw [hsep] at hd
+  exact Bool.false_ne_true hd
+
+theorem beq_false_of_ne {a b : Char} (h : a ≠ b) : (a == b) = false :=
+  beq_eq_false_iff_ne.mpr h
+
+/-- Trimming is the identity on a string that neither starts nor ends with
+ASCII whitespace. -/
+theorem trimAsciiChars_eq_self {l : List Char}
+    (h1 : ∀ c, l.head? = some c → isAsciiSpace c = false)
+    (h2 : ∀ c, l.getLast? = some c → isAsciiSpace c = false) :
+    trimAsciiChars l = l := by
+  unfold trimAsciiChars
+  cases hl : l with
+  | nil => rfl
+  | cons c t =>
+    rw [List.dropWhile_cons_of_neg (by rw [h1 c (by rw [hl]; rfl)]; exact Bool.false_ne_true)]
+    cases hr : (c :: t).reverse with
+    | nil => exact absurd hr (by simp)
+    | cons d u =>
+      have hd : (c :: t).getLast? = some d := by
+        rw [← List.head?_reverse, hr]; rfl
+      rw [List.dropWhile_cons_of_neg
+        (by rw [h2 d (by rw [hl]; exact hd)]; exact Bool.false_ne_true), ← hr,
+        List.reverse_reverse]
+
 end Pg

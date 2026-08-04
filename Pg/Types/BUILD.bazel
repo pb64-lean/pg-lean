@@ -64,6 +64,8 @@ lean_assurance_test(
         # 1-D arrays, NULLs and quoting included.
         "Pg.parseArrayText_renderArrayText",
         "Pg.decode_encode_array",
+        # interval text: the rendering parses back to the same triple.
+        "Pg.PgInterval.fromString_toString",
         "Pg.arrayScan_elem",
         "Pg.arrayScan_quoted",
     ],

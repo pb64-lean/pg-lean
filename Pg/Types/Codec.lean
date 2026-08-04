@@ -1544,4 +1544,413 @@ theorem PgNumeric.fromBinary_toBinary_special (sp : PgNumeric.Special) :
   rw [h.1, h.2.1, h.2.2.1, h.2.2.2]
   cases sp <;> rfl
 
+
+/-!
+### `interval`: the text roundtrip
+
+`PgInterval.toString` renders the default `postgres` interval style and
+`fromString` parses it. The law below says the two invert each other for
+*every* interval — months, days and microseconds, sign and sub-second
+fraction included. Unlike `numeric`, no side condition is needed: the three
+components are independent, so nothing can be lost.
+
+The proof walks the rendering: the token list is joined with single spaces and
+re-split (`splitOn_joinSpace`), trimming is the identity because no token
+starts or ends with whitespace (`trim_joinSpace`), and then one `step_*` lemma
+per token kind drives the parser's state machine.
+-/
+
+namespace PgInterval
+
+private theorem splitOn_three {A B C : List Char}
+    (hA : ':' ∉ A) (hB : ':' ∉ B) (hC : ':' ∉ C) :
+    (A ++ ':' :: (B ++ ':' :: C)).splitOn ':' = [A, B, C] := by
+  rw [List.splitOn_append_cons_self_of_not_mem hA,
+    List.splitOn_append_cons_self_of_not_mem hB, List.splitOn_eq_singleton hC]
+
+private theorem splitOn_two {P Q : List Char} (hP : '.' ∉ P) (hQ : '.' ∉ Q) :
+    (P ++ '.' :: Q).splitOn '.' = [P, Q] := by
+  rw [List.splitOn_append_cons_self_of_not_mem hP, List.splitOn_eq_singleton hQ]
+
+private theorem not_mem_hmsChars {sep : Char} (hsep : isAsciiDigit sep = false)
+    (hne : sep ≠ ':') (us : Nat) : sep ∉ hmsChars us := by
+  unfold hmsChars
+  simp only [List.mem_append, List.mem_cons, not_or]
+  exact ⟨not_mem_padDigits hsep, hne, not_mem_padDigits hsep, hne,
+    not_mem_padDigits hsep⟩
+
+private theorem colon_not_mem_padDigits (w n : Nat) : ':' ∉ padDigits w n :=
+  not_mem_padDigits (by decide)
+
+theorem fracMicros_padDigits {f : Nat} (hf : f < 1000000) :
+    fracMicros (padDigits 6 f) = some f := by
+  have hlen : (padDigits 6 f).length = 6 :=
+    padDigits_length (natDigits_length_le 5 f (by omega))
+  unfold fracMicros
+  rw [List.take_left' hlen, natOfDigitsFull_padDigits]
+
+theorem hmsMicros_hmsChars (orig : String) (us f : Nat) :
+    hmsMicros orig (hmsChars us) f =
+      .ok (Int.ofNat ((us / 3600000000 * 3600 + us / 60000000 % 60 * 60 +
+        us / 1000000 % 60) * 1000000 + f)) := by
+  unfold hmsMicros hmsChars
+  rw [splitOn_three (colon_not_mem_padDigits 2 _) (colon_not_mem_padDigits 2 _)
+    (colon_not_mem_padDigits 2 _)]
+  simp only [natOfDigitsFull_padDigits]
+
+theorem timeMagnitude_timeBody (orig : String) (us : Nat) :
+    timeMagnitude orig (timeBody us) = .ok (Int.ofNat us) := by
+  unfold timeMagnitude timeBody
+  by_cases hf : us % 1000000 = 0
+  · rw [if_pos hf, List.append_nil,
+      List.splitOn_eq_singleton (not_mem_hmsChars (by decide) (by decide) us)]
+    show hmsMicros orig (hmsChars us) 0 = _
+    rw [hmsMicros_hmsChars]
+    congr 1
+    exact congrArg Int.ofNat (by omega)
+  · rw [if_neg hf, splitOn_two (not_mem_hmsChars (by decide) (by decide) us)
+      (not_mem_padDigits (by decide))]
+    show (match fracMicros (padDigits 6 (us % 1000000)) with
+      | some v => hmsMicros orig (hmsChars us) v
+      | none => .error s!"interval: bad fraction {orig}") = _
+    rw [fracMicros_padDigits (Nat.mod_lt _ (by omega))]
+    show hmsMicros orig (hmsChars us) (us % 1000000) = _
+    rw [hmsMicros_hmsChars]
+    congr 1
+    exact congrArg Int.ofNat (by omega)
+
+private theorem not_mem_timeChars {sep : Char} (h1 : isAsciiDigit sep = false)
+    (h2 : sep ≠ ':') (h3 : sep ≠ '.') (h4 : sep ≠ '-') (v : Int) :
+    sep ∉ timeChars v := by
+  unfold timeChars timeBody
+  simp only [List.mem_append, not_or]
+  refine ⟨?_, not_mem_hmsChars h1 h2 v.natAbs, ?_⟩
+  · split
+    · simp only [List.mem_cons, List.not_mem_nil, or_false]; exact h4
+    · exact List.not_mem_nil
+  · split
+    · exact List.not_mem_nil
+    · simp only [List.mem_cons, not_or]
+      exact ⟨h3, not_mem_padDigits h1⟩
+
+private theorem colon_mem_timeChars (v : Int) : ':' ∈ timeChars v := by
+  unfold timeChars timeBody hmsChars
+  simp
+
+private theorem not_mem_intChars {sep : Char} (h1 : isAsciiDigit sep = false)
+    (h4 : sep ≠ '-') (v : Int) : sep ∉ intChars v := by
+  unfold intChars
+  split
+  · simp only [List.mem_cons, not_or]
+    exact ⟨h4, not_mem_natDigits h1⟩
+  · exact not_mem_natDigits h1
+
+private theorem joinSpace_cons {p : List Char} {ts : List (List Char)} (h : ts ≠ []) :
+    joinSpace (p :: ts) = p ++ ' ' :: joinSpace ts := by
+  cases ts with
+  | nil => exact absurd rfl h
+  | cons u us => rfl
+
+private theorem joinSpace_ne_nil : ∀ {ts : List (List Char)}, ts ≠ [] →
+    (∀ t ∈ ts, t ≠ []) → joinSpace ts ≠ [] := by
+  intro ts hne hall
+  cases ts with
+  | nil => exact absurd rfl hne
+  | cons t rest =>
+    cases rest with
+    | nil => exact hall t (List.mem_cons_self ..)
+    | cons u us =>
+      rw [joinSpace_cons (List.cons_ne_nil _ _)]
+      exact List.append_ne_nil_of_right_ne_nil _ (List.cons_ne_nil _ _)
+
+private theorem head?_joinSpace_mem : ∀ (ts : List (List Char)) (c : Char),
+    (∀ t ∈ ts, t ≠ []) → (joinSpace ts).head? = some c → ∃ t, t ∈ ts ∧ c ∈ t := by
+  intro ts c hall hhd
+  cases ts with
+  | nil => exact absurd hhd (by simp [joinSpace])
+  | cons t rest =>
+    refine ⟨t, List.mem_cons_self .., ?_⟩
+    cases rest with
+    | nil => exact List.mem_of_mem_head? (by rw [show joinSpace [t] = t from rfl] at hhd; exact hhd)
+    | cons u us =>
+      rw [joinSpace_cons (List.cons_ne_nil _ _), List.head?_append] at hhd
+      cases ht : t with
+      | nil => exact absurd ht (hall t (List.mem_cons_self ..))
+      | cons a b =>
+        rw [ht] at hhd
+        simp only [List.head?_cons, Option.some_or, Option.some.injEq] at hhd
+        subst hhd
+        exact List.mem_cons_self ..
+
+private theorem getLast?_joinSpace_mem : ∀ (ts : List (List Char)) (c : Char),
+    (∀ t ∈ ts, t ≠ []) → (joinSpace ts).getLast? = some c → ∃ t, t ∈ ts ∧ c ∈ t := by
+  intro ts
+  induction ts with
+  | nil => intro c _ hl; exact absurd hl (by simp [joinSpace])
+  | cons t rest ih =>
+    intro c hall hl
+    cases rest with
+    | nil =>
+      exact ⟨t, List.mem_cons_self ..,
+        List.mem_of_getLast? (by rwa [show joinSpace [t] = t from rfl] at hl)⟩
+    | cons u us =>
+      rw [joinSpace_cons (List.cons_ne_nil _ _),
+        show (' ' :: joinSpace (u :: us)) = [' '] ++ joinSpace (u :: us) from rfl,
+        ← List.append_assoc, List.getLast?_append] at hl
+      have hX : joinSpace (u :: us) ≠ [] :=
+        joinSpace_ne_nil (List.cons_ne_nil _ _) (fun x hx => hall x (List.mem_cons_of_mem _ hx))
+      cases hg : (joinSpace (u :: us)).getLast? with
+      | none => exact absurd (List.getLast?_eq_none_iff.mp hg) hX
+      | some z =>
+        rw [hg, Option.some_or, Option.some.injEq] at hl
+        subst hl
+        obtain ⟨t', ht', hc⟩ :=
+          ih z (fun x hx => hall x (List.mem_cons_of_mem _ hx)) hg
+        exact ⟨t', List.mem_cons_of_mem _ ht', hc⟩
+
+private theorem trim_joinSpace {ts : List (List Char)} (hne : ∀ t ∈ ts, t ≠ [])
+    (hsp : ∀ t ∈ ts, ∀ c ∈ t, isAsciiSpace c = false) :
+    trimAsciiChars (joinSpace ts) = joinSpace ts := by
+  refine trimAsciiChars_eq_self (fun c hc => ?_) (fun c hc => ?_)
+  · obtain ⟨t, ht, hct⟩ := head?_joinSpace_mem ts c hne hc
+    exact hsp t ht c hct
+  · obtain ⟨t, ht, hct⟩ := getLast?_joinSpace_mem ts c hne hc
+    exact hsp t ht c hct
+
+private theorem splitOn_joinSpace : ∀ (ts : List (List Char)), ts ≠ [] →
+    (∀ t ∈ ts, ' ' ∉ t) → (joinSpace ts).splitOn ' ' = ts := by
+  intro ts
+  induction ts with
+  | nil => intro h; exact absurd rfl h
+  | cons t rest ih =>
+    intro _ hall
+    cases rest with
+    | nil =>
+      rw [show joinSpace [t] = t from rfl,
+        List.splitOn_eq_singleton (hall t (List.mem_cons_self ..))]
+    | cons u us =>
+      rw [joinSpace_cons (List.cons_ne_nil _ _),
+        List.splitOn_append_cons_self_of_not_mem (hall t (List.mem_cons_self ..)),
+        ih (List.cons_ne_nil _ _) (fun x hx => hall x (List.mem_cons_of_mem _ hx))]
+
+private theorem not_mem_timeBody {sep : Char} (h1 : isAsciiDigit sep = false)
+    (h2 : sep ≠ ':') (h3 : sep ≠ '.') (us : Nat) : sep ∉ timeBody us := by
+  unfold timeBody
+  simp only [List.mem_append, not_or]
+  refine ⟨not_mem_hmsChars h1 h2 us, ?_⟩
+  split
+  · exact List.not_mem_nil
+  · simp only [List.mem_cons, not_or]
+    exact ⟨h3, not_mem_padDigits h1⟩
+
+private theorem timeBody_ne_nil (us : Nat) : timeBody us ≠ [] := by
+  unfold timeBody hmsChars
+  cases hp : padDigits 2 (us / 3600000000) with
+  | nil => exact absurd hp (padDigits_ne_nil 2 _)
+  | cons c t => simp
+
+private theorem intChars_ne_nil (v : Int) : intChars v ≠ [] := by
+  unfold intChars
+  split
+  · exact List.cons_ne_nil _ _
+  · exact natDigits_ne_nil _
+
+private theorem timeChars_ne_nil (v : Int) : timeChars v ≠ [] := by
+  unfold timeChars
+  exact List.append_ne_nil_of_right_ne_nil _ (timeBody_ne_nil _)
+
+theorem intOfChars_intChars (v : Int) : intOfChars (intChars v) = some v := by
+  unfold intChars
+  by_cases hv : v < 0
+  · rw [if_pos hv]
+    simp only [intOfChars, beq_self_eq_true, if_true, natOfDigitsFull_natDigits,
+      Option.map_some, Option.some.injEq, Int.ofNat_eq_natCast]
+    omega
+  · rw [if_neg hv]
+    cases hn : natDigits v.natAbs with
+    | nil => exact absurd hn (natDigits_ne_nil _)
+    | cons a b =>
+      have hne : a ≠ '-' := by
+        intro h
+        exact absurd (show ('-' : Char) ∈ natDigits v.natAbs by
+          rw [hn, ← h]; exact List.mem_cons_self ..) (not_mem_natDigits (by decide))
+      simp only [intOfChars, beq_false_of_ne hne]
+      rw [← hn, natOfDigitsFull_natDigits, Option.map_some]
+      exact congrArg some (by simp only [Int.ofNat_eq_natCast]; omega)
+
+theorem parseTime_timeChars (orig : String) (v : Int) :
+    parseTime orig (timeChars v) = .ok v := by
+  unfold timeChars
+  by_cases hv : v < 0
+  · rw [if_pos hv]
+    simp only [List.cons_append, List.nil_append, parseTime, beq_self_eq_true, if_true,
+      timeMagnitude_timeBody, Except.map, Except.ok.injEq, Int.ofNat_eq_natCast]
+    omega
+  · rw [if_neg hv, List.nil_append]
+    cases hb : timeBody v.natAbs with
+    | nil => exact absurd hb (timeBody_ne_nil _)
+    | cons a b =>
+      have hmem : a ∈ timeBody v.natAbs := by rw [hb]; exact List.mem_cons_self ..
+      have hminus : a ≠ '-' := by
+        intro h; exact absurd (h ▸ hmem) (not_mem_timeBody (by decide) (by decide) (by decide) _)
+      have hplus : a ≠ '+' := by
+        intro h; exact absurd (h ▸ hmem) (not_mem_timeBody (by decide) (by decide) (by decide) _)
+      simp only [parseTime, beq_false_of_ne hminus, beq_false_of_ne hplus]
+      rw [← hb, timeMagnitude_timeBody]
+      exact congrArg Except.ok (by simp only [Int.ofNat_eq_natCast]; omega)
+
+private theorem contains_false_of_not_mem {l : List Char} {c : Char} (h : c ∉ l) :
+    l.contains c = false := by
+  cases hc : l.contains c with
+  | false => rfl
+  | true => exact absurd (List.contains_iff_mem.mp hc) h
+
+private theorem step_nil (orig : String) (iv : PgInterval) : step orig iv none [] = .ok iv := rfl
+
+private theorem step_num (orig : String) (iv : PgInterval) (v : Int)
+    (rest : List (List Char)) :
+    step orig iv none (intChars v :: rest) = step orig iv (some v) rest := by
+  simp only [step,
+    contains_false_of_not_mem (not_mem_intChars (sep := ':') (by decide) (by decide) v),
+    Bool.false_eq_true, if_false, intOfChars_intChars]
+
+private theorem step_mons (orig : String) (iv : PgInterval) (n : Int)
+    (rest : List (List Char)) :
+    step orig iv (some n) (['m', 'o', 'n', 's'] :: rest) =
+      step orig { iv with months := iv.months + n } none rest := rfl
+
+private theorem step_days (orig : String) (iv : PgInterval) (n : Int)
+    (rest : List (List Char)) :
+    step orig iv (some n) (['d', 'a', 'y', 's'] :: rest) =
+      step orig { iv with days := iv.days + n } none rest := rfl
+
+private theorem step_time (orig : String) (iv : PgInterval) (v : Int) :
+    step orig iv none [timeChars v] = .ok { iv with micros := iv.micros + v } := by
+  simp only [step, List.contains_iff_mem, colon_mem_timeChars, if_true,
+    Option.isNone_none, parseTime_timeChars]
+
+private theorem mem_tokens (iv : PgInterval) : ∀ t ∈ iv.tokens,
+    (∃ v : Int, t = intChars v) ∨ t = ['m', 'o', 'n', 's'] ∨ t = ['d', 'a', 'y', 's'] ∨
+      (∃ v : Int, t = timeChars v) := by
+  intro t ht
+  unfold tokens at ht
+  simp only [List.mem_append] at ht
+  rcases ht with (ht | ht) | ht
+  · split at ht
+    · exact absurd ht List.not_mem_nil
+    · simp only [List.mem_cons, List.not_mem_nil, or_false] at ht
+      rcases ht with rfl | rfl
+      · exact Or.inl ⟨_, rfl⟩
+      · exact Or.inr (Or.inl rfl)
+  · split at ht
+    · exact absurd ht List.not_mem_nil
+    · simp only [List.mem_cons, List.not_mem_nil, or_false] at ht
+      rcases ht with rfl | rfl
+      · exact Or.inl ⟨_, rfl⟩
+      · exact Or.inr (Or.inr (Or.inl rfl))
+  · split at ht
+    · exact absurd ht List.not_mem_nil
+    · simp only [List.mem_cons, List.not_mem_nil, or_false] at ht
+      exact Or.inr (Or.inr (Or.inr ⟨_, ht⟩))
+
+private theorem tokens_ne_nil (iv : PgInterval) : ∀ t ∈ iv.tokens, t ≠ [] := by
+  intro t ht
+  rcases mem_tokens iv t ht with ⟨v, rfl⟩ | rfl | rfl | ⟨v, rfl⟩
+  · exact intChars_ne_nil v
+  · exact List.cons_ne_nil _ _
+  · exact List.cons_ne_nil _ _
+  · exact timeChars_ne_nil v
+
+private theorem space_not_digit {c : Char} (h : isAsciiSpace c = true) :
+    isAsciiDigit c = false ∧ c ≠ ':' ∧ c ≠ '.' ∧ c ≠ '-' := by
+  simp only [isAsciiSpace, Bool.or_eq_true, beq_iff_eq] at h
+  rcases h with ((rfl | rfl) | rfl) | rfl <;>
+    exact ⟨by decide, by decide, by decide, by decide⟩
+
+private theorem tokens_space_free (iv : PgInterval) :
+    ∀ t ∈ iv.tokens, ∀ c ∈ t, isAsciiSpace c = false := by
+  intro t ht c hc
+  cases hsp' : isAsciiSpace c with
+  | false => rfl
+  | true =>
+  exfalso
+  obtain ⟨h1, h2, h3, h4⟩ := space_not_digit hsp'
+  rcases mem_tokens iv t ht with ⟨v, rfl⟩ | rfl | rfl | ⟨v, rfl⟩
+  · exact not_mem_intChars h1 h4 v hc
+  · simp only [List.mem_cons, List.not_mem_nil, or_false] at hc
+    rcases hc with rfl | rfl | rfl | rfl <;> exact absurd hsp' (by decide)
+  · simp only [List.mem_cons, List.not_mem_nil, or_false] at hc
+    rcases hc with rfl | rfl | rfl | rfl <;> exact absurd hsp' (by decide)
+  · exact not_mem_timeChars h1 h2 h3 h4 v hc
+
+private theorem tokens_list_ne_nil (iv : PgInterval) : iv.tokens ≠ [] := by
+  unfold tokens
+  by_cases hm : iv.months = 0
+  · by_cases hd : iv.days = 0
+    · rw [if_pos hm, if_pos hd, if_neg (by simp [hm, hd])]
+      simp
+    · rw [if_pos hm, if_neg hd]
+      simp
+  · rw [if_neg hm]
+    simp
+
+-- One uniform rewrite set for all eight shapes of the token list; which of the
+-- `step_*` lemmas fires depends on the case, so some are unused in each.
+set_option linter.unusedSimpArgs false in
+private theorem step_tokens (orig : String) (iv : PgInterval) :
+    step orig {} none iv.tokens = .ok iv := by
+  obtain ⟨mo, dy, us⟩ := iv
+  unfold tokens
+  by_cases hm : mo = 0 <;> by_cases hd : dy = 0 <;> by_cases hu : us = 0
+  · rw [if_pos hm, if_pos hd, if_neg (by simp [hm, hd])]
+    simp only [List.nil_append, List.append_nil, List.cons_append, step_num,
+      step_mons, step_days, step_time, step_nil]
+    simp [hm, hd, hu]
+  · rw [if_pos hm, if_pos hd, if_neg (by simp [hm, hd])]
+    simp only [List.nil_append, List.append_nil, List.cons_append, step_num,
+      step_mons, step_days, step_time, step_nil]
+    simp [hm, hd, hu]
+  · rw [if_pos hm, if_neg hd, if_pos (by exact ⟨hu, by simp [hd]⟩)]
+    simp only [List.nil_append, List.append_nil, List.cons_append, step_num,
+      step_mons, step_days, step_time, step_nil]
+    simp [hm, hd, hu]
+  · rw [if_pos hm, if_neg hd, if_neg (by simp [hu])]
+    simp only [List.nil_append, List.append_nil, List.cons_append, step_num,
+      step_mons, step_days, step_time, step_nil]
+    simp [hm, hd, hu]
+  · rw [if_neg hm, if_pos hd, if_pos (by exact ⟨hu, by simp [hm]⟩)]
+    simp only [List.nil_append, List.append_nil, List.cons_append, step_num,
+      step_mons, step_days, step_time, step_nil]
+    simp [hm, hd, hu]
+  · rw [if_neg hm, if_pos hd, if_neg (by simp [hu])]
+    simp only [List.nil_append, List.append_nil, List.cons_append, step_num,
+      step_mons, step_days, step_time, step_nil]
+    simp [hm, hd, hu]
+  · rw [if_neg hm, if_neg hd, if_pos (by exact ⟨hu, by simp [hm]⟩)]
+    simp only [List.nil_append, List.append_nil, List.cons_append, step_num,
+      step_mons, step_days, step_time, step_nil]
+    simp [hm, hd, hu]
+  · rw [if_neg hm, if_neg hd, if_neg (by simp [hu])]
+    simp only [List.nil_append, List.append_nil, List.cons_append, step_num,
+      step_mons, step_days, step_time, step_nil]
+    simp [hm, hd, hu]
+
+/-- **An interval renders and parses back to itself**, unconditionally: the
+month, day and microsecond components are recovered exactly, sign and
+sub-second fraction included. -/
+theorem fromString_toString (iv : PgInterval) : fromString iv.toString = .ok iv := by
+  have hne := tokens_ne_nil iv
+  have hsp := tokens_space_free iv
+  unfold fromString
+  rw [toString_eq, String.toList_ofList, trim_joinSpace hne hsp,
+    splitOn_joinSpace _ (tokens_list_ne_nil iv)
+      (fun t ht hmem => absurd (hsp t ht ' ' hmem) (by decide)),
+    List.filter_eq_self.mpr (fun t ht => by
+      cases t with
+      | nil => exact absurd rfl (hne [] ht)
+      | cons _ _ => rfl),
+    step_tokens]
+
+end PgInterval
+
 end Pg
