@@ -264,74 +264,137 @@ instance : PgEncode ByteArray where
   typeOid := Oid.bytea
   encode v := some v
 
+-- ── decimal digit strings ─────────────────────────────────────────────────
+
+/-!
+PostgreSQL's temporal text formats are fixed-width zero-padded decimal fields,
+so the roundtrip proofs have to walk digits. Neither `Nat.repr` nor
+`String.toNat?` can carry that: `Nat.digitChar` is not exposed to the kernel,
+and core ships no lemma about `String.toNat?` of a zero-padded argument. These
+four functions render and parse exactly the same decimal strings while staying
+kernel-visible.
+-/
+
+@[expose] def isAsciiDigit (c : Char) : Bool := 48 ≤ c.toNat && c.toNat ≤ 57
+
+@[expose] def digitChar (d : Nat) : Char := Char.ofNat (48 + d % 10)
+
+/-- Decimal digits of `n`, most significant first (`0` is `['0']`) — the same
+characters `toString n` produces. -/
+def natDigits (n : Nat) : List Char :=
+  if n < 10 then [digitChar n] else natDigits (n / 10) ++ [digitChar (n % 10)]
+termination_by n
+decreasing_by exact Nat.div_lt_self (by omega) (by omega)
+
+/-- `n` in decimal, left-padded with `'0'` to at least `width` characters
+(never truncated — a wider value keeps all its digits, as PostgreSQL does with
+5-digit years). -/
+def padDigits (width n : Nat) : List Char :=
+  List.replicate (width - (natDigits n).length) '0' ++ natDigits n
+
+/-- Fold a decimal digit list onto an accumulator; `none` on any non-digit. -/
+def natOfDigits (acc : Nat) : List Char → Option Nat
+  | [] => some acc
+  | c :: rest =>
+    if isAsciiDigit c then natOfDigits (acc * 10 + (c.toNat - 48)) rest else none
+
 -- ── temporal types ─────────────────────────────────────────────────────────
 
 def parseNatField (s : String) (what : String) : Except String Nat :=
-  match s.toNat? with
-  | some v => pure v
-  | none => throw s!"bad {what}: {s}"
+  match s.toList with
+  | [] => throw s!"bad {what}: {s}"
+  | chars =>
+    match natOfDigits 0 chars with
+    | some v => pure v
+    | none => throw s!"bad {what}: {s}"
 
 def rejectInfinity (s : String) : Except String Unit := do
   if s == "infinity" || s == "-infinity" then
     throw "date/timestamp infinity is not representable"
 
-def parseDate (s : String) : Except String PlainDate := do
-  rejectInfinity s
-  match s.splitOn "-" with
+/-- Split a string at every occurrence of one character.
+
+Deliberately not `String.splitOn`: `String.splitOnAux` is `@[irreducible]` and
+core ships no lemmas about it, so a `String.splitOn`-based parser is opaque to
+the kernel. `List.splitOn` has a full lemma set and agrees with it for a
+single-character separator. (Same trick as `Pg.Sasl.Scram.splitOnChar`.) -/
+def splitOnChar (c : Char) (s : String) : List String :=
+  (s.toList.splitOn c).map String.ofList
+
+/-- The three decimal fields of a `YYYY-MM-DD` date, before any calendar
+validation. -/
+def dateFields (s : String) : Except String (Nat × Nat × Nat) :=
+  match splitOnChar '-' s with
   | [y, m, d] =>
-    let y ← parseNatField y "year"
-    let m ← parseNatField m "month"
-    let d ← parseNatField d "day"
-    let some mo := Std.Time.Internal.Bounded.LE.ofInt (Int.ofNat m)
-      | throw s!"month out of range: {m}"
-    let some da := Std.Time.Internal.Bounded.LE.ofInt (Int.ofNat d)
-      | throw s!"day out of range: {d}"
-    match PlainDate.ofYearMonthDay? (Int.ofNat y) mo da with
-    | some date => pure date
-    | none => throw s!"invalid date {s}"
+    match parseNatField y "year", parseNatField m "month", parseNatField d "day" with
+    | .ok y, .ok m, .ok d => .ok (y, m, d)
+    | .error e, _, _ => .error e
+    | _, .error e, _ => .error e
+    | _, _, .error e => .error e
   | _ => throw s!"cannot parse date {s} (BC dates unsupported)"
 
+def parseDate (s : String) : Except String PlainDate := do
+  rejectInfinity s
+  let (y, m, d) ← dateFields s
+  let some mo := Std.Time.Internal.Bounded.LE.ofInt (Int.ofNat m)
+    | throw s!"month out of range: {m}"
+  let some da := Std.Time.Internal.Bounded.LE.ofInt (Int.ofNat d)
+    | throw s!"day out of range: {d}"
+  match PlainDate.ofYearMonthDay? (Int.ofNat y) mo da with
+  | some date => pure date
+  | none => throw s!"invalid date {s}"
+
+/-- Fractional seconds text → nanoseconds: right-pad to 9 digits and read. -/
+def fracNanos (frac : String) : Except String Nat :=
+  if frac.isEmpty then .ok 0
+  else parseNatField
+    (String.ofList (List.take 9 (frac.toList ++ List.replicate 9 '0'))) "fraction"
+
+/-- `HH:MM:SS` plus an already-split fractional part → nanoseconds. -/
+def hmsNanos (hms frac : String) : Except String Int :=
+  match splitOnChar ':' hms with
+  | [hs, ms, ss] =>
+    match parseNatField hs "hours", parseNatField ms "minutes",
+        parseNatField ss "seconds", fracNanos frac with
+    | .ok h, .ok m, .ok sec, .ok nanos =>
+      if h < 24 && m < 60 && sec < 61 then
+        .ok (Int.ofNat (((h * 3600 + m * 60 + sec) * 1000000000) + nanos))
+      else .error s!"time out of range: {hms}"
+    | .error e, _, _, _ => .error e
+    | _, .error e, _, _ => .error e
+    | _, _, .error e, _ => .error e
+    | _, _, _, .error e => .error e
+  | _ => throw s!"cannot parse time {hms}"
+
 /-- `HH:MM:SS[.ffffff]` → nanoseconds since midnight. -/
-def parseTimeNanos (s : String) : Except String Int := do
-  let (hms, frac) := match s.splitOn "." with
-    | [t] => (t, "")
-    | [t, f] => (t, f)
-    | _ => ("", "")
-  match hms.splitOn ":" with
-  | [h, m, sec] =>
-    let h ← parseNatField h "hours"
-    let m ← parseNatField m "minutes"
-    let sec ← parseNatField sec "seconds"
-    unless h < 24 && m < 60 && sec < 61 do throw s!"time out of range: {s}"
-    let fracNanos ← do
-      if frac.isEmpty then
-        pure 0
-      else
-        let padded := (String.fromUTF8? ((frac ++ "000000000").toUTF8.extract 0 9)).getD ""
-        pure (← parseNatField padded "fraction")
-    pure (Int.ofNat (((h * 3600 + m * 60 + sec) * 1000000000) + fracNanos))
+def parseTimeNanos (s : String) : Except String Int :=
+  match splitOnChar '.' s with
+  | [hms] => hmsNanos hms ""
+  | [hms, frac] => hmsNanos hms frac
   | _ => throw s!"cannot parse time {s}"
 
-def pad2 (v : Nat) : String :=
-  if v < 10 then "0" ++ toString v else toString v
+def pad2 (v : Nat) : String := String.ofList (padDigits 2 v)
 
-def pad4' (v : Int) : String :=
-  let s := toString v.natAbs
-  let padded := String.ofList (List.replicate (4 - min 4 s.length) '0') ++ s
-  if v < 0 then "-" ++ padded else padded
+/-- Zero-padded 4-digit year with an explicit sign for BC dates. -/
+def yearChars (v : Int) : List Char :=
+  if v < 0 then '-' :: padDigits 4 v.natAbs else padDigits 4 v.natAbs
 
-def renderDate (d : PlainDate) : String :=
-  s!"{pad4' d.year}-{pad2 d.month.toNat}-{pad2 d.day.toNat}"
+def pad4' (v : Int) : String := String.ofList (yearChars v)
 
-def renderTimeNanos (nanos : Nat) : String :=
-  let sec := nanos / 1000000000
-  let sub := nanos % 1000000000
-  let base := s!"{pad2 (sec / 3600)}:{pad2 (sec / 60 % 60)}:{pad2 (sec % 60)}"
-  if sub == 0 then base
-  else
-    let micros := sub / 1000
-    let f := toString (1000000 + micros)
-    base ++ "." ++ ((f.toUTF8.extract 1 7 |> String.fromUTF8?).getD "")
+def dateChars (d : PlainDate) : List Char :=
+  yearChars d.year ++
+    '-' :: (padDigits 2 d.month.toNat ++ '-' :: padDigits 2 d.day.toNat)
+
+def renderDate (d : PlainDate) : String := String.ofList (dateChars d)
+
+def timeChars (nanos : Nat) : List Char :=
+  padDigits 2 (nanos / 1000000000 / 3600) ++
+    ':' :: (padDigits 2 (nanos / 1000000000 / 60 % 60) ++
+      ':' :: (padDigits 2 (nanos / 1000000000 % 60) ++
+        (if nanos % 1000000000 == 0 then []
+         else '.' :: padDigits 6 (nanos % 1000000000 / 1000))))
+
+def renderTimeNanos (nanos : Nat) : String := String.ofList (timeChars nanos)
 
 instance : PgDecode PlainDate where
   decodeText _ s := parseDate s
@@ -383,29 +446,38 @@ instance : PgEncode PlainDateTime where
   encode dt :=
     some s!"{renderDate dt.date} {renderTimeNanos dt.time.toNanoseconds.toInt.toNat}".toUTF8
 
+/-- Length of the trailing zone offset, scanning the reversed text: stop at the
+first `+`/`-` (that is the sign) or at the date/time separator space. -/
+def zoneSuffixLen : List Char → Option Nat
+  | [] => none
+  | c :: rest =>
+    if c == '+' || c == '-' then some 1
+    else if c == ' ' then none
+    else (zoneSuffixLen rest).map (· + 1)
+
 /-- Timezone offset suffix of a timestamptz text value: `+HH`, `-HH:MM`, ... -/
-def splitZoneSuffix (s : String) : Except String (String × Int) := do
-  let raw := s.toUTF8
-  let mut signPos : Option Nat := none
-  for k in [0:raw.size] do
-    let i := raw.size - 1 - k
-    let b := raw.get! i
-    if b == 43 || b == 45 then  -- '+' '-'
-      signPos := some i
-      break
-    if b == 32 then break  -- reached the date/time separator space
-  let some pos := signPos | throw s!"timestamptz without zone offset: {s}"
-  let body := (String.fromUTF8? (raw.extract 0 pos)).getD ""
-  let zone := (String.fromUTF8? (raw.extract pos raw.size)).getD ""
-  let neg := zone.startsWith "-"
-  let zoneBody := (String.fromUTF8? (zone.toUTF8.extract 1 zone.utf8ByteSize)).getD ""
-  let (h, m) ← match zoneBody.splitOn ":" with
-    | [h] => pure (← parseNatField h "zone hours", 0)
-    | [h, m] => pure (← parseNatField h "zone hours", ← parseNatField m "zone minutes")
-    | [h, m, _s] => pure (← parseNatField h "zone hours", ← parseNatField m "zone minutes")
+def splitZoneSuffix (s : String) : Except String (String × Int) :=
+  match zoneSuffixLen s.toList.reverse with
+  | none => throw s!"timestamptz without zone offset: {s}"
+  | some k =>
+    let pos := s.toList.length - k
+    let body := String.ofList (s.toList.take pos)
+    let zone := String.ofList (s.toList.drop pos)
+    let neg := zone.startsWith "-"
+    let zoneBody := String.ofList (zone.toList.drop 1)
+    match splitOnChar ':' zoneBody with
+    | [h] =>
+      match parseNatField h "zone hours" with
+      | .ok h => .ok (body, if neg then -(Int.ofNat (h * 3600)) else Int.ofNat (h * 3600))
+      | .error e => .error e
+    | [h, m] | [h, m, _] =>
+      match parseNatField h "zone hours", parseNatField m "zone minutes" with
+      | .ok h, .ok m =>
+        let secs := Int.ofNat (h * 3600 + m * 60)
+        .ok (body, if neg then -secs else secs)
+      | .error e, _ => .error e
+      | _, .error e => .error e
     | _ => throw s!"bad zone offset {zone}"
-  let secs := Int.ofNat (h * 3600 + m * 60)
-  pure (body, if neg then -secs else secs)
 
 instance : PgDecode Timestamp where
   decodeText _ s := do
@@ -530,47 +602,79 @@ instance : PgEncode PgInterval where
 
 -- ── 1-D arrays ─────────────────────────────────────────────────────────────
 
-/-- Parse `{a,"quo\"ted",NULL}` into raw element texts. 1-D only. -/
-def parseArrayText (s : String) : Except String (Array (Option String)) := do
-  let chars := s.trimAscii.toString.toList
-  match chars with
-  | '{' :: rest => do
-    let mut elems : Array (Option String) := #[]
-    let mut buf : List Char := []
-    let mut quoted := false      -- current element was quoted
-    let mut inQuotes := false
-    let mut escaped := false
-    let mut closed := false
-    let mut sawAny := false
-    for c in rest do
-      if closed then throw s!"array: trailing characters in {s}"
-      if escaped then
-        buf := c :: buf
-        escaped := false
-      else if inQuotes then
-        if c == '\\' then escaped := true
-        else if c == '"' then inQuotes := false
-        else buf := c :: buf
-      else if c == '"' then
-        inQuotes := true
-        quoted := true
-        sawAny := true
-      else if c == ',' || c == '}' then
-        let text := String.ofList buf.reverse
-        if sawAny || !text.isEmpty then
-          elems := elems.push (if !quoted && text == "NULL" then none else some text)
-        else if c == ',' then
-          throw s!"array: empty element in {s}"
-        buf := []
-        quoted := false
-        sawAny := c == ','  -- after a comma another element must follow
-        if c == '}' then closed := true
+/-- Parser state while scanning a 1-D array literal. `buf` holds the current
+element's characters in reverse. -/
+structure ArrayScan where
+  elems : Array (Option String) := #[]
+  buf : List Char := []
+  /-- The current element was quoted (so `NULL` in it is the literal text). -/
+  quoted : Bool := false
+  inQuotes : Bool := false
+  escaped : Bool := false
+  closed : Bool := false
+  /-- Something (a character, a quote, or a preceding comma) demands an
+  element here, so an empty one is a parse error rather than "no elements". -/
+  sawAny : Bool := false
+  deriving Inhabited
+
+/-- One scanning step per character. Explicit recursion rather than a `for`
+loop with mutable state: a `forIn` body is opaque to the kernel. -/
+def arrayScan (src : String) : ArrayScan → List Char → Except String ArrayScan
+  | st, [] => .ok st
+  | st, c :: rest =>
+    if st.closed then .error s!"array: trailing characters in {src}"
+    else if st.escaped then
+      arrayScan src { st with buf := c :: st.buf, escaped := false } rest
+    else if st.inQuotes then
+      if c == '\\' then arrayScan src { st with escaped := true } rest
+      else if c == '"' then arrayScan src { st with inQuotes := false } rest
+      else arrayScan src { st with buf := c :: st.buf } rest
+    else if c == '"' then
+      arrayScan src { st with inQuotes := true, quoted := true, sawAny := true } rest
+    else if c == ',' || c == '}' then
+      let text := String.ofList st.buf.reverse
+      if st.sawAny || !text.isEmpty then
+        arrayScan src
+          { st with
+            elems := st.elems.push (if !st.quoted && text == "NULL" then none else some text)
+            buf := [], quoted := false, sawAny := c == ',', closed := c == '}' } rest
+      else if c == ',' then .error s!"array: empty element in {src}"
       else
-        buf := c :: buf
-        sawAny := true
-    unless closed && !inQuotes && !escaped do throw s!"array: unterminated {s}"
-    pure elems
-  | _ => throw s!"not an array literal: {s}"
+        arrayScan src
+          { st with buf := [], quoted := false, sawAny := c == ',', closed := c == '}' } rest
+    else arrayScan src { st with buf := c :: st.buf, sawAny := true } rest
+
+/-- Parse `{a,"quo\"ted",NULL}` into raw element texts. 1-D only. -/
+def parseArrayText (s : String) : Except String (Array (Option String)) :=
+  match s.trimAscii.toString.toList with
+  | '{' :: rest =>
+    match arrayScan s {} rest with
+    | .error e => .error e
+    | .ok st =>
+      if st.closed && !st.inQuotes && !st.escaped then .ok st.elems
+      else .error s!"array: unterminated {s}"
+  | _ => .error s!"not an array literal: {s}"
+
+/-- Read `count` length-prefixed binary array elements starting at `off`.
+Explicit recursion on the count. -/
+def decodeArrayElems (α : Type) [PgDecode α] (elemOid : UInt32) (b : ByteArray) :
+    Nat → Nat → Array α → Except String (Array α)
+  | _, 0, out => .ok out
+  | off, count + 1, out =>
+    match rdInt32 b off with
+    | .error e => .error e
+    | .ok len32 =>
+      if len32.toInt == -1 then
+        match PgDecode.decodeNull (α := α) with
+        | .ok v => decodeArrayElems α elemOid b (off + 4) count (out.push v)
+        | .error e => .error e
+      else
+        let n := len32.toInt.toNat
+        if off + 4 + n ≤ b.size then
+          match PgDecode.decodeBinary (α := α) elemOid (b.extract (off + 4) (off + 4 + n)) with
+          | .ok v => decodeArrayElems α elemOid b (off + 4 + n) count (out.push v)
+          | .error e => .error e
+        else .error "truncated array element"
 
 /-- One instance covers both nullable and strict element types: a NULL element
 decodes through the element's `decodeNull` (so `Array (Option α)` yields
@@ -590,19 +694,7 @@ instance [PgDecode α] : PgDecode (Array α) where
       return #[]
     unless ndim == 1 do throw s!"only 1-D arrays supported (got {ndim}-D)"
     let count := (← rdInt32 b 12).toInt.toNat
-    let mut off := 20
-    let mut out : Array α := #[]
-    for _ in [0:count] do
-      let len := (← rdInt32 b off).toInt
-      off := off + 4
-      if len == -1 then
-        out := out.push (← PgDecode.decodeNull)
-      else
-        let n := len.toNat
-        unless off + n ≤ b.size do throw "truncated array element"
-        out := out.push (← PgDecode.decodeBinary elemOid (b.extract off (off + n)))
-        off := off + n
-    pure out
+    decodeArrayElems α elemOid b 20 count #[]
 
 -- ── roundtrip laws ─────────────────────────────────────────────────────────
 
