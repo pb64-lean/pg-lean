@@ -1559,6 +1559,79 @@ theorem step_async_preserves_pipeline {s : State} {msg : RawMessage}
     intro h
     cases h
 
+/-!
+### Progress
+
+Preservation alone would be satisfied by a machine that rejects everything.
+`step_progress` rules that out: whenever the pipeline's head op awaits a
+reply and the backend sends a message of the expected class, `step` succeeds
+(no `.ok` obligations beyond decoding — not even `WellFormed`). The expected
+classes are exactly PostgreSQL's documented reply sets per request type.
+`step_errorResponse_progress` complements it: an ErrorResponse is always
+accepted while an op is pending — server errors during a pipeline can never
+poison the connection.
+-/
+
+/-- Backend messages that legitimately answer the pipeline's head op in its
+current reply-progress state. Async messages are always accepted
+(`step_async_preserves_pipeline`), ErrorResponse is always accepted while an
+op is pending (`step_errorResponse_progress`), and the COPY-start responses
+additionally depend on the queued pipeline, so they are not listed here. -/
+def ExpectedReply (op : CurrentOp) (m : BackendMsg) : Prop :=
+  match op.kind, op.progress, m with
+  | .parse, .start, .parseComplete => True
+  | .bind, .start, .bindComplete => True
+  | .close, .start, .closeComplete => True
+  | .describeStatement, .start, .parameterDescription _ => True
+  | .describeStatement, .descParams, .rowDescription _ => True
+  | .describeStatement, .descParams, .noData => True
+  | .describePortal, .start, .rowDescription _ => True
+  | .describePortal, .start, .noData => True
+  | .execute, .start, .dataRow _ => True
+  | .execute, .rows none, .dataRow _ => True
+  | .execute, .start, .commandComplete _ => True
+  | .execute, .rows none, .commandComplete _ => True
+  | .execute, .start, .emptyQueryResponse => True
+  | .execute, .start, .portalSuspended => True
+  | .execute, .rows none, .portalSuspended => True
+  | .sync, _, .readyForQuery _ => True
+  | .simpleQuery, .start, .rowDescription _ => True
+  | .simpleQuery, .start, .commandComplete _ => True
+  | .simpleQuery, .start, .emptyQueryResponse => True
+  | .simpleQuery, .start, .readyForQuery _ => True
+  | .simpleQuery, .rows (some n), .dataRow cols => cols.size = n
+  | .simpleQuery, .rows _, .commandComplete _ => True
+  | .simpleQuery, .rows _, .readyForQuery _ => True
+  | _, .copyOut _, .copyData _ => True
+  | _, .copyOut _, .copyDone => True
+  | _, _, _ => False
+
+/-- **Progress**: an expected reply for the head op always steps successfully. -/
+theorem step_progress {s : State} {pipe : Pipeline} {op : CurrentOp}
+    {msg : RawMessage} {m : BackendMsg}
+    (hph : s.phase = .running pipe) (hcur : pipe.current = some op)
+    (hdec : Backend.decode msg = .ok m) (hexp : ExpectedReply op m) :
+    ∃ r, step s msg = .ok r := by
+  revert hexp
+  fun_cases ExpectedReply op m <;> intro hexp <;>
+    first
+      | exact hexp.elim
+      | (unfold step stepRunning
+         simp only [*, beq_self_eq_true]
+         exact ⟨_, rfl⟩)
+
+/-- An ErrorResponse is always accepted while an op is pending: recoverable
+server errors can never poison a mid-pipeline connection. -/
+theorem step_errorResponse_progress {s : State} {pipe : Pipeline} {op : CurrentOp}
+    {msg : RawMessage} {fields : ErrorFields}
+    (hph : s.phase = .running pipe) (hcur : pipe.current = some op)
+    (hdec : Backend.decode msg = .ok (.errorResponse fields)) :
+    ∃ r, step s msg = .ok r := by
+  cases hsimple : isSimple op <;> cases hsync : op.kind == OpKind.sync <;>
+    (unfold step stepRunning
+     simp only [hph, hdec, hcur, hsimple, hsync]
+     exact ⟨_, rfl⟩)
+
 end Machine
 end Protocol
 end Pg
