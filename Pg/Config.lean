@@ -988,6 +988,96 @@ theorem parseUri_renderUri {cfg : ConnectConfig}
         applyHostPort_render hhost hhostsafe hport, String.ofList_toList,
         applyPath_render hdb0, finishUri, huserEmpty, Bool.false_eq_true, if_false]
 
+/-!
+### Query-parameter laws
+
+An unrecognized query key is a PostgreSQL *startup* parameter. These laws say
+that treating it as one is safe: it can never fail the parse, and it can never
+disturb a setting the authority, path, or an earlier query field established.
+-/
+
+/-- The query keys `applyQueryParam` interprets; everything else becomes a
+startup parameter. -/
+@[expose] def knownQueryKey (key : String) : Bool :=
+  key == "user" || key == "password" || key == "dbname" || key == "host" ||
+    key == "port" || key == "sslrootcert" || key == "sslmode" ||
+    key == "channel_binding" || key == "connect_timeout" || key == "protocol"
+
+/-- **Unknown keys are inert**: an unrecognized query parameter is accepted
+unconditionally and only appends to `parameters` — no recognized field can be
+reached by one. -/
+theorem applyQueryParam_unknown (cfg : ConnectConfig) (key value : String)
+    (h : knownQueryKey key = false) :
+    applyQueryParam cfg key value
+      = .ok { cfg with parameters := cfg.parameters.push (key, value) } := by
+  unfold knownQueryKey at h
+  simp only [Bool.or_eq_false_iff, beq_eq_false_iff_ne, ne_eq] at h
+  unfold applyQueryParam
+  split <;> rename_i hk <;> simp_all
+  rfl
+
+private def queryFieldChars (kv : String × String) : List Char :=
+  (percentEncode kv.1).toList ++ '=' :: (percentEncode kv.2).toList
+
+/-- One `key=value` query field, both halves percent-encoded. -/
+def renderQueryField (kv : String × String) : String :=
+  String.ofList (queryFieldChars kv)
+
+private theorem renderQueryField_not_empty (kv : String × String) :
+    (renderQueryField kv).isEmpty = false := by
+  refine String.isEmpty_eq_false_iff.mpr (fun he => ?_)
+  have : queryFieldChars kv = [] := by
+    rw [← String.toList_ofList (l := queryFieldChars kv)]
+    unfold renderQueryField at he
+    rw [he]
+    rfl
+  unfold queryFieldChars at this
+  rcases List.append_eq_nil_iff.mp this with ⟨-, h2⟩
+  cases h2
+
+private theorem splitFirstChar_renderQueryField (kv : String × String) :
+    splitFirstChar '=' (renderQueryField kv)
+      = some (percentEncode kv.1, percentEncode kv.2) := by
+  unfold renderQueryField queryFieldChars
+  rw [splitFirstChar_ofList
+    (ne_of_uriSafe (uriSafeChar_percentEncode kv.1) (by decide))]
+  rw [String.ofList_toList, String.ofList_toList]
+
+/-- **A whole query string of unknown parameters is inert**: it always parses,
+every recognized setting comes through untouched, and the pairs land in
+`parameters` in the order they appeared. -/
+theorem applyQueryPairs_render (cfg : ConnectConfig) (ps : List (String × String))
+    (h : ∀ kv ∈ ps, knownQueryKey kv.1 = false) :
+    ∃ cfg', applyQueryPairs cfg (ps.map renderQueryField) = .ok cfg' ∧
+      cfg'.user = cfg.user ∧ cfg'.password = cfg.password ∧
+      cfg'.host = cfg.host ∧ cfg'.port = cfg.port ∧
+      cfg'.database = cfg.database ∧ cfg'.sslMode = cfg.sslMode ∧
+      cfg'.sslRootCert = cfg.sslRootCert ∧
+      cfg'.channelBinding = cfg.channelBinding ∧
+      cfg'.requestedVersion = cfg.requestedVersion ∧
+      cfg'.connectTimeoutMs = cfg.connectTimeoutMs ∧
+      cfg'.parameters.toList = cfg.parameters.toList ++ ps := by
+  induction ps generalizing cfg with
+  | nil =>
+    exact ⟨cfg, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl,
+      (List.append_nil _).symm⟩
+  | cons kv rest ih =>
+    have hkv : knownQueryKey kv.1 = false := h kv (List.mem_cons_self ..)
+    obtain ⟨cfg', hrun, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11⟩ :=
+      ih (cfg := { cfg with parameters := cfg.parameters.push kv })
+        (fun x hx => h x (List.mem_cons_of_mem _ hx))
+    refine ⟨cfg', ?_, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, ?_⟩
+    · show applyQueryPairs cfg (renderQueryField kv :: rest.map renderQueryField) = _
+      unfold applyQueryPairs
+      rw [if_neg (by rw [renderQueryField_not_empty]; exact Bool.false_ne_true),
+        splitFirstChar_renderQueryField]
+      simp only [percentDecode_percentEncode,
+        applyQueryParam_unknown cfg kv.1 kv.2 hkv]
+      exact hrun
+    · rw [h11]
+      show (cfg.parameters.push kv).toList ++ rest = _
+      rw [Array.toList_push, List.append_assoc, List.singleton_append]
+
 end ConnectConfig
 
 end Pg
