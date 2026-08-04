@@ -1966,7 +1966,7 @@ refinement: the shell's event-driven queue is always exactly the machine's
 pending-op queue, so no reply can be attributed to the wrong request.
 `terminal_pops_head` reads off the headline — every user-visible success is
 the terminal reply of the op at the FIFO head and pops exactly that one op —
-and `nonterminal_preserves_fifo` its complement.
+with `nonterminal_preserves_fifo` and `error_drops_to_sync` its complements.
 -/
 
 /-- The correlation FIFO as the machine sees it: the ops still awaiting
