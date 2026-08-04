@@ -173,5 +173,14 @@ def main : IO Unit := do
   expectOk (dBin (Array Int) Oid.int4Array (hex "00 00 00 00 00 00 00 00 00 00 00 17"))
     #[] "array binary empty"
   expectErr (dText (Array Int) 0 "1,2") "not an array literal"
+  -- the array renderer: every non-NULL element is quoted, so "NULL"-as-text
+  -- survives, and quotes/backslashes are escaped
+  expect (encText (Array (Option String)) #[some "a", none, some "NULL"]
+    == "{\"a\",NULL,\"NULL\"}") "array text render"
+  expect (encText (Array (Option String)) #[] == "{}") "empty array render"
+  for a in [#[some "a", none, some "NULL"], #[], #[some "quo\"te\\back", some " sp "],
+      #[none]] do
+    expectOk (parseArrayText (renderArrayText a.toList)) a
+      s!"array render/parse roundtrip {renderArrayText a.toList}"
 
   IO.println "all codec assertions passed"

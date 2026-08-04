@@ -105,7 +105,8 @@ bazel run //Cmd:pg_lean -- -e -b postgres://postgres@localhost/postgres \
 - **Codecs** (text + binary): bool, int2/4/8, float4/8, text/varchar/bpchar,
   bytea, uuid, json/jsonb, date/time/timestamp/timestamptz on `Std.Time`
   (PG↔Unix epoch handled), `PgNumeric` (lossless base-10000), `PgInterval`
-  (months/days/micros), 1-D arrays with NULLs.
+  (months/days/micros), 1-D arrays with NULLs (`renderArrayText` sends one as
+  a text parameter).
 - **Errors**: full §53.8 field set with accessors (SQLSTATE, constraint,
   table, position, ...); statement errors are values, connection-fatal
   errors are typed separately.
@@ -223,6 +224,11 @@ section docstring states its scope.
   that date and those nanoseconds). Underneath them, `parseNatField_padDigits`:
   a zero-padded decimal field reads back as the number it was rendered from, at
   any width.
+
+  For 1-D arrays, `parseArrayText_renderArrayText`: a rendered array parses
+  back to the same elements, NULLs included — and an element whose text is
+  literally `NULL` stays a value, because `renderArrayText` quotes every
+  non-NULL element (escaping `"` and `\`).
 
   Two gaps are deliberate. **Floats are excluded**: `toString`/`parseFloat` is
   not an unconditional IEEE-754 roundtrip, and stating the true law needs

@@ -676,9 +676,17 @@ def arrayScan (src : String) : ArrayScan → List Char → Except String ArraySc
           { st with buf := [], quoted := false, sawAny := c == ',', closed := c == '}' } rest
     else arrayScan src { st with buf := c :: st.buf, sawAny := true } rest
 
+@[expose] def isAsciiSpace (c : Char) : Bool :=
+  c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+/-- Trim ASCII whitespace on the character list. `String.trimAscii` goes
+through `String.Slice`, which the kernel cannot follow. -/
+def trimAsciiChars (l : List Char) : List Char :=
+  ((l.dropWhile isAsciiSpace).reverse.dropWhile isAsciiSpace).reverse
+
 /-- Parse `{a,"quo\"ted",NULL}` into raw element texts. 1-D only. -/
 def parseArrayText (s : String) : Except String (Array (Option String)) :=
-  match s.trimAscii.toString.toList with
+  match trimAsciiChars s.toList with
   | '{' :: rest =>
     match arrayScan s {} rest with
     | .error e => .error e
@@ -686,6 +694,35 @@ def parseArrayText (s : String) : Except String (Array (Option String)) :=
       if st.closed && !st.inQuotes && !st.escaped then .ok st.elems
       else .error s!"array: unterminated {s}"
   | _ => .error s!"not an array literal: {s}"
+
+/-- Escape `"` and `\` inside a quoted array element. -/
+def escapeArrayChars : List Char → List Char
+  | [] => []
+  | c :: rest =>
+    if c == '"' || c == '\\' then '\\' :: c :: escapeArrayChars rest
+    else c :: escapeArrayChars rest
+
+/-- One element of an array literal: the unquoted word `NULL`, or the element
+text in double quotes. Non-NULL elements are *always* quoted, so an element
+whose text is literally `NULL` survives the roundtrip. -/
+def arrayElemChars : Option String → List Char
+  | none => ['N', 'U', 'L', 'L']
+  | some t => '"' :: (escapeArrayChars t.toList ++ ['"'])
+
+/-- The elements and closing brace of a 1-D array literal. -/
+def arrayBodyChars : List (Option String) → List Char
+  | [] => ['}']
+  | [e] => arrayElemChars e ++ ['}']
+  | e :: rest => arrayElemChars e ++ ',' :: arrayBodyChars rest
+
+/-- `{"a","b",NULL}` — the literal PostgreSQL accepts for a 1-D array
+parameter of any element type (the server casts each quoted element). -/
+def renderArrayText (elems : List (Option String)) : String :=
+  String.ofList ('{' :: arrayBodyChars elems)
+
+/-- Send a 1-D array as a text parameter; `none` elements become SQL NULL. -/
+instance : PgEncode (Array (Option String)) where
+  encode a := some (renderArrayText a.toList).toUTF8
 
 /-- Read `count` length-prefixed binary array elements starting at `off`.
 Explicit recursion on the count. -/
@@ -1354,6 +1391,145 @@ theorem timestampFields_renderTimestamp {d : PlainDate} {n : Nat}
   simp only [show String.ofList (dateChars d) = renderDate d from rfl,
     show String.ofList (timeChars n) = renderTimeNanos n from rfl,
     parseDate_renderDate hyear, parseTimeNanos_renderTimeNanos hlt hmicro]
+
+/-!
+### 1-D array literals
+
+`renderArrayText` quotes every non-NULL element, so `parseArrayText` recovers
+the element list exactly — including an element whose text is the word `NULL`,
+and including embedded quotes and backslashes.
+-/
+
+/-- Scanning a quoted element body: the escapes come back off. -/
+theorem arrayScan_quoted (src : String) : ∀ (body : List Char)
+    (acc : Array (Option String)) (buf : List Char) (any : Bool) (rest : List Char),
+    arrayScan src (ArrayScan.mk acc buf true true false false any)
+        (escapeArrayChars body ++ '"' :: rest)
+      = arrayScan src (ArrayScan.mk acc (body.reverse ++ buf) true false false false any)
+          rest := by
+  intro body
+  induction body with
+  | nil =>
+    intro acc buf any rest
+    simp [escapeArrayChars, arrayScan]
+  | cons c t ih =>
+    intro acc buf any rest
+    by_cases hc : (c == '"' || c == '\\') = true
+    · rw [show escapeArrayChars (c :: t) = '\\' :: c :: escapeArrayChars t from by
+        rw [escapeArrayChars, if_pos hc]]
+      rw [show ('\\' :: c :: escapeArrayChars t) ++ '"' :: rest
+          = '\\' :: (c :: (escapeArrayChars t ++ '"' :: rest)) from rfl]
+      rw [show arrayScan src (ArrayScan.mk acc buf true true false false any)
+          ('\\' :: (c :: (escapeArrayChars t ++ '"' :: rest)))
+          = arrayScan src (ArrayScan.mk acc buf true true true false any)
+            (c :: (escapeArrayChars t ++ '"' :: rest)) from by simp [arrayScan]]
+      rw [show arrayScan src (ArrayScan.mk acc buf true true true false any)
+          (c :: (escapeArrayChars t ++ '"' :: rest))
+          = arrayScan src (ArrayScan.mk acc (c :: buf) true true false false any)
+            (escapeArrayChars t ++ '"' :: rest) from by simp [arrayScan]]
+      rw [ih acc (c :: buf) any rest]
+      simp
+    · have hq : (c == '"') = false := Bool.eq_false_iff.mpr (fun h => hc (by simp [h]))
+      have hb : (c == '\\') = false := Bool.eq_false_iff.mpr (fun h => hc (by simp [h]))
+      rw [show escapeArrayChars (c :: t) = c :: escapeArrayChars t from by
+        rw [escapeArrayChars, if_neg hc]]
+      rw [show (c :: escapeArrayChars t) ++ '"' :: rest
+          = c :: (escapeArrayChars t ++ '"' :: rest) from rfl]
+      rw [show arrayScan src (ArrayScan.mk acc buf true true false false any)
+          (c :: (escapeArrayChars t ++ '"' :: rest))
+          = arrayScan src (ArrayScan.mk acc (c :: buf) true true false false any)
+            (escapeArrayChars t ++ '"' :: rest) from by simp [arrayScan, hq, hb]]
+      rw [ih acc (c :: buf) any rest]
+      simp
+
+/-- One rendered element is scanned into one pushed element. -/
+theorem arrayScan_elem (src : String) (e : Option String) (acc : Array (Option String))
+    (any : Bool) (sep : Char) (rest : List Char)
+    (hcomma : (sep == ',') = true ∨ (sep == '}') = true) :
+    arrayScan src (ArrayScan.mk acc [] false false false false any)
+        (arrayElemChars e ++ sep :: rest)
+      = arrayScan src
+          (ArrayScan.mk (acc.push e) [] false false false (sep == '}') (sep == ',')) rest := by
+  have hsep : (sep == ',' || sep == '}') = true := by
+    rcases hcomma with h | h <;> simp [h]
+  have hquote : (sep == '"') = false := by
+    rcases hcomma with h | h <;> (rw [eq_of_beq h]; rfl)
+  cases e with
+  | none =>
+    show arrayScan src (ArrayScan.mk acc [] false false false false any)
+      ('N' :: 'U' :: 'L' :: 'L' :: sep :: rest) = _
+    simp [arrayScan, hsep, hquote]
+  | some t =>
+    show arrayScan src (ArrayScan.mk acc [] false false false false any)
+      ('"' :: (escapeArrayChars t.toList ++ ['"'] ++ sep :: rest)) = _
+    rw [show escapeArrayChars t.toList ++ ['"'] ++ sep :: rest
+        = escapeArrayChars t.toList ++ '"' :: sep :: rest from by simp]
+    rw [show arrayScan src (ArrayScan.mk acc [] false false false false any)
+        ('"' :: (escapeArrayChars t.toList ++ '"' :: sep :: rest))
+        = arrayScan src (ArrayScan.mk acc [] true true false false true)
+          (escapeArrayChars t.toList ++ '"' :: sep :: rest) from by simp [arrayScan]]
+    rw [arrayScan_quoted src t.toList acc [] true (sep :: rest)]
+    simp [arrayScan, hsep, hquote]
+
+/-- Every array body ends with the closing brace. -/
+theorem arrayBodyChars_snoc : ∀ es : List (Option String),
+    ∃ pre, arrayBodyChars es = pre ++ ['}'] := by
+  intro es
+  induction es with
+  | nil => exact ⟨[], rfl⟩
+  | cons e t ih =>
+    cases t with
+    | nil => exact ⟨arrayElemChars e, rfl⟩
+    | cons e' t' =>
+      obtain ⟨pre, hpre⟩ := ih
+      exact ⟨arrayElemChars e ++ ',' :: pre, by
+        rw [show arrayBodyChars (e :: e' :: t')
+            = arrayElemChars e ++ ',' :: arrayBodyChars (e' :: t') from rfl, hpre]
+        simp⟩
+
+theorem trimAsciiChars_bracketed (mid : List Char) :
+    trimAsciiChars ('{' :: (mid ++ ['}'])) = '{' :: (mid ++ ['}']) := by
+  unfold trimAsciiChars
+  rw [List.dropWhile_cons, if_neg (by decide)]
+  have hrev : ('{' :: (mid ++ ['}'])).reverse = '}' :: (mid.reverse ++ ['{']) := by simp
+  rw [hrev, List.dropWhile_cons, if_neg (by decide)]
+  simp
+
+/-- Scanning the whole body of a non-empty array literal. -/
+theorem arrayScan_body (src : String) : ∀ (es : List (Option String)) (e : Option String)
+    (acc : Array (Option String)) (any : Bool),
+    arrayScan src (ArrayScan.mk acc [] false false false false any)
+        (arrayBodyChars (e :: es))
+      = .ok (ArrayScan.mk (acc ++ (e :: es).toArray) [] false false false true false) := by
+  intro es
+  induction es with
+  | nil =>
+    intro e acc any
+    rw [show arrayBodyChars [e] = arrayElemChars e ++ '}' :: [] from rfl,
+      arrayScan_elem src e acc any '}' [] (Or.inr rfl)]
+    simp [arrayScan]
+  | cons e' t ih =>
+    intro e acc any
+    rw [show arrayBodyChars (e :: e' :: t)
+        = arrayElemChars e ++ ',' :: arrayBodyChars (e' :: t) from rfl,
+      arrayScan_elem src e acc any ',' _ (Or.inl rfl),
+      show ((',' : Char) == '}') = false from rfl, show ((',' : Char) == ',') = true from rfl,
+      ih e' (acc.push e) true]
+    simp
+
+/-- **A rendered 1-D array parses back to the same elements**, NULLs included —
+and an element whose text is literally `NULL` stays a value, because every
+non-NULL element is quoted. -/
+theorem parseArrayText_renderArrayText (es : List (Option String)) :
+    parseArrayText (renderArrayText es) = .ok es.toArray := by
+  obtain ⟨pre, hpre⟩ := arrayBodyChars_snoc es
+  unfold parseArrayText renderArrayText
+  rw [String.toList_ofList, hpre, trimAsciiChars_bracketed, ← hpre]
+  cases es with
+  | nil => rfl
+  | cons e t =>
+    simp only [arrayScan_body (String.ofList ('{' :: arrayBodyChars (e :: t))) t e #[] false]
+    simp
 
 /-!
 ### `numeric`: the lossless base-10000 roundtrip

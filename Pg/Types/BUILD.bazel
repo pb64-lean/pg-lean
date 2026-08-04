@@ -60,6 +60,10 @@ lean_assurance_test(
         "Pg.parseDate_renderDate",
         "Pg.parseTimeNanos_renderTimeNanos",
         "Pg.timestampFields_renderTimestamp",
+        # 1-D arrays, NULLs and quoting included.
+        "Pg.parseArrayText_renderArrayText",
+        "Pg.arrayScan_elem",
+        "Pg.arrayScan_quoted",
     ],
     deps = [":types"],
 )
