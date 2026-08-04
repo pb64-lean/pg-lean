@@ -145,6 +145,12 @@ def main : IO Unit := do
     expectOk (dBin PgNumeric 0 n.toBinary) n "numeric -inf binary"
   | .error e => throw (IO.userError s!"numeric -inf: {e}")
   expectErr (PgNumeric.fromString "1e10") "numeric rejects e-notation"
+  -- the value-level direction `PgNumeric.fromString_toString` proves (the
+  -- kernel cannot evaluate `natDigits`, so this half is checked at runtime)
+  for n in [(⟨false, #[1, 2345, 6780], 1, 3, none⟩ : PgNumeric),
+            ⟨true, #[5000], -1, 4, none⟩, ⟨false, #[], 0, 0, none⟩,
+            ⟨false, #[], 0, 2, none⟩, ⟨true, #[12, 3400], 2, 0, none⟩] do
+    expectOk (PgNumeric.fromString n.toString) n s!"numeric text roundtrip {n.toString}"
 
   -- ── interval ────────────────────────────────────────────────────────────
   expectOk (dText PgInterval 0 "1 year 2 mons 3 days 04:05:06.789")
@@ -156,6 +162,11 @@ def main : IO Unit := do
   for iv in [(⟨14, 3, 14706789000⟩ : PgInterval), ⟨-2, -3, -5000001⟩, ⟨0, 0, 0⟩] do
     expectOk (dBin PgInterval 0 iv.toBinary) iv s!"interval binary roundtrip {iv.toString}"
     expectOk (dText PgInterval 0 iv.toString) iv s!"interval text roundtrip {iv.toString}"
+  -- `PgInterval.fromString_toString` holds for every interval; spot-check the
+  -- shapes with zero components, which take the other branches of `tokens`
+  for iv in [(⟨5, 0, 0⟩ : PgInterval), ⟨0, 7, 0⟩, ⟨0, 0, -1⟩, ⟨-1, -1, -1⟩,
+             ⟨0, 0, 90061000001⟩] do
+    expectOk (PgInterval.fromString iv.toString) iv s!"interval text roundtrip {iv.toString}"
 
   -- ── arrays ──────────────────────────────────────────────────────────────
   expectOk (dText (Array Int) Oid.int4Array "{1,2,3}") #[1, 2, 3] "int array text"

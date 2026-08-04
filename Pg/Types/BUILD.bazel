@@ -64,6 +64,10 @@ lean_assurance_test(
         # 1-D arrays, NULLs and quoting included.
         "Pg.parseArrayText_renderArrayText",
         "Pg.decode_encode_array",
+        # numeric text: the rendering parses back to the same digits, with no
+        # precision lost in the base-10000 regrouping.
+        "Pg.PgNumeric.fromString_toString",
+        "Pg.PgNumeric.group4_flatMap",
         # interval text: the rendering parses back to the same triple.
         "Pg.PgInterval.fromString_toString",
         "Pg.arrayScan_elem",

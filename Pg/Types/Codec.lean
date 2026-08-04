@@ -1953,4 +1953,699 @@ theorem fromString_toString (iv : PgInterval) : fromString iv.toString = .ok iv 
 
 end PgInterval
 
+
+/-!
+### `numeric`: the text roundtrip
+
+The binary form is already proved lossless (`PgNumeric.fromBinary_toBinary`);
+this is the same statement for the text form, which is what a `numeric`
+parameter and a text-format result column actually travel as.
+
+The argument is one chain: the rendered digit string, once the parser has
+padded the integer part on the left and the fraction on the right to whole
+base-10000 groups, is *exactly* `flatMap digits4` of the value's own group
+list (`chars_groups`); regrouping it four characters at a time therefore
+returns those groups unchanged (`group4_flatMap`, the lemma that says no
+precision is lost); the group list is the digits array flanked by the zero
+groups the padding introduced (`groups_shape`); and stripping those zero
+groups restores the digits and the weight.
+
+`Canonical` states what has to hold for that to be a roundtrip rather than a
+truncation: digits in base-10000 range, no leading or trailing zero group,
+zero spelled canonically, and a display scale wide enough to reach the last
+digit. PostgreSQL's own `numeric` values satisfy it — the example at the end
+of this section is `12345.678` exactly as the server sends it.
+-/
+
+namespace PgNumeric
+
+-- ── digit-group primitives ────────────────────────────────────────────────
+
+private theorem digitChar_zero : digitChar 0 = '0' := by decide
+
+private theorem digitChar_mod (v : Nat) : digitChar (v % 10) = digitChar v := by
+  unfold digitChar
+  congr 1
+  omega
+
+private theorem natDigits_lt (v : Nat) (h : v < 10) : natDigits v = [digitChar v] := by
+  rw [natDigits, if_pos h]
+
+private theorem natDigits_ge (v : Nat) (h : ¬ v < 10) :
+    natDigits v = natDigits (v / 10) ++ [digitChar v] := by
+  rw [natDigits, if_neg h, digitChar_mod]
+
+theorem digits4_eq_padDigits {v : Nat} (h : v < 10000) : digits4 v = padDigits 4 v := by
+  unfold digits4 padDigits
+  by_cases h1 : v < 10
+  · rw [natDigits_lt v h1]
+    simp only [List.length_cons, List.length_nil]
+    rw [show v / 1000 = 0 from by omega, show v / 100 = 0 from by omega,
+      show v / 10 = 0 from by omega, digitChar_zero]
+    rfl
+  · rw [natDigits_ge v h1]
+    by_cases h2 : v / 10 < 10
+    · rw [natDigits_lt _ h2]
+      simp only [List.length_append, List.length_cons, List.length_nil]
+      rw [show v / 1000 = 0 from by omega, show v / 100 = 0 from by omega,
+        digitChar_zero]
+      rfl
+    · rw [natDigits_ge _ h2, show v / 10 / 10 = v / 100 from by omega]
+      by_cases h3 : v / 100 < 10
+      · rw [natDigits_lt _ h3]
+        simp only [List.length_append, List.length_cons, List.length_nil]
+        rw [show v / 1000 = 0 from by omega, digitChar_zero]
+        rfl
+      · rw [natDigits_ge _ h3, show v / 100 / 10 = v / 1000 from by omega,
+          natDigits_lt _ (by omega)]
+        simp only [List.length_append, List.length_cons, List.length_nil]
+        rfl
+
+private theorem length_digits4 (v : Nat) : (digits4 v).length = 4 := rfl
+
+private theorem natOfDigits_digits4 {v : Nat} (h : v < 10000) :
+    (natOfDigits 0 (digits4 v)).getD 0 = v := by
+  rw [digits4_eq_padDigits h, natOfDigits_padDigits]
+  rfl
+
+/-- Regrouping a rendered digit string recovers exactly the groups it came
+from. This is the lemma that says no precision is lost. -/
+theorem group4_flatMap : ∀ (ds : List Nat), (∀ d ∈ ds, d < 10000) →
+    ∀ out : Array UInt16,
+    group4 (ds.flatMap digits4) out = out ++ (ds.map UInt16.ofNat).toArray := by
+  intro ds
+  induction ds with
+  | nil => intro _ out; simp [group4]
+  | cons v t ih =>
+    intro hall out
+    have hv : v < 10000 := hall v (List.mem_cons_self ..)
+    simp only [List.flatMap_cons, digits4, List.cons_append, group4,
+      List.nil_append, List.map_cons]
+    rw [show (natOfDigits 0 [digitChar (v / 1000), digitChar (v / 100), digitChar (v / 10),
+        digitChar v]).getD 0 = v from natOfDigits_digits4 hv,
+      ih (fun d hd => hall d (List.mem_cons_of_mem _ hd))]
+    simp
+
+
+
+-- ── the group list ────────────────────────────────────────────────────────
+
+private theorem digitAt_neg {n : PgNumeric} {i : Int} (h : i < 0) : n.digitAt i = 0 := by
+  unfold digitAt; rw [if_pos h]
+
+private theorem digitAt_ge {n : PgNumeric} {i : Int} (h : (n.digits.size : Int) ≤ i) :
+    n.digitAt i = 0 := by
+  unfold digitAt
+  by_cases hn : i < 0
+  · rw [if_pos hn]
+  · rw [if_neg hn, Array.getElem?_eq_none (by omega)]
+    rfl
+
+private theorem digitAt_lt {n : PgNumeric} {s : Nat} (h : s < n.digits.size) :
+    n.digitAt (s : Int) = (n.digits[s]'h).toNat := by
+  unfold digitAt
+  rw [if_neg (by omega), Array.getElem?_eq_getElem (by omega)]
+  rfl
+
+theorem groupList_length {n : PgNumeric} : ∀ (k : Nat) (s : Int),
+    (n.groupList s k).length = k := by
+  intro k
+  induction k with
+  | zero => intro s; rfl
+  | succ j ih => intro s; simp only [groupList, List.length_cons, ih]
+
+theorem groupList_append {n : PgNumeric} : ∀ (a b : Nat) (s : Int),
+    n.groupList s (a + b) = n.groupList s a ++ n.groupList (s + (a : Int)) b := by
+  intro a
+  induction a with
+  | zero => intro b s; simp [groupList]
+  | succ j ih =>
+    intro b s
+    have hidx : s + ((j + 1 : Nat) : Int) = (s + 1) + (j : Int) := by omega
+    rw [show j + 1 + b = (j + b) + 1 from by omega]
+    show n.digitAt s :: n.groupList (s + 1) (j + b) = _
+    rw [ih b (s + 1), hidx]
+    show _ = (n.digitAt s :: n.groupList (s + 1) j) ++ _
+    rw [List.cons_append]
+
+theorem groupList_zeros {n : PgNumeric} : ∀ (k : Nat) (s : Int), s + (k : Int) ≤ 0 →
+    n.groupList s k = List.replicate k 0 := by
+  intro k
+  induction k with
+  | zero => intro s _; rfl
+  | succ j ih =>
+    intro s hs
+    show n.digitAt s :: n.groupList (s + 1) j = _
+    rw [digitAt_neg (by omega), ih (s + 1) (by omega), List.replicate_succ]
+
+theorem groupList_zeros_right {n : PgNumeric} : ∀ (k : Nat) (s : Int),
+    (n.digits.size : Int) ≤ s → n.groupList s k = List.replicate k 0 := by
+  intro k
+  induction k with
+  | zero => intro s _; rfl
+  | succ j ih =>
+    intro s hs
+    show n.digitAt s :: n.groupList (s + 1) j = _
+    rw [digitAt_ge hs, ih (s + 1) (by omega), List.replicate_succ]
+
+theorem groupList_digits {n : PgNumeric} : ∀ (k s : Nat), s + k ≤ n.digits.size →
+    (n.groupList (s : Int) k).map UInt16.ofNat = (n.digits.toList.drop s).take k := by
+  intro k
+  induction k with
+  | zero => intro s _; simp [groupList]
+  | succ j ih =>
+    intro s hs
+    have hlt : s < n.digits.size := by omega
+    show (UInt16.ofNat (n.digitAt (s : Int)) :: _) = _
+    rw [digitAt_lt hlt, UInt16.ofNat_toNat,
+      show ((s : Int) + 1) = ((s + 1 : Nat) : Int) from by omega,
+      ih (s + 1) (by omega)]
+    rw [show n.digits.toList.drop s
+        = n.digits.toList[s]'(by simp only [Array.length_toList]; omega)
+          :: n.digits.toList.drop (s + 1) from
+      List.drop_eq_getElem_cons (by simp only [Array.length_toList]; omega)]
+    simp
+
+theorem groupList_lt {n : PgNumeric} (hall : ∀ i, n.digitAt i < 10000) :
+    ∀ (k : Nat) (s : Int), ∀ d ∈ n.groupList s k, d < 10000 := by
+  intro k
+  induction k with
+  | zero => intro s d hd; exact absurd hd List.not_mem_nil
+  | succ j ih =>
+    intro s d hd
+    rcases List.mem_cons.mp hd with rfl | hd
+    · exact hall s
+    · exact ih (s + 1) d hd
+
+theorem length_flatMap_digits4 : ∀ (l : List Nat),
+    (l.flatMap digits4).length = 4 * l.length := by
+  intro l
+  induction l with
+  | nil => rfl
+  | cons v t ih =>
+    simp only [List.flatMap_cons, List.length_append, ih, length_digits4, List.length_cons]
+    omega
+
+
+
+-- ── the rendered digit string is exactly the group list, regrouped ────────
+
+private theorem digitChar_eq_zero {x : Nat} (h : x % 10 = 0) : digitChar x = '0' := by
+  unfold digitChar
+  rw [h]
+
+private theorem flatMap_padDigits_eq : ∀ (l : List Nat), (∀ d ∈ l, d < 10000) →
+    l.flatMap (padDigits 4) = l.flatMap digits4 := by
+  intro l
+  induction l with
+  | nil => intro _; rfl
+  | cons v t ih =>
+    intro hall
+    simp only [List.flatMap_cons, digits4_eq_padDigits (hall v (List.mem_cons_self ..)),
+      ih (fun d hd => hall d (List.mem_cons_of_mem _ hd))]
+
+private theorem groupList_snoc {n : PgNumeric} (q : Nat) (s : Int) :
+    n.groupList s (q + 1) = n.groupList s q ++ [n.digitAt (s + (q : Int))] :=
+  groupList_append q 1 s
+
+theorem alignInt_intChars {n : PgNumeric} (hall : ∀ i, n.digitAt i < 10000) :
+    alignInt n.intChars = (n.groupList n.baseIndex (n.intGroups + 1)).flatMap digits4 := by
+  have hL1 : 1 ≤ (natDigits (n.digitAt n.baseIndex)).length :=
+    List.length_pos_iff.mpr (natDigits_ne_nil _)
+  have hL4 : (natDigits (n.digitAt n.baseIndex)).length ≤ 4 :=
+    natDigits_length_le 3 _ (by have := hall n.baseIndex; omega)
+  have hflat : (n.groupList (n.baseIndex + 1) n.intGroups).flatMap (padDigits 4) =
+      (n.groupList (n.baseIndex + 1) n.intGroups).flatMap digits4 :=
+    flatMap_padDigits_eq _ (groupList_lt hall _ _)
+  have hlen : ((n.groupList (n.baseIndex + 1) n.intGroups).flatMap digits4).length
+      = 4 * n.intGroups := by
+    rw [length_flatMap_digits4, groupList_length]
+  show List.replicate ((4 - n.intChars.length % 4) % 4) '0' ++ n.intChars = _
+  unfold intChars
+  rw [hflat]
+  rw [show ((4 : Nat) - (natDigits (n.digitAt n.baseIndex) ++
+      (n.groupList (n.baseIndex + 1) n.intGroups).flatMap digits4).length % 4) % 4
+      = 4 - (natDigits (n.digitAt n.baseIndex)).length from by
+    rw [List.length_append, hlen]; omega]
+  rw [← List.append_assoc]
+  show padDigits 4 (n.digitAt n.baseIndex) ++ _ = _
+  rw [show n.groupList n.baseIndex (n.intGroups + 1)
+      = n.digitAt n.baseIndex :: n.groupList (n.baseIndex + 1) n.intGroups from rfl,
+    List.flatMap_cons, digits4_eq_padDigits (hall n.baseIndex)]
+
+private theorem digits4_take {v r : Nat} (h1 : 0 < r) (h2 : r < 4)
+    (h : v % 10 ^ (4 - r) = 0) :
+    (digits4 v).take r ++ List.replicate (4 - r) '0' = digits4 v := by
+  have hr : r = 1 ∨ r = 2 ∨ r = 3 := by omega
+  unfold digits4
+  rcases hr with rfl | rfl | rfl
+  · have h' : v % 1000 = 0 := h
+    rw [digitChar_eq_zero (show v / 100 % 10 = 0 from by omega),
+      digitChar_eq_zero (show v / 10 % 10 = 0 from by omega),
+      digitChar_eq_zero (show v % 10 = 0 from by omega)]
+    rfl
+  · have h' : v % 100 = 0 := h
+    rw [digitChar_eq_zero (show v / 10 % 10 = 0 from by omega),
+      digitChar_eq_zero (show v % 10 = 0 from by omega)]
+    rfl
+  · have h' : v % 10 = 0 := h
+    rw [digitChar_eq_zero (show v % 10 = 0 from by omega)]
+    rfl
+
+theorem length_fracChars {n : PgNumeric} (k : Nat) : (n.fracChars k).length = k := by
+  unfold fracChars
+  rw [List.length_take, length_flatMap_digits4, groupList_length]
+  omega
+
+theorem alignFrac_fracChars {n : PgNumeric}
+    (htail : n.dscale % 4 ≠ 0 →
+      n.digitAt (n.weight + 1 + (n.dscale / 4 : Nat)) % 10 ^ (4 - n.dscale % 4) = 0) :
+    alignFrac (n.fracChars n.dscale) =
+      (n.groupList (n.weight + 1) ((n.dscale + 3) / 4)).flatMap digits4 := by
+  show n.fracChars n.dscale ++
+    List.replicate ((4 - (n.fracChars n.dscale).length % 4) % 4) '0' = _
+  rw [length_fracChars]
+  by_cases hr : n.dscale % 4 = 0
+  · rw [show ((4 : Nat) - n.dscale % 4) % 4 = 0 from by omega, List.replicate_zero,
+      List.append_nil]
+    unfold fracChars
+    rw [List.take_of_length_le (by
+      rw [length_flatMap_digits4, groupList_length]; omega)]
+  · rw [show ((4 : Nat) - n.dscale % 4) % 4 = 4 - n.dscale % 4 from by omega]
+    have hceil : (n.dscale + 3) / 4 = n.dscale / 4 + 1 := by omega
+    have hG : ((n.groupList (n.weight + 1) (n.dscale / 4)).flatMap digits4).length
+        = n.dscale - n.dscale % 4 := by
+      rw [length_flatMap_digits4, groupList_length]; omega
+    unfold fracChars
+    rw [hceil, groupList_snoc, List.flatMap_append,
+      show ([n.digitAt (n.weight + 1 + (n.dscale / 4 : Nat))] : List Nat).flatMap digits4
+        = digits4 (n.digitAt (n.weight + 1 + (n.dscale / 4 : Nat))) from by simp]
+    rw [List.take_append, hG,
+      show n.dscale - (n.dscale - n.dscale % 4) = n.dscale % 4 from by omega,
+      List.take_of_length_le (l := (n.groupList (n.weight + 1) (n.dscale / 4)).flatMap digits4)
+        (by rw [hG]; omega),
+      List.append_assoc,
+      digits4_take (Nat.pos_of_ne_zero hr) (by omega) (htail hr)]
+
+
+
+-- ── stripping the alignment's zero groups ─────────────────────────────────
+
+private theorem dropLeadZeros_replicate : ∀ (p : Nat) (l : List UInt16),
+    dropLeadZeros (List.replicate p 0 ++ l) = dropLeadZeros l := by
+  intro p
+  induction p with
+  | zero => intro l; rw [List.replicate_zero, List.nil_append]
+  | succ j ih =>
+    intro l
+    rw [List.replicate_succ, List.cons_append]
+    show (if ((0 : UInt16) == 0) = true then dropLeadZeros (List.replicate j 0 ++ l)
+      else _) = _
+    simp only [beq_self_eq_true, if_true, ih l]
+
+private theorem dropLeadZeros_replicate_nil (p : Nat) :
+    dropLeadZeros (List.replicate p 0) = [] := by
+  rw [← List.append_nil (List.replicate p (0 : UInt16)), dropLeadZeros_replicate]
+  rfl
+
+private theorem dropLeadZeros_cons {d : UInt16} (h : d ≠ 0) (rest : List UInt16) :
+    dropLeadZeros (d :: rest) = d :: rest := by
+  show (if d == 0 then _ else d :: rest) = _
+  rw [if_neg (by simpa using h)]
+
+private theorem dropTrailZeros_replicate (l : List UInt16) (q : Nat) :
+    dropTrailZeros (l ++ List.replicate q 0) = dropTrailZeros l := by
+  unfold dropTrailZeros
+  rw [List.reverse_append, List.reverse_replicate, dropLeadZeros_replicate]
+
+private theorem dropTrailZeros_concat {d : UInt16} (h : d ≠ 0) (l : List UInt16) :
+    dropTrailZeros (l ++ [d]) = l ++ [d] := by
+  unfold dropTrailZeros
+  rw [List.reverse_append, show ([d] : List UInt16).reverse = [d] from rfl,
+    List.cons_append, List.nil_append, dropLeadZeros_cons h, List.reverse_cons,
+    List.reverse_reverse]
+
+-- ── the parsed group list ─────────────────────────────────────────────────
+
+/-- What `fromBinary` and `fromString` both produce, and exactly what the text
+form can round-trip: every base-10000 digit in range, no leading or trailing
+zero group, zero spelled canonically, and a display scale wide enough to show
+every digit. -/
+structure Canonical (n : PgNumeric) : Prop where
+  /-- Not NaN/±Infinity. -/
+  finite : n.special = none
+  /-- Every digit is a base-10000 digit. -/
+  digitsLt : ∀ d ∈ n.digits, d.toNat < 10000
+  /-- No leading zero group. -/
+  leadNz : n.digits.size ≠ 0 → n.digitAt 0 ≠ 0
+  /-- No trailing zero group. -/
+  trailNz : n.digits.size ≠ 0 → n.digitAt ((n.digits.size : Int) - 1) ≠ 0
+  /-- Zero carries no sign and no weight. -/
+  zeroCanon : n.digits.size = 0 → n.neg = false ∧ n.weight = 0
+  /-- The display scale reaches the last digit. -/
+  covers : (n.digits.size : Int) ≤ n.weight + 1 + (((n.dscale + 3) / 4 : Nat) : Int)
+  /-- A partly-shown final group has nothing but zeros past the cut. -/
+  tail : n.dscale % 4 ≠ 0 →
+    n.digitAt (n.weight + 1 + (n.dscale / 4 : Nat)) % 10 ^ (4 - n.dscale % 4) = 0
+
+/-- Out-of-range group indices read as `0`, so a bound on the array is a bound
+on every group. -/
+theorem Canonical.inRange {n : PgNumeric} (hc : Canonical n) : ∀ i, n.digitAt i < 10000 := by
+  intro i
+  unfold digitAt
+  split
+  · omega
+  · rename_i hi
+    by_cases hlt : i.toNat < n.digits.size
+    · rw [Array.getElem?_eq_getElem hlt]
+      exact hc.digitsLt _ (Array.getElem_mem hlt)
+    · rw [Array.getElem?_eq_none (by omega)]
+      exact (by decide)
+
+/-- The number of leading zero groups the left-alignment introduced. -/
+private def leadPad (n : PgNumeric) : Nat := (-n.weight).toNat
+
+/-- Total base-10000 groups in the rendering. -/
+private def totalGroups (n : PgNumeric) : Nat := n.intGroups + 1 + (n.dscale + 3) / 4
+
+private theorem chars_groups {n : PgNumeric} (hc : Canonical n) :
+    alignInt n.intChars ++ alignFrac (n.fracChars n.dscale) =
+      (n.groupList n.baseIndex n.totalGroups).flatMap digits4 := by
+  rw [alignInt_intChars hc.inRange, alignFrac_fracChars hc.tail, ← List.flatMap_append]
+  unfold totalGroups
+  rw [groupList_append (n.intGroups + 1) ((n.dscale + 3) / 4) n.baseIndex,
+    show n.baseIndex + ((n.intGroups + 1 : Nat) : Int) = n.weight + 1 from by
+      unfold baseIndex; omega]
+
+private theorem groups_shape {n : PgNumeric} (hc : Canonical n) :
+    (n.groupList n.baseIndex n.totalGroups).map UInt16.ofNat =
+      List.replicate n.leadPad 0 ++
+        (n.digits.toList ++ List.replicate (n.totalGroups - n.leadPad - n.digits.size) 0) := by
+  have hbase : n.baseIndex + ((n.leadPad : Nat) : Int) = 0 := by
+    unfold baseIndex leadPad intGroups; omega
+  have hsum : n.totalGroups = n.leadPad + (n.digits.size +
+      (n.totalGroups - n.leadPad - n.digits.size)) := by
+    unfold totalGroups leadPad intGroups
+    have := hc.covers
+    omega
+  rw [hsum, groupList_append, hbase, groupList_append,
+    groupList_zeros n.leadPad n.baseIndex (by omega),
+    groupList_zeros_right _ (0 + (n.digits.size : Nat)) (by omega)]
+  have hd := groupList_digits (n := n) n.digits.size 0 (by omega)
+  rw [show (((0 : Nat) : Int)) = (0 : Int) from rfl, List.drop_zero,
+    List.take_of_length_le (by simp only [Array.length_toList]; omega)] at hd
+  rw [List.map_append, List.map_append, hd]
+  simp
+
+
+
+private theorem length_alignInt_intChars {n : PgNumeric} (hc : Canonical n) :
+    (alignInt n.intChars).length = 4 * (n.intGroups + 1) := by
+  rw [alignInt_intChars hc.inRange, length_flatMap_digits4, groupList_length]
+
+private theorem raw_groups {n : PgNumeric} (hc : Canonical n) :
+    (group4 (alignInt n.intChars ++ alignFrac (n.fracChars n.dscale)) #[]).toList =
+      List.replicate n.leadPad 0 ++
+        (n.digits.toList ++
+          List.replicate (n.totalGroups - n.leadPad - n.digits.size) 0) := by
+  rw [chars_groups hc, group4_flatMap _ (groupList_lt hc.inRange _ _)]
+  simp only [Array.toList_append, List.nil_append]
+  exact groups_shape hc
+
+private theorem dropTrailZeros_self {l : List UInt16}
+    (h : ∀ d, l.getLast? = some d → d ≠ 0) : dropTrailZeros l = l := by
+  unfold dropTrailZeros
+  cases hr : l.reverse with
+  | nil =>
+    rw [show l = [] from by rw [← List.reverse_reverse l, hr]; rfl]
+    rfl
+  | cons d u =>
+    have hd : d ≠ 0 := h d (by rw [← List.head?_reverse, hr]; rfl)
+    rw [dropLeadZeros_cons hd, ← hr, List.reverse_reverse]
+
+theorem ofDigitChars_chars {n : PgNumeric} (hc : Canonical n) :
+    ofDigitChars n.neg n.intChars (n.fracChars n.dscale) = n := by
+  have hraw := raw_groups hc
+  have hlenI := length_alignInt_intChars hc
+  have hds := length_fracChars (n := n) n.dscale
+  have hlenL : n.digits.toList.length = n.digits.size := Array.length_toList
+  unfold ofDigitChars
+  rw [hraw, hlenI, hds]
+  by_cases hsz : n.digits.size = 0
+  · have hnil : n.digits.toList = [] := by
+      rw [← Array.length_toList] at hsz
+      exact List.eq_nil_of_length_eq_zero hsz
+    obtain ⟨hneg, hw⟩ := hc.zeroCanon hsz
+    have hsp := hc.finite
+    have hde : n.digits = #[] := Array.eq_empty_of_size_eq_zero hsz
+    rw [hnil, List.nil_append, dropLeadZeros_replicate, dropLeadZeros_replicate_nil]
+    show ofGroups n.neg n.dscale [] _ = n
+    unfold ofGroups
+    show PgNumeric.mk false #[] 0 n.dscale none = n
+    obtain ⟨neg, digits, weight, dscale, special⟩ := n
+    simp only at hneg hw hsp hde ⊢
+    rw [hneg, hw, hsp, hde]
+  · have hd0 : ∀ d rest, n.digits.toList = d :: rest → d ≠ 0 := by
+      intro d rest hl hz
+      have h := hc.leadNz hsz
+      rw [show (0 : Int) = ((0 : Nat) : Int) from rfl,
+        digitAt_lt (n := n) (s := 0) (by omega)] at h
+      apply h
+      rw [show n.digits[0]'(by omega) = n.digits.toList[0]'(by omega) from
+        (Array.getElem_toList _).symm]
+      simp only [hl, List.getElem_cons_zero, hz]
+      rfl
+    have hdlast : ∀ d, n.digits.toList.getLast? = some d → d ≠ 0 := by
+      intro d hg hz
+      have h := hc.trailNz hsz
+      rw [show ((n.digits.size : Int) - 1) = (((n.digits.size - 1 : Nat)) : Int) from by omega,
+        digitAt_lt (n := n) (s := n.digits.size - 1) (by omega)] at h
+      apply h
+      rw [List.getLast?_eq_getElem?,
+        List.getElem?_eq_getElem (by omega)] at hg
+      rw [show n.digits[n.digits.size - 1]'(by omega)
+          = n.digits.toList[n.digits.size - 1]'(by omega) from
+        (Array.getElem_toList _).symm]
+      have : n.digits.toList[n.digits.toList.length - 1]'(by omega) = d :=
+        Option.some.inj hg
+      rw [show n.digits.toList[n.digits.size - 1]'(by omega)
+          = n.digits.toList[n.digits.toList.length - 1]'(by omega) from by
+        first | rfl | (congr 1; omega),
+        this, hz]
+      rfl
+    cases hl : n.digits.toList with
+    | nil => exact absurd (by rw [← hlenL, hl]; rfl) hsz
+    | cons d0 rest =>
+      rw [List.cons_append, dropLeadZeros_replicate,
+        dropLeadZeros_cons (hd0 d0 rest hl)]
+      show ofGroups n.neg n.dscale (d0 :: (rest ++ _)) _ = n
+      unfold ofGroups
+      rw [show (d0 :: (rest ++ List.replicate (n.totalGroups - n.leadPad - n.digits.size) 0))
+          = n.digits.toList ++ List.replicate (n.totalGroups - n.leadPad - n.digits.size) 0 from by
+        rw [hl, List.cons_append],
+        dropTrailZeros_replicate, dropTrailZeros_self hdlast, hl]
+      show PgNumeric.mk n.neg (d0 :: rest).toArray _ n.dscale none = n
+      have hrl : rest.length + 1 = n.digits.size := by rw [← hlenL, hl]; rfl
+      have hw : ((4 * (n.intGroups + 1) : Nat) : Int) / 4 - 1 -
+          (((List.replicate n.leadPad (0 : UInt16) ++
+              (d0 :: rest ++ List.replicate
+                (n.totalGroups - n.leadPad - n.digits.size) 0)).length
+            - (d0 :: rest ++ List.replicate
+                (n.totalGroups - n.leadPad - n.digits.size) 0).length : Nat) : Int)
+          = n.weight := by
+        simp only [List.length_append, List.length_replicate, List.length_cons]
+        unfold leadPad intGroups
+        have := hc.covers
+        omega
+      have hsp := hc.finite
+      rw [hw, ← hl, Array.toArray_toList]
+      obtain ⟨neg, digits, weight, dscale, special⟩ := n
+      simp only at hsp ⊢
+      rw [hsp]
+
+
+-- ── every rendered character is a digit, `-` or `.` ───────────────────────
+
+private theorem isAsciiDigit_digitChar' (x : Nat) : isAsciiDigit (digitChar x) = true := by
+  rw [← digitChar_mod]
+  exact isAsciiDigit_digitChar (Nat.mod_lt _ (by omega))
+
+private theorem digits_of_mem_digits4 {v : Nat} {c : Char} (h : c ∈ digits4 v) :
+    isAsciiDigit c = true := by
+  unfold digits4 at h
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at h
+  rcases h with rfl | rfl | rfl | rfl <;> exact isAsciiDigit_digitChar' _
+
+private theorem digits_of_mem_flatMap : ∀ (l : List Nat) (c : Char),
+    c ∈ l.flatMap digits4 → isAsciiDigit c = true := by
+  intro l
+  induction l with
+  | nil => intro c h; exact absurd h List.not_mem_nil
+  | cons v t ih =>
+    intro c h
+    rw [List.flatMap_cons, List.mem_append] at h
+    rcases h with h | h
+    · exact digits_of_mem_digits4 h
+    · exact ih c h
+
+theorem digits_of_mem_fracChars {n : PgNumeric} {k : Nat} {c : Char}
+    (h : c ∈ n.fracChars k) : isAsciiDigit c = true := by
+  unfold fracChars at h
+  exact digits_of_mem_flatMap _ c (List.mem_of_mem_take h)
+
+theorem digits_of_mem_intChars {n : PgNumeric} (hall : ∀ i, n.digitAt i < 10000)
+    {c : Char} (h : c ∈ n.intChars) : isAsciiDigit c = true := by
+  unfold intChars at h
+  rw [List.mem_append] at h
+  rcases h with h | h
+  · exact isAsciiDigit_of_mem_natDigits _ c h
+  · rw [flatMap_padDigits_eq _ (groupList_lt hall _ _)] at h
+    exact digits_of_mem_flatMap _ c h
+
+theorem intChars_ne_nil {n : PgNumeric} : n.intChars ≠ [] := by
+  unfold intChars
+  exact fun h => absurd (List.append_eq_nil_iff.mp h).1 (natDigits_ne_nil _)
+
+theorem chars_charset {n : PgNumeric} (hall : ∀ i, n.digitAt i < 10000) :
+    ∀ c ∈ n.chars, isAsciiDigit c = true ∨ c = '-' ∨ c = '.' := by
+  intro c hc
+  unfold chars at hc
+  rw [List.mem_append, List.mem_append] at hc
+  rcases hc with (hc | hc) | hc
+  · split at hc
+    · simp only [List.mem_cons, List.not_mem_nil, or_false] at hc
+      exact Or.inr (Or.inl hc)
+    · exact absurd hc List.not_mem_nil
+  · exact Or.inl (digits_of_mem_intChars hall hc)
+  · split at hc
+    · exact absurd hc List.not_mem_nil
+    · rcases List.mem_cons.mp hc with rfl | hc
+      · exact Or.inr (Or.inr rfl)
+      · exact Or.inl (digits_of_mem_fracChars hc)
+
+private theorem no_space_of_charset {l : List Char}
+    (h : ∀ c ∈ l, isAsciiDigit c = true ∨ c = '-' ∨ c = '.') :
+    ∀ c ∈ l, isAsciiSpace c = false := by
+  intro c hc
+  rcases h c hc with h | rfl | rfl
+  · cases hs : isAsciiSpace c with
+    | false => rfl
+    | true =>
+      exfalso
+      simp only [isAsciiSpace, Bool.or_eq_true, beq_iff_eq] at hs
+      rcases hs with ((rfl | rfl) | rfl) | rfl <;> exact absurd h (by decide)
+  · rfl
+  · rfl
+
+private theorem specialOf_eq_none {l : List Char}
+    (h : ∀ c ∈ l, isAsciiDigit c = true ∨ c = '-' ∨ c = '.') : specialOf l = none := by
+  unfold specialOf
+  split
+  · exact absurd (h 'N' (by simp)) (by decide)
+  · exact absurd (h 'I' (by simp)) (by decide)
+  · exact absurd (h 'I' (by simp)) (by decide)
+  · exact absurd (h 'i' (by simp)) (by decide)
+  · exact absurd (h 'I' (by simp)) (by decide)
+  · exact absurd (h 'i' (by simp)) (by decide)
+  · rfl
+
+
+
+private theorem dot_not_mem_intChars {n : PgNumeric} (hall : ∀ i, n.digitAt i < 10000) :
+    '.' ∉ n.intChars := fun h => absurd (digits_of_mem_intChars hall h) (by decide)
+
+private theorem dot_not_mem_fracChars {n : PgNumeric} {k : Nat} :
+    '.' ∉ n.fracChars k := fun h => absurd (digits_of_mem_fracChars h) (by decide)
+
+private theorem all_digits_intChars {n : PgNumeric} (hall : ∀ i, n.digitAt i < 10000) :
+    n.intChars.all isAsciiDigit = true :=
+  List.all_eq_true.mpr (fun c hc => digits_of_mem_intChars hall hc)
+
+private theorem all_digits_fracChars {n : PgNumeric} {k : Nat} :
+    (n.fracChars k).all isAsciiDigit = true :=
+  List.all_eq_true.mpr (fun c hc => digits_of_mem_fracChars hc)
+
+private theorem if_isEmpty_intChars {n : PgNumeric} :
+    (if n.intChars.isEmpty then ['0'] else n.intChars) = n.intChars := by
+  cases hi : n.intChars with
+  | nil => exact absurd hi intChars_ne_nil
+  | cons c t => rfl
+
+private theorem ofSigned_body {n : PgNumeric} (hc : Canonical n) (orig : String) :
+    ofSigned orig n.neg (n.intChars ++
+      (if n.dscale = 0 then [] else '.' :: n.fracChars n.dscale)) = .ok n := by
+  unfold ofSigned
+  by_cases hd : n.dscale = 0
+  · rw [if_pos hd, List.append_nil,
+      List.splitOn_eq_singleton (dot_not_mem_intChars hc.inRange)]
+    show ofParts orig n.neg n.intChars [] = _
+    unfold ofParts
+    rw [if_pos (by rw [if_isEmpty_intChars, all_digits_intChars hc.inRange]; rfl),
+      if_isEmpty_intChars,
+      show ([] : List Char) = n.fracChars n.dscale from by rw [hd]; rfl,
+      ofDigitChars_chars hc]
+  · rw [if_neg hd, List.splitOn_append_cons_self_of_not_mem
+      (dot_not_mem_intChars hc.inRange),
+      List.splitOn_eq_singleton (dot_not_mem_fracChars (n := n) (k := n.dscale))]
+    show ofParts orig n.neg n.intChars (n.fracChars n.dscale) = _
+    unfold ofParts
+    rw [if_pos (by
+      rw [if_isEmpty_intChars, all_digits_intChars hc.inRange,
+        all_digits_fracChars (n := n) (k := n.dscale)]
+      rfl),
+      if_isEmpty_intChars, ofDigitChars_chars hc]
+
+private theorem ofSigned_body' {n : PgNumeric} (hc : Canonical n) (orig : String)
+    (b : Bool) (hb : b = n.neg) :
+    ofSigned orig b (n.intChars ++
+      (if n.dscale = 0 then [] else '.' :: n.fracChars n.dscale)) = .ok n := by
+  rw [hb]; exact ofSigned_body hc orig
+
+/-- **A `numeric` renders and parses back to itself.** Every base-10000 digit,
+the sign, the weight and the display scale are recovered exactly — no silent
+precision loss — for every canonical value: digits in range, no leading or
+trailing zero group, zero spelled canonically, and a display scale wide enough
+to show the last digit. -/
+theorem fromString_toString {n : PgNumeric} (hc : Canonical n) :
+    fromString n.toString = .ok n := by
+  have hcs := chars_charset hc.inRange
+  have hns := no_space_of_charset hcs
+  unfold fromString
+  rw [toString_eq hc.finite, String.toList_ofList, trimAsciiChars_of_no_space hns]
+  unfold ofChars
+  rw [specialOf_eq_none hcs]
+  show ofDecimalChars (String.ofList n.chars) n.chars = _
+  unfold chars
+  cases hneg : n.neg with
+  | true =>
+    rw [if_pos rfl]
+    show ofDecimalChars _ ('-' :: (n.intChars ++ _)) = _
+    simp only [ofDecimalChars, beq_self_eq_true, if_true]
+    exact ofSigned_body' hc _ true hneg.symm
+  | false =>
+    rw [if_neg (by simp), List.nil_append]
+    cases hi : n.intChars with
+    | nil => exact absurd hi intChars_ne_nil
+    | cons c t =>
+      have hdig : isAsciiDigit c = true :=
+        digits_of_mem_intChars hc.inRange (by rw [hi]; exact List.mem_cons_self ..)
+      rw [List.cons_append]
+      simp only [ofDecimalChars, beq_false_of_ne (show c ≠ '-' from by
+          intro h; rw [h] at hdig; exact absurd hdig (by decide)),
+        beq_false_of_ne (show c ≠ '+' from by
+          intro h; rw [h] at hdig; exact absurd hdig (by decide))]
+      rw [← List.cons_append, ← hi]
+      exact ofSigned_body' hc _ false hneg.symm
+
+
+
+/-- Non-vacuity: `12345.678` as PostgreSQL sends it — base-10000 digits
+`1`, `2345`, `6780` with weight 1 and display scale 3 — is canonical, so the
+law above applies to it. (`Test/CodecTest.lean` checks the rendering itself;
+`natDigits` is well-founded recursion, which the kernel will not evaluate.) -/
+example : Canonical { neg := false, digits := #[1, 2345, 6780], weight := 1, dscale := 3 } := by
+  refine ⟨rfl, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide
+
+end PgNumeric
+
 end Pg

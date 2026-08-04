@@ -303,4 +303,10 @@ theorem trimAsciiChars_eq_self {l : List Char}
         (by rw [h2 d (by rw [hl]; exact hd)]; exact Bool.false_ne_true), ← hr,
         List.reverse_reverse]
 
+/-- Trimming is the identity on a string with no ASCII whitespace at all. -/
+theorem trimAsciiChars_of_no_space {l : List Char}
+    (h : ∀ c ∈ l, isAsciiSpace c = false) : trimAsciiChars l = l :=
+  trimAsciiChars_eq_self (fun c hc => h c (List.mem_of_mem_head? hc))
+    (fun c hc => h c (List.mem_of_getLast? hc))
+
 end Pg

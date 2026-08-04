@@ -225,6 +225,17 @@ section docstring states its scope.
   a zero-padded decimal field reads back as the number it was rendered from, at
   any width.
 
+  On the text side, `PgNumeric.fromString_toString` — **a rendered `numeric`
+  parses back to the same value**: every base-10000 digit, the sign, the
+  weight and the display scale, with no precision lost in the regrouping. It
+  holds for every `PgNumeric.Canonical` value, which is what PostgreSQL sends:
+  digits in base-10000 range, no leading or trailing zero group, zero spelled
+  canonically, and a display scale wide enough to reach the last digit. (Those
+  hypotheses are the law, not fine print — without the last one the rendering
+  genuinely truncates, and the theorem would be false.) The lemma the whole
+  argument turns on is `PgNumeric.group4_flatMap`: regrouping a rendered digit
+  string four characters at a time returns exactly the groups it came from.
+
   For `interval`, the text side matches the binary one:
   `PgInterval.fromString_toString` — **a rendered interval parses back to the
   same triple**, unconditionally. Months, days and microseconds are

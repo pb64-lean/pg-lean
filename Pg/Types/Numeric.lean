@@ -54,25 +54,35 @@ negative weight renders the single group `0`, hence `Int.toNat`. -/
 `weight` (negative) when the integer part is the lone `0` group — in both cases
 `weight - intGroups`, so the rendered groups are always
 `baseIndex … baseIndex + intGroups` followed by the fraction. -/
-@[expose] def baseIndex (n : PgNumeric) : Int := n.weight - Int.ofNat n.intGroups
+@[expose] def baseIndex (n : PgNumeric) : Int := n.weight - (n.intGroups : Int)
+
+/-- The base-10000 groups a rendering covers: `k` of them, from group index
+`start` outwards. Written as a list so the parser's regrouping can be matched
+against it directly. -/
+@[expose] def groupList (n : PgNumeric) (start : Int) : Nat → List Nat
+  | 0 => []
+  | k + 1 => n.digitAt start :: n.groupList (start + 1) k
+
+/-- One base-10000 group as exactly four decimal characters. Equal to
+`padDigits 4` on every in-range group (`< 10000`); out of range it keeps the
+low four digits, which is what the fraction rendering always did. -/
+@[expose] def digits4 (v : Nat) : List Char :=
+  [digitChar (v / 1000), digitChar (v / 100), digitChar (v / 10), digitChar v]
 
 /-- Integer-part characters: the leading group unpadded, every later group
-zero-padded to four. `k` counts the groups after the leading one. -/
-@[expose] def intChars (n : PgNumeric) : Nat → List Char
-  | 0 => natDigits (n.digitAt n.baseIndex)
-  | k + 1 => n.intChars k ++ padDigits 4 (n.digitAt (n.baseIndex + Int.ofNat (k + 1)))
+zero-padded to four. -/
+@[expose] def intChars (n : PgNumeric) : List Char :=
+  natDigits (n.digitAt n.baseIndex) ++
+    (n.groupList (n.baseIndex + 1) n.intGroups).flatMap (padDigits 4)
 
-/-- Fraction characters: `k` decimal places, place `j` taken from base-10000
-group `weight + 1 + j / 4`. -/
-@[expose] def fracChars (n : PgNumeric) : Nat → List Char
-  | 0 => []
-  | k + 1 =>
-    n.fracChars k ++
-      [digitChar (n.digitAt (n.weight + 1 + Int.ofNat (k / 4)) / 10 ^ (3 - k % 4))]
+/-- Fraction characters: `k` decimal places, i.e. the first `k` characters of
+the base-10000 groups just past the decimal point. -/
+@[expose] def fracChars (n : PgNumeric) (k : Nat) : List Char :=
+  ((n.groupList (n.weight + 1) ((k + 3) / 4)).flatMap digits4).take k
 
 /-- The full decimal rendering of a finite `numeric`. -/
 @[expose] def chars (n : PgNumeric) : List Char :=
-  (if n.neg then ['-'] else []) ++ n.intChars n.intGroups ++
+  (if n.neg then ['-'] else []) ++ n.intChars ++
     (if n.dscale = 0 then [] else '.' :: n.fracChars n.dscale)
 
 protected def toString (n : PgNumeric) : String :=
@@ -83,6 +93,12 @@ protected def toString (n : PgNumeric) : String :=
   | none => String.ofList n.chars
 
 instance : ToString PgNumeric := ⟨PgNumeric.toString⟩
+
+/-- The rendering of a finite value, at the character level. -/
+theorem toString_eq {n : PgNumeric} (h : n.special = none) :
+    n.toString = String.ofList n.chars := by
+  unfold PgNumeric.toString
+  rw [h]
 
 /-! ### Parsing -/
 
@@ -136,9 +152,9 @@ each leading one dropped lowers the weight by one. -/
 @[expose] def ofDigitChars (neg : Bool) (ip fp : List Char) : PgNumeric :=
   ofGroups neg fp.length
     (dropLeadZeros (group4 (alignInt ip ++ alignFrac fp) #[]).toList)
-    (Int.ofNat ((alignInt ip).length / 4) - 1 -
-      Int.ofNat ((group4 (alignInt ip ++ alignFrac fp) #[]).toList.length -
-        (dropLeadZeros (group4 (alignInt ip ++ alignFrac fp) #[]).toList).length))
+    (((alignInt ip).length / 4 : Int) - 1 -
+      (((group4 (alignInt ip ++ alignFrac fp) #[]).toList.length -
+        (dropLeadZeros (group4 (alignInt ip ++ alignFrac fp) #[]).toList).length : Nat) : Int))
 
 /-- Integer and fraction digits, after defaulting an absent integer part to
 `0`. Rejects anything that is not a decimal digit. -/
@@ -158,18 +174,21 @@ each leading one dropped lowers the weight by one. -/
   | [i, f] => ofParts orig neg i f
   | _ => .error s!"numeric: cannot parse {orig}"
 
-/-- Strip an optional sign. -/
+/-- Strip an optional sign. Written with an `if` rather than a character
+pattern so that proofs can rewrite it. -/
 @[expose] def ofDecimalChars (orig : String) : List Char → Except String PgNumeric
-  | '-' :: rest => ofSigned orig true rest
-  | '+' :: rest => ofSigned orig false rest
-  | rest => ofSigned orig false rest
+  | [] => ofSigned orig false []
+  | c :: rest =>
+    if c == '-' then ofSigned orig true rest
+    else if c == '+' then ofSigned orig false rest
+    else ofSigned orig false (c :: rest)
 
 @[expose] def ofChars (orig : String) (cs : List Char) : Except String PgNumeric :=
   match specialOf cs with
   | some sp => .ok { special := some sp }
   | none => ofDecimalChars orig cs
 
-def fromString (s : String) : Except String PgNumeric :=
+@[expose] def fromString (s : String) : Except String PgNumeric :=
   ofChars s (trimAsciiChars s.toList)
 
 end PgNumeric
