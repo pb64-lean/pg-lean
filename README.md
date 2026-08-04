@@ -226,9 +226,13 @@ section docstring states its scope.
   `PlainDate`), `parseTimeNanos_renderTimeNanos` (a rendered time-of-day parses
   back to the same nanosecond count, at PostgreSQL's microsecond resolution),
   and `timestampFields_renderTimestamp` (a rendered timestamp splits back into
-  that date and those nanoseconds). Underneath them, `parseNatField_padDigits`:
-  a zero-padded decimal field reads back as the number it was rendered from, at
-  any width.
+  that date and those nanoseconds). Underneath them, in
+  `Pg/Types/Digits.lean`, `parseNatField_padDigits`: a zero-padded decimal
+  field reads back as the number it was rendered from, at any width. That
+  module is the kernel-visible decimal substrate every text codec is proved
+  through — core's `Nat.repr`/`String.toNat?`/`String.splitOn` are all opaque
+  to the kernel, so pg-lean renders and parses decimals with its own
+  `natDigits`/`padDigits`/`natOfDigits` and splits with `List.splitOn`.
 
   On the text side, `PgNumeric.fromString_toString` — **a rendered `numeric`
   parses back to the same value**: every base-10000 digit, the sign, the
