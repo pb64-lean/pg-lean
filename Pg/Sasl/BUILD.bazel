@@ -1,9 +1,34 @@
 package(default_visibility = ["//visibility:public"])
 
-load("@rules_lean//lean:defs.bzl", "lean_library")
+load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
+load("//:assurance.bzl", "PG_ALLOWED_AXIOMS")
 
 lean_library(
     name = "sasl",
     srcs = ["Scram.lean"],
     deps = ["//Pg/Crypto:crypto"],
+)
+
+# Compile-time audit of the SCRAM-SHA-256 client. The principal theorems pin
+# the construction the RFC specifies — what the client sends, what it accepts
+# from the server, and that a server-final message is accepted only when its
+# signature equals the one derived from the client's own key material.
+#
+# This scope reaches no `bv_decide` call site, so its axiom closure is only the
+# standard three even though the shared policy list is wider.
+lean_assurance_test(
+    name = "sasl_assurance",
+    allowed_axioms = PG_ALLOWED_AXIOMS,
+    allowed_extern_modules = [],
+    module_prefixes = ["Pg"],
+    principal_theorems = [
+        "Pg.Sasl.Scram.clientFirst_message",
+        "Pg.Sasl.Scram.clientFirst_state",
+        "Pg.Sasl.Scram.parseServerFirst_spec",
+        "Pg.Sasl.Scram.parseServerFirst_nonce_extends",
+        "Pg.Sasl.Scram.parseServerFirst_render",
+        "Pg.Sasl.Scram.clientFinal_spec",
+        "Pg.Sasl.Scram.verifyServerFinal_spec",
+    ],
+    deps = [":sasl"],
 )

@@ -211,6 +211,39 @@ section docstring states its scope.
 - **Codecs** (`Pg/Types/Codec.lean`) — text and binary integer roundtrips,
   `PgInterval.fromBinary_toBinary`.
 
+### Mechanically enforced
+
+Four `lean_assurance_test` targets audit the compiled environment at build
+time, so a regression is a red build rather than a stale claim:
+
+| target | scope |
+| --- | --- |
+| `//Pg/Protocol:protocol_assurance` | framing, `State.WellFormed`, FIFO attribution, byte accounting, progress/recovery, startup order, the ten `completes_*` |
+| `//Pg/Types:types_assurance` | codec roundtrips |
+| `//Pg/Sasl:sasl_assurance` | SCRAM construction and mutual authentication |
+| `//:pg_lean_assurance` | the whole client: `sslmode` policy, trust-store gate, connection-string roundtrips |
+
+Each target checks that its named theorems exist, are theorems, and close over
+an allowed axiom set — and scans **every** first-party module (`module_prefixes
+= ["Pg"]`, 21 modules / ~3650 constants) for `sorry`, stray axioms, `unsafe`,
+and `@[extern]`. Current whole-client result: no `sorry`, no `unsafe`, no
+`opaque`, two `partial` definitions (the socket read loop and the cancellable
+sleep in `Pg/Connection.lean`), and **no `@[extern]` constants at all** —
+`allowed_extern_modules` is empty, so any first-party native code would fail
+the audit. pg-lean's crypto is pure Lean; the only native code it runs is
+`tls13-lean`'s HACL* bindings, audited in that repository.
+
+Beyond the standard three (`propext`, `Classical.choice`, `Quot.sound`) the
+allowed axiom set is exactly seven LRAT-certificate axioms, listed by full name
+in [`assurance.bzl`](assurance.bzl). Lean 4.31's `bv_decide` checks the SAT
+solver's refutation with a natively compiled checker and records that check as
+one axiom per call site; pg-lean uses `bv_decide` only for big-endian byte
+(de)composition (three in `pack_unpack`, one each in `getUInt16?_putUInt16`,
+`getUInt32?_putUInt32`, `rdUInt64_putInt64BE`, and
+`PgInterval.fromBinary_toBinary`). They are enumerated individually rather than
+matched by pattern so that a *new* `bv_decide` call site fails every assurance
+target and has to be justified.
+
 ## Testing (the yardstick)
 
 Hermetic, every commit — `bazel test //...` (10 suites):

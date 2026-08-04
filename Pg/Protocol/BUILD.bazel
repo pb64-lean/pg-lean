@@ -1,6 +1,7 @@
 package(default_visibility = ["//visibility:public"])
 
-load("@rules_lean//lean:defs.bzl", "lean_library")
+load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
+load("//:assurance.bzl", "PG_ALLOWED_AXIOMS")
 
 # Wire protocol: byte framing, typed message catalog, and the sans-IO
 # connection state machine.
@@ -17,4 +18,83 @@ lean_library(
         "//Pg/Crypto:crypto",
         "//Pg/Sasl:sasl",
     ],
+)
+
+# Compile-time audit of the sans-IO core — the tier that decides what bytes go
+# out and which reply belongs to which request. The principal theorems are the
+# ones the client's correctness argument actually rests on: framing conserves
+# and partitions bytes, `State.WellFormed` is preserved by every entry point,
+# the shell's FIFO of outstanding operations refines the pipeline exactly,
+# startup cannot skip the SCRAM server signature, and each documented reply
+# sequence drives its operation to completion.
+#
+# `module_prefixes` is the whole first-party closure (`Pg`), not just this
+# library, so the `@[extern]` check is a statement about the repository:
+# pg-lean links no native code of its own — its crypto is pure Lean and the TLS
+# primitives come from the tls13-lean sibling, outside this scan. The report
+# line to look for is `@[extern] constants: none`.
+lean_assurance_test(
+    name = "protocol_assurance",
+    allowed_axioms = PG_ALLOWED_AXIOMS,
+    allowed_extern_modules = [],
+    module_prefixes = ["Pg"],
+    principal_theorems = [
+        # Framing: bytes are conserved and the split point does not matter.
+        "Pg.Protocol.DecodeState.feed_conservation",
+        "Pg.Protocol.DecodeState.feed_conservation_drained",
+        "Pg.Protocol.DecodeState.feed_append",
+        "Pg.Protocol.DecodeState.feed_chunks",
+        "Pg.Protocol.DecodeState.feed_partition_invariant",
+        "Pg.Protocol.getUInt16?_putUInt16",
+        "Pg.Protocol.getUInt32?_putUInt32",
+        # State.WellFormed: established at start, preserved by every entry point.
+        "Pg.Protocol.Machine.start_wellFormed",
+        "Pg.Protocol.Machine.submit_wellFormed",
+        "Pg.Protocol.Machine.submitAll_wellFormed",
+        "Pg.Protocol.Machine.step_wellFormed",
+        "Pg.Protocol.Machine.feed_wellFormed",
+        # FIFO attribution: the shell's queue of outstanding operations tracks
+        # the pipeline through every step, feed, and submission.
+        "Pg.Protocol.Machine.step_fifo",
+        "Pg.Protocol.Machine.runSteps_fifo",
+        "Pg.Protocol.Machine.feed_fifo",
+        "Pg.Protocol.Machine.submit_fifo",
+        "Pg.Protocol.Machine.terminal_pops_head",
+        "Pg.Protocol.Machine.nonterminal_preserves_fifo",
+        "Pg.Protocol.Machine.error_drops_to_sync",
+        # Byte accounting through the machine, not just the framer.
+        "Pg.Protocol.Machine.step_decode",
+        "Pg.Protocol.Machine.submit_decode",
+        "Pg.Protocol.Machine.runSteps_decode",
+        "Pg.Protocol.Machine.feed_frames",
+        "Pg.Protocol.Machine.feed_messages_drained",
+        "Pg.Protocol.Machine.feed_byte_accounting",
+        # Progress and error recovery.
+        "Pg.Protocol.Machine.step_progress",
+        "Pg.Protocol.Machine.expectedReply_nonempty",
+        "Pg.Protocol.Machine.step_errorResponse_progress",
+        "Pg.Protocol.Machine.error_enters_drain_until_sync",
+        "Pg.Protocol.Machine.drained_operation_cannot_succeed",
+        "Pg.Protocol.Machine.readyForQuery_clears_recovery_state",
+        "Pg.Protocol.Machine.readyForQuery_restores_pipeline_alignment",
+        "Pg.Protocol.Machine.sync_clears_aborted",
+        # Startup: the documented arrows, and no skipping the server signature.
+        "Pg.Protocol.Machine.authStep_scram",
+        "Pg.Protocol.Machine.authReach_stage_le",
+        "Pg.Protocol.Machine.step_startup_order",
+        "Pg.Protocol.Machine.runSteps_startup_order",
+        "Pg.Protocol.Machine.startup_ready",
+        # Liveness: each documented reply sequence completes its operation.
+        "Pg.Protocol.Machine.completes_parse",
+        "Pg.Protocol.Machine.completes_bind",
+        "Pg.Protocol.Machine.completes_close",
+        "Pg.Protocol.Machine.completes_sync",
+        "Pg.Protocol.Machine.completes_describePortal",
+        "Pg.Protocol.Machine.completes_describeStatement",
+        "Pg.Protocol.Machine.completes_execute",
+        "Pg.Protocol.Machine.completes_execute_copyIn",
+        "Pg.Protocol.Machine.completes_execute_copyOut",
+        "Pg.Protocol.Machine.completes_simpleQuery",
+    ],
+    deps = [":protocol"],
 )

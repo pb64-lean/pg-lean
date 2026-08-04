@@ -1,6 +1,9 @@
 package(default_visibility = ["//visibility:public"])
 
-load("@rules_lean//lean:defs.bzl", "lean_library")
+load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
+load("//:assurance.bzl", "PG_ALLOWED_AXIOMS")
+
+exports_files(["assurance.bzl"])
 
 # Umbrella library: the root `Pg` module re-exporting the whole client.
 # Per-directory libraries live in Pg/*/BUILD.bazel; tests in Test/BUILD.bazel;
@@ -20,4 +23,54 @@ lean_library(
         "//Pg/Tls:trust_store",
         "//Pg/Types:types",
     ],
+)
+
+# Whole-client audit: every first-party module (`module_prefixes = ["Pg"]`) is
+# scanned, so this target is the repository-level statement.
+#
+#   * No constant anywhere under `Pg` reaches `sorryAx`.
+#   * The only axioms in scope are the standard three plus the five
+#     LRAT-certificate axioms enumerated in //:assurance.bzl.
+#   * `@[extern] constants: none` — pg-lean links no native code of its own.
+#     Its crypto (SHA-256, HMAC, PBKDF2, MD5, base64, hex) is pure Lean, and
+#     the TLS primitives it uses are the tls13-lean sibling's HACL* bindings,
+#     which live under `HaclStar` and are audited there. `allowed_extern_modules`
+#     is therefore empty: a first-party `@[extern]` fails this target.
+#   * `partial definitions` are reported, not failed: two socket-driven loops in
+#     `Pg.Connection` (`recvTransport`, `cancellableSleep`) are genuinely
+#     unbounded, and no theorem here mentions them — the sans-IO machine under
+#     the IO shell is what the laws are about.
+#   * `unsafe constants: none`, `opaque constants: none`.
+#
+# The principal theorems are the connection-level ones the per-library targets
+# do not carry: the TLS policy table, the trust-store gate, and URI parsing.
+lean_assurance_test(
+    name = "pg_lean_assurance",
+    allowed_axioms = PG_ALLOWED_AXIOMS,
+    allowed_extern_modules = [],
+    module_prefixes = ["Pg"],
+    principal_theorems = [
+        # The sslmode policy table, and the connect path that reads it.
+        "Pg.verifyFull_policy",
+        "Pg.verifyCa_policy",
+        "Pg.require_policy",
+        "Pg.policy_hostname_implies_chain",
+        "Pg.policy_chain_implies_encryption",
+        "Pg.policy_no_insecure_fallback",
+        "Pg.policy_fallback_iff",
+        "Pg.initialAttempt_of_requireEncryption",
+        "Pg.fallbackAttempt_of_requireEncryption",
+        "Pg.fallbackAttempt_isSome",
+        "Pg.fallbackTriggered_of_no_fallback",
+        "Pg.fallback_plaintext_only_unencrypted",
+        # Trust anchors are consulted for exactly the chain-verifying modes.
+        "Pg.Tls.TrustStore.verificationRequested_eq_policy",
+        "Pg.Tls.TrustStore.select_none_of_not_requireChain",
+        # Connection URIs: percent-encoding and the render/parse roundtrip.
+        "Pg.ConnectConfig.percentDecode_percentEncode",
+        "Pg.ConnectConfig.parseUri_renderUri",
+        "Pg.ConnectConfig.applyQueryParam_unknown",
+        "Pg.ConnectConfig.applyQueryPairs_render",
+    ],
+    deps = [":pg_lean"],
 )
