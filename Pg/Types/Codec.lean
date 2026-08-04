@@ -6,6 +6,8 @@ public import Pg.Crypto.Hex
 public import Pg.Types.Oid
 public import Pg.Types.Numeric
 public import Pg.Types.Interval
+import Std.Data.String.ToNat
+import Std.Data.String.ToInt
 
 public section
 
@@ -570,5 +572,114 @@ instance [PgDecode α] : PgDecode (Array α) where
         out := out.push (← PgDecode.decodeBinary elemOid (b.extract off (off + n)))
         off := off + n
     pure out
+
+-- ── roundtrip laws ─────────────────────────────────────────────────────────
+
+/-!
+Codec roundtrips: decoding what we encode yields the original value
+(`decodeValue oid (format α) (encode x) = .ok x`). The reverse direction is
+false in general (many wire spellings decode to one value), so these are the
+strongest uniform laws the codecs admit. Covered: int2/int4/int8, unsized
+Int, bool, bytea, text, uuid-as-text.
+-/
+
+/-- UTF-8 encode then decode is the identity (Strings are UTF-8-backed). -/
+theorem fromUTF8?_toUTF8 (s : String) : String.fromUTF8? s.toUTF8 = some s := by
+  simp only [String.fromUTF8?, String.toUTF8_eq_toByteArray]
+  rw [dif_pos s.isValidUTF8]
+  rfl
+
+/-- In text format (`0`), `decodeValue` is exactly the instance's text
+decoder on the encoded string. -/
+theorem decodeValue_text (α : Type) [PgDecode α] (oid : UInt32) (s : String) :
+    decodeValue (α := α) oid 0 (some s.toUTF8) = PgDecode.decodeText oid s := by
+  rw [decodeValue]
+  rw [if_neg (by decide)]
+  rw [fromUTF8?_toUTF8]
+
+theorem decode_encode_int2 (oid : UInt32) (x : Int16) :
+    decodeValue (α := Int16) oid (PgEncode.format Int16) (PgEncode.encode x) = .ok x := by
+  have htoInt : (toString x).toInt? = some x.toInt := by
+    show (Int16.toInt x).repr.toInt? = _
+    exact Int.toInt?_repr _
+  have h1 := Int16.le_toInt x
+  have h2 := Int16.toInt_le x
+  have h3 : Int16.maxValue.toInt = 32767 := by decide
+  show decodeValue oid 0 (some (toString x).toUTF8) = .ok x
+  rw [decodeValue_text]
+  simp only [PgDecode.decodeText, htoInt, intInRange]
+  rw [if_pos (by
+    simp only [Bool.and_eq_true, decide_eq_true_eq]
+    exact ⟨by omega, by omega⟩)]
+  simp [Int16.ofInt_toInt]
+  try rfl
+
+theorem decode_encode_int4 (oid : UInt32) (x : Int32) :
+    decodeValue (α := Int32) oid (PgEncode.format Int32) (PgEncode.encode x) = .ok x := by
+  have htoInt : (toString x).toInt? = some x.toInt := by
+    show (Int32.toInt x).repr.toInt? = _
+    exact Int.toInt?_repr _
+  have h1 := Int32.le_toInt x
+  have h2 := Int32.toInt_le x
+  have h3 : Int32.maxValue.toInt = 2147483647 := by decide
+  show decodeValue oid 0 (some (toString x).toUTF8) = .ok x
+  rw [decodeValue_text]
+  simp only [PgDecode.decodeText, htoInt, intInRange]
+  rw [if_pos (by
+    simp only [Bool.and_eq_true, decide_eq_true_eq]
+    exact ⟨by omega, by omega⟩)]
+  simp [Int32.ofInt_toInt]
+  try rfl
+
+theorem decode_encode_int8 (oid : UInt32) (x : Int64) :
+    decodeValue (α := Int64) oid (PgEncode.format Int64) (PgEncode.encode x) = .ok x := by
+  have htoInt : (toString x).toInt? = some x.toInt := by
+    show (Int64.toInt x).repr.toInt? = _
+    exact Int.toInt?_repr _
+  have h1 := Int64.le_toInt x
+  have h2 := Int64.toInt_le x
+  have h3 : Int64.maxValue.toInt = 9223372036854775807 := by decide
+  show decodeValue oid 0 (some (toString x).toUTF8) = .ok x
+  rw [decodeValue_text]
+  simp only [PgDecode.decodeText, htoInt, intInRange]
+  rw [if_pos (by
+    simp only [Bool.and_eq_true, decide_eq_true_eq]
+    exact ⟨by omega, by omega⟩)]
+  simp [Int64.ofInt_toInt]
+  try rfl
+
+/-- Unsized `Int` (server-inferred parameter type): no range check at all. -/
+theorem decode_encode_int (oid : UInt32) (x : Int) :
+    decodeValue (α := Int) oid (PgEncode.format Int) (PgEncode.encode x) = .ok x := by
+  show decodeValue oid 0 (some (toString x).toUTF8) = .ok x
+  rw [decodeValue_text]
+  simp [PgDecode.decodeText]
+  try rfl
+
+theorem decode_encode_bool (oid : UInt32) (x : Bool) :
+    decodeValue (α := Bool) oid (PgEncode.format Bool) (PgEncode.encode x) = .ok x := by
+  show decodeValue oid 0 (some (if x then "t" else "f").toUTF8) = .ok x
+  cases x <;> rw [decodeValue_text] <;> rfl
+
+theorem decode_encode_text (oid : UInt32) (s : String) :
+    decodeValue (α := String) oid (PgEncode.format String) (PgEncode.encode s) = .ok s := by
+  show decodeValue oid 0 (some s.toUTF8) = .ok s
+  rw [decodeValue_text]
+  rfl
+
+/-- uuid values travel as text; the binary 16-byte decoder has no encoder
+counterpart, so text is the roundtrip that exists. -/
+theorem decode_encode_uuid (s : String) :
+    decodeValue (α := String) Oid.uuid (PgEncode.format String) (PgEncode.encode s) =
+      .ok s :=
+  decode_encode_text Oid.uuid s
+
+theorem decode_encode_bytea (oid : UInt32) (b : ByteArray) :
+    decodeValue (α := ByteArray) oid (PgEncode.format ByteArray) (PgEncode.encode b) =
+      .ok b := by
+  show decodeValue oid 1 (some b) = .ok b
+  rw [decodeValue]
+  rw [if_pos (by decide)]
+  rfl
 
 end Pg
