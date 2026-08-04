@@ -450,7 +450,10 @@ def abortToSync (pipe : Pipeline) : Pipeline :=
 — determines which error-recovery path an ErrorResponse takes. -/
 private def isSimple (op : CurrentOp) : Bool := op.kind == .simpleQuery
 
-private def stepRunning (s : State) (pipe : Pipeline) (m : BackendMsg) :
+/-- The running-phase transition: `step` minus decoding and the asynchronous
+pre-filter (`step_eq_stepRunning`). Public so the completion theorems at the end
+of this file can state what a documented reply sequence does. -/
+def stepRunning (s : State) (pipe : Pipeline) (m : BackendMsg) :
     Except PgError (State × Array Event × ByteArray) :=
   match m with
   | .errorResponse fields =>
@@ -2881,6 +2884,361 @@ theorem runSteps_startup_order :
         · exact Or.inr hrest
       · exact Or.inr (runSteps_phase_running hrun h)
 
+
+/-!
+### Completion: the documented reply sequences pop their operation
+
+`expectedReply_nonempty` says a coherent head op always *has* some accepted
+reply. This section strengthens that to completion: for each `OpKind`, the
+reply sequence PostgreSQL documents drives the machine all the way to popping
+that operation, so the correlation FIFO really does shrink.
+
+`runReplies` folds the machine over already-decoded replies;
+`step_eq_stepRunning` proves that is exactly what `step` does once decoding and
+the asynchronous pre-filter are out of the way, so these are statements about
+the shipped `step` path and not about a proof-only model.
+
+**Coverage.** Parse, Bind, Close, Describe (statement and portal), Sync,
+Execute (with any number of streamed DataRows), Execute over COPY IN and
+COPY OUT (with any number of CopyData messages), and the simple-query cycle
+(RowDescription, any number of DataRows, CommandComplete, ReadyForQuery). Not
+covered: multi-statement simple queries (each additional statement returns the
+head op to `.start`, so the sequence is unbounded in a second dimension) and
+Execute sequences interleaved with `PortalSuspended` resumption. -/
+
+/-- Drive the machine over already-decoded backend replies, in order. -/
+def runReplies : State → List BackendMsg → Except PgError State
+  | s, [] => .ok s
+  | s, m :: rest =>
+    match s.phase with
+    | .running pipe =>
+      match stepRunning s pipe m with
+      | .error e => .error e
+      | .ok (s', _, _) => runReplies s' rest
+    | _ => .error (.protocol "runReplies: not in the running phase")
+
+/-- `step` on a non-asynchronous message in the running phase *is*
+`stepRunning`: `runReplies` drives the shipped code path. -/
+theorem step_eq_stepRunning {s : State} {pipe : Pipeline} {msg : RawMessage}
+    {m : BackendMsg} (hph : s.phase = .running pipe)
+    (hdec : Backend.decode msg = .ok m)
+    (hnotice : ∀ f, m ≠ .noticeResponse f)
+    (hparam : ∀ n v, m ≠ .parameterStatus n v)
+    (hnotif : ∀ p c pl, m ≠ .notificationResponse p c pl) :
+    step s msg = stepRunning s pipe m := by
+  fun_cases step s msg
+  case case1 => rename_i hclosed; rw [hph] at hclosed; cases hclosed
+  case case2 => rename_i e hdec2; rw [hdec] at hdec2; cases hdec2
+  case case3 => rename_i f hdec2; rw [hdec] at hdec2; cases hdec2; exact absurd rfl (hnotice f)
+  case case4 =>
+    rename_i n v hdec2
+    rw [hdec] at hdec2
+    cases hdec2
+    exact absurd rfl (hparam n v)
+  case case5 =>
+    rename_i p c pl hdec2
+    rw [hdec] at hdec2
+    cases hdec2
+    exact absurd rfl (hnotif p c pl)
+  case case6 =>
+    rename_i m2 hdec2 auth hph2 _ _ _
+    rw [hph] at hph2
+    cases hph2
+  case case7 =>
+    rename_i m2 hdec2 pipe2 hph2 _ _ _
+    rw [hdec] at hdec2
+    cases hdec2
+    rw [hph] at hph2
+    injection hph2 with hp
+    subst hp
+    rfl
+  case case8 => rename_i m2 hdec2 hph2 _ _ _; rw [hph] at hph2; cases hph2
+
+private theorem runReplies_one {s : State} {pipe : Pipeline} {m : BackendMsg}
+    {s' : State} {evs : Array Event} {out : ByteArray} {rest : List BackendMsg}
+    (hph : s.phase = .running pipe) (hstep : stepRunning s pipe m = .ok (s', evs, out)) :
+    runReplies s (m :: rest) = runReplies s' rest := by
+  simp only [runReplies, hph, hstep]
+
+/-- The head operation has been popped: the correlation FIFO is exactly the
+queue that was waiting behind it. -/
+def PopsTo (s' : State) (pipe : Pipeline) : Prop :=
+  ∃ pipe', s'.phase = .running pipe' ∧ pipe'.pending = pipe.queued.toList
+
+private theorem popsTo_advance {s : State} {pipe : Pipeline} :
+    PopsTo (withPipe s (advance pipe)) pipe :=
+  ⟨advance pipe, rfl, advance_pending pipe⟩
+
+/-- CommandComplete completes any Execute, whatever reply state it is in. -/
+private theorem execute_commandComplete {s : State} {pipe : Pipeline} {op : CurrentOp}
+    {tag : String} (hph : s.phase = .running pipe) (hcur : pipe.current = some op)
+    (hk : op.kind = .execute) :
+    ∃ s', runReplies s [.commandComplete tag] = .ok s' ∧ PopsTo s' pipe := by
+  have h1 : stepRunning s pipe (.commandComplete tag)
+      = .ok (withPipe s (advance pipe), #[.commandComplete tag], ByteArray.empty) := by
+    simp only [stepRunning, hcur, hk]
+    rfl
+  exact ⟨_, by rw [runReplies_one hph h1]; rfl, popsTo_advance⟩
+
+/-- Parse: ParseComplete. -/
+theorem completes_parse {s : State} {pipe : Pipeline} (hph : s.phase = .running pipe)
+    (hcur : pipe.current = some { kind := .parse }) :
+    ∃ s', runReplies s [.parseComplete] = .ok s' ∧ PopsTo s' pipe := by
+  have h1 : stepRunning s pipe .parseComplete
+      = .ok (withPipe s (advance pipe), #[.parseComplete], ByteArray.empty) := by
+    simp only [stepRunning, hcur]
+    rfl
+  exact ⟨_, by rw [runReplies_one hph h1]; rfl, popsTo_advance⟩
+
+/-- Bind: BindComplete. -/
+theorem completes_bind {s : State} {pipe : Pipeline} (hph : s.phase = .running pipe)
+    (hcur : pipe.current = some { kind := .bind }) :
+    ∃ s', runReplies s [.bindComplete] = .ok s' ∧ PopsTo s' pipe := by
+  have h1 : stepRunning s pipe .bindComplete
+      = .ok (withPipe s (advance pipe), #[.bindComplete], ByteArray.empty) := by
+    simp only [stepRunning, hcur]
+    rfl
+  exact ⟨_, by rw [runReplies_one hph h1]; rfl, popsTo_advance⟩
+
+/-- Close: CloseComplete. -/
+theorem completes_close {s : State} {pipe : Pipeline} (hph : s.phase = .running pipe)
+    (hcur : pipe.current = some { kind := .close }) :
+    ∃ s', runReplies s [.closeComplete] = .ok s' ∧ PopsTo s' pipe := by
+  have h1 : stepRunning s pipe .closeComplete
+      = .ok (withPipe s (advance pipe), #[.closeComplete], ByteArray.empty) := by
+    simp only [stepRunning, hcur]
+    rfl
+  exact ⟨_, by rw [runReplies_one hph h1]; rfl, popsTo_advance⟩
+
+/-- Sync: ReadyForQuery. -/
+theorem completes_sync {s : State} {pipe : Pipeline} {tx : TxStatus}
+    (hph : s.phase = .running pipe) (hcur : pipe.current = some { kind := .sync }) :
+    ∃ s', runReplies s [.readyForQuery tx] = .ok s' ∧ PopsTo s' pipe := by
+  have h1 : stepRunning s pipe (.readyForQuery tx)
+      = .ok (withPipe { s with txStatus := tx } (advance pipe), #[.ready tx],
+        ByteArray.empty) := by
+    simp only [stepRunning, hcur]
+    rfl
+  exact ⟨_, by rw [runReplies_one hph h1]; rfl, popsTo_advance⟩
+
+/-- Describe portal: NoData. -/
+theorem completes_describePortal {s : State} {pipe : Pipeline}
+    (hph : s.phase = .running pipe)
+    (hcur : pipe.current = some { kind := .describePortal }) :
+    ∃ s', runReplies s [.noData] = .ok s' ∧ PopsTo s' pipe := by
+  have h1 : stepRunning s pipe .noData
+      = .ok (withPipe s (advance pipe), #[.noData], ByteArray.empty) := by
+    simp only [stepRunning, hcur]
+    rfl
+  exact ⟨_, by rw [runReplies_one hph h1]; rfl, popsTo_advance⟩
+
+/-- Describe statement: ParameterDescription, then NoData. -/
+theorem completes_describeStatement {s : State} {pipe : Pipeline}
+    {oids : Array UInt32} (hph : s.phase = .running pipe)
+    (hcur : pipe.current = some { kind := .describeStatement }) :
+    ∃ s', runReplies s [.parameterDescription oids, .noData] = .ok s' ∧
+      PopsTo s' pipe := by
+  have h1 : stepRunning s pipe (.parameterDescription oids)
+      = .ok (withPipe s { pipe with
+          current := some { kind := .describeStatement, progress := .descParams } },
+        #[.parameterDescription oids], ByteArray.empty) := by
+    simp only [stepRunning, hcur]
+    rfl
+  have h2 : stepRunning (withPipe s { pipe with
+          current := some { kind := .describeStatement, progress := .descParams } })
+        { pipe with
+          current := some { kind := .describeStatement, progress := .descParams } }
+        .noData
+      = .ok (withPipe s (advance { pipe with
+          current := some { kind := .describeStatement, progress := .descParams } }),
+        #[.noData], ByteArray.empty) := by
+    simp only [stepRunning]
+    rfl
+  exact ⟨_, by rw [runReplies_one hph h1, runReplies_one rfl h2]; rfl,
+    ⟨_, rfl, advance_pending _⟩⟩
+
+private theorem execute_rows_then (n : Nat) {tag : String} :
+    ∀ {s : State} {pipe : Pipeline}, s.phase = .running pipe →
+      pipe.current = some { kind := .execute, progress := .rows none } →
+      ∃ s', runReplies s
+          (List.replicate n (.dataRow #[]) ++ [.commandComplete tag]) = .ok s' ∧
+        PopsTo s' pipe := by
+  induction n with
+  | zero =>
+    intro s pipe hph hcur
+    exact execute_commandComplete hph hcur rfl
+  | succ n ih =>
+    intro s pipe hph hcur
+    have h1 : stepRunning s pipe (.dataRow #[])
+        = .ok (withPipe s pipe, #[.dataRow #[]], ByteArray.empty) := by
+      simp only [stepRunning, hcur]
+      rfl
+    obtain ⟨s', hr, hpop⟩ := ih (s := withPipe s pipe) rfl hcur
+    refine ⟨s', ?_, hpop⟩
+    rw [List.replicate_succ, List.cons_append, runReplies_one hph h1]
+    exact hr
+
+/-- **Execute completes**: any number of streamed DataRows followed by
+CommandComplete pops the Execute. -/
+theorem completes_execute (n : Nat) {s : State} {pipe : Pipeline} {tag : String}
+    (hph : s.phase = .running pipe) (hcur : pipe.current = some { kind := .execute }) :
+    ∃ s', runReplies s (List.replicate n (.dataRow #[]) ++ [.commandComplete tag])
+        = .ok s' ∧ PopsTo s' pipe := by
+  cases n with
+  | zero => exact execute_commandComplete hph hcur rfl
+  | succ n =>
+    have h1 : stepRunning s pipe (.dataRow #[])
+        = .ok (withPipe s { pipe with
+            current := some { kind := .execute, progress := .rows none } },
+          #[.dataRow #[]], ByteArray.empty) := by
+      simp only [stepRunning, hcur]
+      rfl
+    obtain ⟨s', hr, hpop⟩ := execute_rows_then n (tag := tag)
+      (s := withPipe s { pipe with
+        current := some { kind := .execute, progress := .rows none } }) rfl rfl
+    refine ⟨s', ?_, hpop⟩
+    rw [List.replicate_succ, List.cons_append, runReplies_one hph h1]
+    exact hr
+
+/-- **Execute over COPY IN completes**: CopyInResponse then CommandComplete. -/
+theorem completes_execute_copyIn {s : State} {pipe : Pipeline} {tag : String}
+    {formats : Array UInt16} (hph : s.phase = .running pipe)
+    (hcur : pipe.current = some { kind := .execute })
+    (hgate : CopyStartGate pipe) :
+    ∃ s', runReplies s [.copyInResponse 0 formats, .commandComplete tag] = .ok s' ∧
+      PopsTo s' pipe := by
+  unfold CopyStartGate at hgate
+  have h1 : stepRunning s pipe (.copyInResponse 0 formats)
+      = .ok (withPipe s (Pipeline.mk
+          (some (CurrentOp.mk .execute (.copyIn (CopyInfo.mk false formats) false)))
+          pipe.queued pipe.aborted),
+        #[.copyInStarted (CopyInfo.mk false formats)], ByteArray.empty) := by
+    simp only [stepRunning, hcur, hgate]
+    rfl
+  obtain ⟨s', hr, hpop⟩ := execute_commandComplete (tag := tag)
+    (s := withPipe s (Pipeline.mk
+      (some (CurrentOp.mk .execute (.copyIn (CopyInfo.mk false formats) false)))
+      pipe.queued pipe.aborted)) rfl rfl rfl
+  refine ⟨s', ?_, hpop⟩
+  rw [runReplies_one hph h1]
+  exact hr
+
+private theorem execute_copyData_then (n : Nat) {tag : String} {info : CopyInfo} :
+    ∀ {s : State} {pipe : Pipeline}, s.phase = .running pipe →
+      pipe.current = some { kind := .execute, progress := .copyOut info } →
+      ∃ s', runReplies s (List.replicate n (.copyData ByteArray.empty) ++
+          [.copyDone, .commandComplete tag]) = .ok s' ∧ PopsTo s' pipe := by
+  induction n with
+  | zero =>
+    intro s pipe hph hcur
+    have h1 : stepRunning s pipe .copyDone
+        = .ok (withPipe s { pipe with
+            current := some { kind := .execute, progress := .start } },
+          #[.copyOutDone], ByteArray.empty) := by
+      simp only [stepRunning, hcur]
+      rfl
+    obtain ⟨s', hr, hpop⟩ := execute_commandComplete (tag := tag)
+      (s := withPipe s { pipe with
+        current := some { kind := .execute, progress := .start } }) rfl rfl rfl
+    refine ⟨s', ?_, hpop⟩
+    rw [List.replicate_zero, List.nil_append, runReplies_one hph h1]
+    exact hr
+  | succ n ih =>
+    intro s pipe hph hcur
+    have h1 : stepRunning s pipe (.copyData ByteArray.empty)
+        = .ok (withPipe s pipe, #[.copyData ByteArray.empty], ByteArray.empty) := by
+      simp only [stepRunning, hcur]
+      rfl
+    obtain ⟨s', hr, hpop⟩ := ih (s := withPipe s pipe) rfl hcur
+    refine ⟨s', ?_, hpop⟩
+    rw [List.replicate_succ, List.cons_append, runReplies_one hph h1]
+    exact hr
+
+/-- **Execute over COPY OUT completes**: CopyOutResponse, any number of
+CopyData messages, CopyDone, CommandComplete. -/
+theorem completes_execute_copyOut (n : Nat) {s : State} {pipe : Pipeline}
+    {tag : String} {formats : Array UInt16} (hph : s.phase = .running pipe)
+    (hcur : pipe.current = some { kind := .execute })
+    (hgate : CopyStartGate pipe) :
+    ∃ s', runReplies s (.copyOutResponse 0 formats ::
+        (List.replicate n (.copyData ByteArray.empty) ++
+          [.copyDone, .commandComplete tag])) = .ok s' ∧ PopsTo s' pipe := by
+  unfold CopyStartGate at hgate
+  have h1 : stepRunning s pipe (.copyOutResponse 0 formats)
+      = .ok (withPipe s (Pipeline.mk
+          (some (CurrentOp.mk .execute (.copyOut (CopyInfo.mk false formats))))
+          pipe.queued pipe.aborted),
+        #[.copyOutStarted (CopyInfo.mk false formats)], ByteArray.empty) := by
+    simp only [stepRunning, hcur, hgate]
+    rfl
+  obtain ⟨s', hr, hpop⟩ := execute_copyData_then n (tag := tag)
+    (info := CopyInfo.mk false formats)
+    (s := withPipe s (Pipeline.mk
+      (some (CurrentOp.mk .execute (.copyOut (CopyInfo.mk false formats))))
+      pipe.queued pipe.aborted)) rfl rfl
+  refine ⟨s', ?_, hpop⟩
+  rw [runReplies_one hph h1]
+  exact hr
+
+private theorem simpleQuery_rows_then (n : Nat) {tag : String} {tx : TxStatus} :
+    ∀ {s : State} {pipe : Pipeline}, s.phase = .running pipe →
+      pipe.current = some { kind := .simpleQuery, progress := .rows (some 0) } →
+      ∃ s', runReplies s (List.replicate n (.dataRow #[]) ++
+          [.commandComplete tag, .readyForQuery tx]) = .ok s' ∧ PopsTo s' pipe := by
+  induction n with
+  | zero =>
+    intro s pipe hph hcur
+    have h1 : stepRunning s pipe (.commandComplete tag)
+        = .ok (withPipe s { pipe with
+            current := some { kind := .simpleQuery, progress := .start } },
+          #[.commandComplete tag], ByteArray.empty) := by
+      simp only [stepRunning, hcur]
+      rfl
+    have h2 : stepRunning (withPipe s { pipe with
+            current := some { kind := .simpleQuery, progress := .start } })
+          { pipe with current := some { kind := .simpleQuery, progress := .start } }
+          (.readyForQuery tx)
+        = .ok (withPipe { (withPipe s { pipe with
+              current := some { kind := .simpleQuery, progress := .start } }) with
+              txStatus := tx }
+            (advance { pipe with
+              current := some { kind := .simpleQuery, progress := .start } }),
+          #[.ready tx], ByteArray.empty) := by
+      simp only [stepRunning]
+      rfl
+    exact ⟨_, by rw [List.replicate_zero, List.nil_append, runReplies_one hph h1,
+      runReplies_one rfl h2]; rfl, ⟨_, rfl, advance_pending _⟩⟩
+  | succ n ih =>
+    intro s pipe hph hcur
+    have h1 : stepRunning s pipe (.dataRow #[])
+        = .ok (withPipe s pipe, #[.dataRow #[]], ByteArray.empty) := by
+      simp only [stepRunning, hcur]
+      rfl
+    obtain ⟨s', hr, hpop⟩ := ih (s := withPipe s pipe) rfl hcur
+    refine ⟨s', ?_, hpop⟩
+    rw [List.replicate_succ, List.cons_append, runReplies_one hph h1]
+    exact hr
+
+/-- **The simple-query cycle completes**: RowDescription, any number of
+DataRows, CommandComplete, ReadyForQuery pops the simple query. -/
+theorem completes_simpleQuery (n : Nat) {s : State} {pipe : Pipeline}
+    {tag : String} {tx : TxStatus} (hph : s.phase = .running pipe)
+    (hcur : pipe.current = some { kind := .simpleQuery }) :
+    ∃ s', runReplies s (.rowDescription #[] ::
+        (List.replicate n (.dataRow #[]) ++
+          [.commandComplete tag, .readyForQuery tx])) = .ok s' ∧ PopsTo s' pipe := by
+  have h1 : stepRunning s pipe (.rowDescription #[])
+      = .ok (withPipe s { pipe with
+          current := some { kind := .simpleQuery, progress := .rows (some 0) } },
+        #[.rowDescription #[]], ByteArray.empty) := by
+    simp only [stepRunning, hcur]
+    rfl
+  obtain ⟨s', hr, hpop⟩ := simpleQuery_rows_then n (tag := tag) (tx := tx)
+    (s := withPipe s { pipe with
+      current := some { kind := .simpleQuery, progress := .rows (some 0) } }) rfl rfl
+  refine ⟨s', ?_, hpop⟩
+  rw [runReplies_one hph h1]
+  exact hr
 
 end Machine
 end Protocol
