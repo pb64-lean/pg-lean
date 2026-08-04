@@ -319,7 +319,7 @@ theorem encodeMessages_push (msgs : Array RawMessage) (m : RawMessage) :
     encodeMessages (msgs.push m) = encodeMessages msgs ++ m.encode := by
   simp [encodeMessages]
 
-private theorem get!_eq_getElem {a : ByteArray} {i : Nat} (h : i < a.size) :
+theorem get!_eq_getElem {a : ByteArray} {i : Nat} (h : i < a.size) :
     a.get! i = a[i] := by
   rcases a with ⟨data⟩
   show data[i]! = _
@@ -363,6 +363,70 @@ private theorem putUInt32_empty (v : UInt32) :
   show ((((ByteArray.empty.push _).push _).push _).push _) = _
   simp only [← ByteArray.append_toByteArray_singleton, ← List.toByteArray_append,
     ByteArray.empty_append, List.cons_append, List.nil_append]
+
+private theorem putUInt16_empty (v : UInt16) :
+    putUInt16 ByteArray.empty v = [(v >>> 8).toUInt8, v.toUInt8].toByteArray := by
+  show ((ByteArray.empty.push _).push _) = _
+  simp only [← ByteArray.append_toByteArray_singleton, ← List.toByteArray_append,
+    ByteArray.empty_append, List.cons_append, List.nil_append]
+
+/-- The writers append: writing onto `a` is `a ++` writing onto empty. -/
+theorem putUInt16_append (a : ByteArray) (v : UInt16) :
+    putUInt16 a v = a ++ putUInt16 ByteArray.empty v := by
+  show (a.push _).push _ = a ++ ((ByteArray.empty.push _).push _)
+  simp only [← ByteArray.append_toByteArray_singleton, ByteArray.append_assoc,
+    ByteArray.empty_append]
+
+theorem putUInt32_append (a : ByteArray) (v : UInt32) :
+    putUInt32 a v = a ++ putUInt32 ByteArray.empty v := by
+  show (((a.push _).push _).push _).push _ =
+    a ++ ((((ByteArray.empty.push _).push _).push _).push _)
+  simp only [← ByteArray.append_toByteArray_singleton, ByteArray.append_assoc,
+    ByteArray.empty_append]
+
+theorem size_putUInt16 (a : ByteArray) (v : UInt16) :
+    (putUInt16 a v).size = a.size + 2 := by
+  show ((a.push _).push _).size = a.size + 2
+  simp only [ByteArray.size_push]
+
+theorem size_putUInt32 (a : ByteArray) (v : UInt32) :
+    (putUInt32 a v).size = a.size + 4 := by
+  show ((((a.push _).push _).push _).push _).size = a.size + 4
+  simp only [ByteArray.size_push]
+
+/-- Big-endian 16-bit write/read roundtrip. -/
+theorem getUInt16?_putUInt16 (v : UInt16) :
+    getUInt16? (putUInt16 ByteArray.empty v) 0 = some v := by
+  rw [putUInt16_empty]
+  have hsz : ([(v >>> 8).toUInt8, v.toUInt8].toByteArray).size = 2 :=
+    List.size_toByteArray
+  rw [getUInt16?, if_pos (by omega)]
+  rw [get!_eq_getElem (by omega), get!_eq_getElem (by omega)]
+  simp only [List.getElem_toByteArray, List.getElem_cons_zero, List.getElem_cons_succ]
+  congr 1
+  bv_decide
+
+theorem putInt32_eq (a : ByteArray) (v : Int32) :
+    putInt32 a v = putUInt32 a v.toUInt32 := by rfl
+
+theorem size_putInt32 (a : ByteArray) (v : Int32) :
+    (putInt32 a v).size = a.size + 4 := by
+  rw [putInt32_eq]
+  exact size_putUInt32 a v.toUInt32
+
+/-- Big-endian 32-bit write/read roundtrip. -/
+theorem getUInt32?_putUInt32 (v : UInt32) :
+    getUInt32? (putUInt32 ByteArray.empty v) 0 = some v := by
+  rw [putUInt32_empty]
+  have hsz : ([(v >>> 24).toUInt8, (v >>> 16).toUInt8, (v >>> 8).toUInt8,
+      v.toUInt8].toByteArray).size = 4 :=
+    List.size_toByteArray
+  rw [getUInt32?, if_pos (by omega)]
+  rw [get!_eq_getElem (by omega), get!_eq_getElem (by omega),
+    get!_eq_getElem (by omega), get!_eq_getElem (by omega)]
+  simp only [List.getElem_toByteArray, List.getElem_cons_zero, List.getElem_cons_succ]
+  congr 1
+  bv_decide
 
 /-- A decoded frame re-encodes to exactly the bytes it was cut from. -/
 private theorem encode_extract {buffered : ByteArray} {len32 : UInt32}
@@ -487,13 +551,35 @@ private theorem get!_append_left {a b : ByteArray} {i : Nat} (h : i < a.size) :
     get!_eq_getElem h]
   exact ByteArray.getElem_append_left h
 
-private theorem getUInt32?_append_left {a b : ByteArray} {off : Nat}
+theorem getUInt32?_append_left {a b : ByteArray} {off : Nat}
     (h : off + 4 ≤ a.size) :
     getUInt32? (a ++ b) off = getUInt32? a off := by
   unfold getUInt32?
   rw [if_pos h, if_pos (show off + 4 ≤ (a ++ b).size by rw [ByteArray.size_append]; omega)]
   rw [get!_append_left (by omega), get!_append_left (by omega),
     get!_append_left (by omega), get!_append_left (by omega)]
+
+private theorem get!_append_right {a b : ByteArray} {i : Nat}
+    (h : a.size ≤ i) (h2 : i < a.size + b.size) :
+    (a ++ b).get! i = b.get! (i - a.size) := by
+  rw [get!_eq_getElem (show i < (a ++ b).size by rw [ByteArray.size_append]; omega),
+    get!_eq_getElem (by omega)]
+  exact ByteArray.getElem_append_right h
+
+/-- Reading past a prefix reads the suffix. -/
+theorem getUInt32?_append_right {a b : ByteArray} {off : Nat} (h : a.size ≤ off) :
+    getUInt32? (a ++ b) off = getUInt32? b (off - a.size) := by
+  unfold getUInt32?
+  rw [ByteArray.size_append]
+  by_cases hle : off - a.size + 4 ≤ b.size
+  · rw [if_pos (by omega), if_pos hle]
+    rw [get!_append_right (by omega) (by omega), get!_append_right (by omega) (by omega),
+      get!_append_right (by omega) (by omega), get!_append_right (by omega) (by omega)]
+    have e1 : off + 1 - a.size = off - a.size + 1 := by omega
+    have e2 : off + 2 - a.size = off - a.size + 2 := by omega
+    have e3 : off + 3 - a.size = off - a.size + 3 := by omega
+    rw [e1, e2, e3]
+  · rw [if_neg (by omega), if_neg hle]
 
 private theorem extract_append_left_of_le {a b : ByteArray} {i j : Nat}
     (hij : i ≤ j) (hj : j ≤ a.size) : (a ++ b).extract i j = a.extract i j := by

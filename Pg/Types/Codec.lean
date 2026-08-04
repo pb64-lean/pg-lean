@@ -8,6 +8,8 @@ public import Pg.Types.Numeric
 public import Pg.Types.Interval
 import Std.Data.String.ToNat
 import Std.Data.String.ToInt
+import Std.Tactic.BVDecide
+public meta import Std.Tactic.BVDecide.Reflect
 
 public section
 
@@ -104,12 +106,9 @@ def rdIntAny (b : ByteArray) : Except String Int := do
   | 8 => pure (← rdInt64 b).toInt
   | n => throw s!"unexpected integer width {n}"
 
-def putInt64BE (v : Int64) : ByteArray := Id.run do
-  let u := v.toUInt64
-  let mut out := ByteArray.empty
-  for i in [0:8] do
-    out := out.push (u >>> (UInt64.ofNat ((7 - i) * 8))).toUInt8
-  return out
+def putInt64BE (v : Int64) : ByteArray :=
+  Protocol.putUInt32 (Protocol.putUInt32 ByteArray.empty (v.toUInt64 >>> 32).toUInt32)
+    v.toUInt64.toUInt32
 
 -- ── numbers ────────────────────────────────────────────────────────────────
 
@@ -479,14 +478,22 @@ instance : PgEncode PgNumeric where
   typeOid := Oid.numeric
   encode n := some n.toString.toUTF8
 
+/-- Binary `interval`: 8-byte microseconds, 4-byte days, 4-byte months
+(big-endian, in that order). Shaped as a plain match chain for provability. -/
+def PgInterval.fromBinary (b : ByteArray) : Except String PgInterval :=
+  if b.size = 16 then
+    match rdInt64 b 0, rdInt32 b 8, rdInt32 b 12 with
+    | .ok micros, .ok days, .ok months =>
+      .ok { months := months.toInt, days := days.toInt, micros := micros.toInt }
+    | .error e, _, _ => .error e
+    | _, .error e, _ => .error e
+    | _, _, .error e => .error e
+  else
+    .error "interval must be 16 bytes"
+
 instance : PgDecode PgInterval where
   decodeText _ s := PgInterval.fromString s
-  decodeBinary _ b := do
-    unless b.size == 16 do throw "interval must be 16 bytes"
-    let micros := (← rdInt64 b 0).toInt
-    let days := (← rdInt32 b 8).toInt
-    let months := (← rdInt32 b 12).toInt
-    pure { months, days, micros }
+  decodeBinary _ b := PgInterval.fromBinary b
 
 def PgInterval.toBinary (iv : PgInterval) : ByteArray :=
   putInt64BE (Int64.ofInt iv.micros) ++
@@ -681,5 +688,144 @@ theorem decode_encode_bytea (oid : UInt32) (b : ByteArray) :
   rw [decodeValue]
   rw [if_pos (by decide)]
   rfl
+
+/-!
+### Binary integer roundtrips
+
+The big-endian binary writers and readers invert each other:
+`rdInt16`/`rdInt32`/`rdInt64`/`rdUInt64` read back exactly what
+`putUInt16`/`putInt32`/`putInt64BE` wrote, and the width-dispatching
+`rdIntAny` recovers the mathematical integer at every width.
+-/
+
+theorem size_putInt64BE (v : Int64) : (putInt64BE v).size = 8 := by
+  unfold putInt64BE
+  rw [Protocol.size_putUInt32, Protocol.size_putUInt32, ByteArray.size_empty]
+
+theorem putInt64BE_split (v : Int64) :
+    putInt64BE v =
+      Protocol.putUInt32 ByteArray.empty (v.toUInt64 >>> 32).toUInt32 ++
+        Protocol.putUInt32 ByteArray.empty v.toUInt64.toUInt32 :=
+  Protocol.putUInt32_append _ _
+
+theorem getUInt32?_putInt64BE_0 (v : Int64) :
+    Protocol.getUInt32? (putInt64BE v) 0 = some (v.toUInt64 >>> 32).toUInt32 := by
+  rw [putInt64BE_split,
+    Protocol.getUInt32?_append_left
+      (by rw [Protocol.size_putUInt32, ByteArray.size_empty]; omega),
+    Protocol.getUInt32?_putUInt32]
+
+theorem getUInt32?_putInt64BE_4 (v : Int64) :
+    Protocol.getUInt32? (putInt64BE v) 4 = some v.toUInt64.toUInt32 := by
+  have hA : (Protocol.putUInt32 ByteArray.empty (v.toUInt64 >>> 32).toUInt32).size = 4 := by
+    rw [Protocol.size_putUInt32, ByteArray.size_empty]
+  rw [putInt64BE_split, Protocol.getUInt32?_append_right (by omega),
+    show 4 - (Protocol.putUInt32 ByteArray.empty (v.toUInt64 >>> 32).toUInt32).size = 0
+      by omega,
+    Protocol.getUInt32?_putUInt32]
+
+theorem rdInt16_putUInt16 (x : Int16) :
+    rdInt16 (Protocol.putUInt16 ByteArray.empty x.toUInt16) = .ok x := by
+  unfold rdInt16
+  simp only [Protocol.getUInt16?_putUInt16, Int16.toInt16_toUInt16]
+  rfl
+
+theorem rdInt32_putInt32 (x : Int32) :
+    rdInt32 (Protocol.putInt32 ByteArray.empty x) = .ok x := by
+  unfold rdInt32
+  rw [Protocol.putInt32_eq]
+  simp only [Protocol.getUInt32?_putUInt32, Int32.toInt32_toUInt32]
+  rfl
+
+theorem rdUInt64_putInt64BE (v : Int64) : rdUInt64 (putInt64BE v) = .ok v.toUInt64 := by
+  unfold rdUInt64
+  simp only [Nat.zero_add, getUInt32?_putInt64BE_0, getUInt32?_putInt64BE_4]
+  exact congrArg Except.ok (by bv_decide)
+
+theorem rdInt64_putInt64BE (v : Int64) : rdInt64 (putInt64BE v) = .ok v := by
+  unfold rdInt64
+  rw [rdUInt64_putInt64BE]
+  show Except.ok v.toUInt64.toInt64 = Except.ok v
+  rw [Int64.toInt64_toUInt64]
+
+/-- `rdIntAny` recovers the integer from an 8-byte big-endian encoding. -/
+theorem rdIntAny_putInt64BE (v : Int64) : rdIntAny (putInt64BE v) = .ok v.toInt := by
+  unfold rdIntAny
+  rw [size_putInt64BE, rdInt64_putInt64BE]
+  rfl
+
+/-- `rdIntAny` recovers the integer from a 2-byte big-endian encoding. -/
+theorem rdIntAny_putUInt16 (x : Int16) :
+    rdIntAny (Protocol.putUInt16 ByteArray.empty x.toUInt16) = .ok x.toInt := by
+  unfold rdIntAny
+  rw [Protocol.size_putUInt16, ByteArray.size_empty, Nat.zero_add, rdInt16_putUInt16]
+  rfl
+
+/-- `rdIntAny` recovers the integer from a 4-byte big-endian encoding. -/
+theorem rdIntAny_putInt32 (x : Int32) :
+    rdIntAny (Protocol.putInt32 ByteArray.empty x) = .ok x.toInt := by
+  unfold rdIntAny
+  rw [Protocol.size_putInt32, ByteArray.size_empty, Nat.zero_add, rdInt32_putInt32]
+  rfl
+
+/-- Every representable `interval` (fields within int32/int64 wire range)
+roundtrips through its 16-byte binary form. -/
+theorem PgInterval.fromBinary_toBinary (m d : Int32) (u : Int64) :
+    PgInterval.fromBinary
+        (PgInterval.toBinary { months := m.toInt, days := d.toInt, micros := u.toInt }) =
+      .ok { months := m.toInt, days := d.toInt, micros := u.toInt } := by
+  have hb : PgInterval.toBinary { months := m.toInt, days := d.toInt, micros := u.toInt } =
+      putInt64BE u ++
+        (Protocol.putUInt32 ByteArray.empty d.toUInt32 ++
+          Protocol.putUInt32 ByteArray.empty m.toUInt32) := by
+    unfold PgInterval.toBinary
+    rw [Int64.ofInt_toInt, Int32.ofInt_toInt, Int32.ofInt_toInt, ByteArray.append_assoc]
+  suffices h : ∀ b : ByteArray,
+      b = putInt64BE u ++
+        (Protocol.putUInt32 ByteArray.empty d.toUInt32 ++
+          Protocol.putUInt32 ByteArray.empty m.toUInt32) →
+      PgInterval.fromBinary b =
+        .ok { months := m.toInt, days := d.toInt, micros := u.toInt } by
+    rw [hb]
+    exact h _ rfl
+  intro b hbdef
+  have hP : (putInt64BE u).size = 8 := size_putInt64BE u
+  have hD : (Protocol.putUInt32 ByteArray.empty d.toUInt32).size = 4 := by
+    rw [Protocol.size_putUInt32, ByteArray.size_empty]
+  have hM : (Protocol.putUInt32 ByteArray.empty m.toUInt32).size = 4 := by
+    rw [Protocol.size_putUInt32, ByteArray.size_empty]
+  have hsize : b.size = 16 := by
+    rw [hbdef, ByteArray.size_append, ByteArray.size_append, hP, hD, hM]
+  have h0 : Protocol.getUInt32? b 0 = some (u.toUInt64 >>> 32).toUInt32 := by
+    rw [hbdef, Protocol.getUInt32?_append_left (by omega), getUInt32?_putInt64BE_0]
+  have h4 : Protocol.getUInt32? b 4 = some u.toUInt64.toUInt32 := by
+    rw [hbdef, Protocol.getUInt32?_append_left (by omega), getUInt32?_putInt64BE_4]
+  have h8 : Protocol.getUInt32? b 8 = some d.toUInt32 := by
+    rw [hbdef, Protocol.getUInt32?_append_right (by omega),
+      show 8 - (putInt64BE u).size = 0 by omega,
+      Protocol.getUInt32?_append_left (by omega), Protocol.getUInt32?_putUInt32]
+  have h12 : Protocol.getUInt32? b 12 = some m.toUInt32 := by
+    rw [hbdef, Protocol.getUInt32?_append_right (by omega),
+      show 12 - (putInt64BE u).size = 4 by omega,
+      Protocol.getUInt32?_append_right (by omega),
+      show 4 - (Protocol.putUInt32 ByteArray.empty d.toUInt32).size = 0 by omega,
+      Protocol.getUInt32?_putUInt32]
+  have hrd64 : rdInt64 b 0 = .ok u := by
+    unfold rdInt64 rdUInt64
+    simp only [Nat.zero_add, h0, h4]
+    show Except.ok ((u.toUInt64 >>> 32).toUInt32.toUInt64 <<< 32 |||
+      u.toUInt64.toUInt32.toUInt64).toInt64 = Except.ok u
+    rw [show ((u.toUInt64 >>> 32).toUInt32.toUInt64 <<< 32 |||
+      u.toUInt64.toUInt32.toUInt64) = u.toUInt64 by bv_decide, Int64.toInt64_toUInt64]
+  have hrd8 : rdInt32 b 8 = .ok d := by
+    unfold rdInt32
+    simp only [h8, Int32.toInt32_toUInt32]
+    rfl
+  have hrd12 : rdInt32 b 12 = .ok m := by
+    unfold rdInt32
+    simp only [h12, Int32.toInt32_toUInt32]
+    rfl
+  unfold PgInterval.fromBinary
+  rw [hsize, if_pos rfl, hrd64, hrd8, hrd12]
 
 end Pg
