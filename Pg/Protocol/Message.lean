@@ -472,5 +472,143 @@ theorem DecodeState.feed_conservation_drained {s : DecodeState} {chunk : ByteArr
   rwa [hm, show encodeMessages #[] = ByteArray.empty from rfl,
     ByteArray.empty_append] at this
 
+/-!
+### Partition invariance
+
+Chunk boundaries are invisible: feeding one big chunk equals feeding any
+split of it (`feed_append`), so any two chunkings of the same byte stream
+produce the same messages, residual buffer, and error behavior
+(`feed_partition_invariant`).
+-/
+
+private theorem get!_append_left {a b : ByteArray} {i : Nat} (h : i < a.size) :
+    (a ++ b).get! i = a.get! i := by
+  rw [get!_eq_getElem (show i < (a ++ b).size by rw [ByteArray.size_append]; omega),
+    get!_eq_getElem h]
+  exact ByteArray.getElem_append_left h
+
+private theorem getUInt32?_append_left {a b : ByteArray} {off : Nat}
+    (h : off + 4 ≤ a.size) :
+    getUInt32? (a ++ b) off = getUInt32? a off := by
+  unfold getUInt32?
+  rw [if_pos h, if_pos (show off + 4 ≤ (a ++ b).size by rw [ByteArray.size_append]; omega)]
+  rw [get!_append_left (by omega), get!_append_left (by omega),
+    get!_append_left (by omega), get!_append_left (by omega)]
+
+private theorem extract_append_left_of_le {a b : ByteArray} {i j : Nat}
+    (hij : i ≤ j) (hj : j ≤ a.size) : (a ++ b).extract i j = a.extract i j := by
+  rw [ByteArray.extract_append,
+    Nat.sub_eq_zero_of_le (Nat.le_trans hij hj),
+    Nat.sub_eq_zero_of_le hj,
+    ByteArray.extract_same, ByteArray.append_empty]
+
+private theorem extract_append_chunk {a b : ByteArray} {i : Nat} (hi : i ≤ a.size) :
+    (a ++ b).extract i (a ++ b).size = a.extract i a.size ++ b := by
+  rw [ByteArray.size_append, ByteArray.extract_append,
+    Nat.sub_eq_zero_of_le hi, Nat.add_sub_cancel_left, ByteArray.extract_zero_size]
+  congr 1
+  apply ByteArray.ext_getElem
+  · simp only [ByteArray.size_extract]
+    omega
+  · intro k hk hk'
+    rw [ByteArray.getElem_extract, ByteArray.getElem_extract]
+
+/-- One scan step commutes with appending more bytes: parsing `buffered ++ b`
+is parsing `buffered` first, then continuing on the retained residue plus
+`b` — including identical error behavior. -/
+private theorem parseBuffered_append (buffered : ByteArray)
+    (messages : Array RawMessage) (b : ByteArray) :
+    parseBuffered (buffered ++ b) messages =
+      (parseBuffered buffered messages).bind
+        (fun st => parseBuffered (st.buffered ++ b) st.messages) := by
+  fun_induction parseBuffered buffered messages with
+  | case1 buffered messages hsize =>
+    rfl
+  | case2 buffered messages hsize hget =>
+    rw [getUInt32?, if_pos (by simp only [lengthFieldSize] at hsize; omega)] at hget
+    cases hget
+  | case3 =>
+    rename_i buffered messages hsize len32 hget tag len hlen
+    have hsize5 : 1 + 4 ≤ buffered.size := by
+      simp only [lengthFieldSize] at hsize; omega
+    have hlen' : (decide (len32.toNat < lengthFieldSize) ||
+        decide (len32.toNat > maxMessageLength)) = true := hlen
+    rw [parseBuffered.eq_def]
+    rw [if_neg (show ¬(buffered ++ b).size < 1 + lengthFieldSize by
+      rw [ByteArray.size_append]; omega)]
+    rw [getUInt32?_append_left (by omega)]
+    simp only [hget]
+    rw [dif_pos hlen']
+    rw [get!_append_left (show 0 < buffered.size by omega)]
+    rfl
+  | case4 =>
+    rename_i buffered messages hsize len32 hget len hlen hend
+    rfl
+  | case5 =>
+    rename_i buffered messages hsize len32 hget tag len hlen hend payload rest ih
+    have hsize5 : 1 + 4 ≤ buffered.size := by
+      simp only [lengthFieldSize] at hsize; omega
+    have hlen4 : lengthFieldSize ≤ len := by
+      simp only [decide_eq_true_eq, Bool.or_eq_true, not_or] at hlen
+      exact Nat.le_of_not_lt hlen.1
+    simp only [lengthFieldSize] at hlen4
+    have hlenEq : len = len32.toNat := rfl
+    have hlen' : ¬(decide (len32.toNat < lengthFieldSize) ||
+        decide (len32.toNat > maxMessageLength)) = true := hlen
+    have hend' : 1 + len32.toNat ≤ buffered.size := by omega
+    rw [parseBuffered.eq_def]
+    rw [if_neg (show ¬(buffered ++ b).size < 1 + lengthFieldSize by
+      rw [ByteArray.size_append]; omega)]
+    rw [getUInt32?_append_left (by omega)]
+    simp only [hget]
+    rw [dif_neg hlen']
+    rw [dif_neg (show ¬(buffered ++ b).size < 1 + len32.toNat by
+      rw [ByteArray.size_append]; omega)]
+    rw [get!_append_left (show 0 < buffered.size by omega)]
+    rw [extract_append_left_of_le (a := buffered) (b := b) (i := 1 + lengthFieldSize)
+      (j := 1 + len32.toNat) (by simp only [lengthFieldSize]; omega) (by omega)]
+    rw [extract_append_chunk (a := buffered) (b := b) (i := 1 + len32.toNat) (by omega)]
+    exact ih
+
+/-- Feeding a concatenation is feeding its parts in sequence. -/
+theorem DecodeState.feed_append (s : DecodeState) (a b : ByteArray) :
+    s.feed (a ++ b) = (s.feed a).bind (fun st => st.feed b) := by
+  show parseBuffered (s.buffered ++ (a ++ b)) s.messages = _
+  rw [← ByteArray.append_assoc, parseBuffered_append]
+  rfl
+
+/-- Feeding chunks one at a time equals feeding their concatenation. -/
+theorem DecodeState.feed_chunks (s : DecodeState) (c : ByteArray)
+    (cs : List ByteArray) :
+    List.foldlM DecodeState.feed s (c :: cs) = s.feed (cs.foldl (· ++ ·) c) := by
+  induction cs generalizing s c with
+  | nil => simp [List.foldlM_cons, List.foldlM_nil, List.foldl_nil]
+  | cons d ds ih =>
+    have hassoc : ∀ (x y : ByteArray) (l : List ByteArray),
+        l.foldl (· ++ ·) (x ++ y) = x ++ l.foldl (· ++ ·) y := by
+      intro x y l
+      induction l generalizing y with
+      | nil => rfl
+      | cons z zs ihz =>
+        rw [List.foldl_cons, List.foldl_cons, ByteArray.append_assoc, ihz]
+    rw [List.foldlM_cons]
+    calc (s.feed c).bind (fun st => List.foldlM DecodeState.feed st (d :: ds))
+        = (s.feed c).bind (fun st => st.feed (ds.foldl (· ++ ·) d)) := by
+          cases s.feed c with
+          | error e => rfl
+          | ok st => simp only [Except.bind]; exact ih st d
+      _ = s.feed (c ++ ds.foldl (· ++ ·) d) := (s.feed_append c _).symm
+      _ = s.feed (List.foldl (· ++ ·) (c ++ d) ds) := by rw [hassoc]
+      _ = s.feed ((d :: ds).foldl (· ++ ·) c) := by rw [List.foldl_cons]
+
+/-- **Partition invariance**: any two chunkings of the same byte stream give
+the same parse — same messages, same residual buffer, same errors. -/
+theorem DecodeState.feed_partition_invariant (s : DecodeState)
+    {c d : ByteArray} {cs ds : List ByteArray}
+    (h : cs.foldl (· ++ ·) c = ds.foldl (· ++ ·) d) :
+    List.foldlM DecodeState.feed s (c :: cs) =
+      List.foldlM DecodeState.feed s (d :: ds) := by
+  rw [DecodeState.feed_chunks, DecodeState.feed_chunks, h]
+
 end Protocol
 end Pg
