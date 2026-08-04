@@ -1,5 +1,8 @@
 module
 
+import Std.Tactic.BVDecide
+public meta import Std.Tactic.BVDecide.Reflect
+
 public section
 
 namespace Pg
@@ -129,24 +132,29 @@ structure DecodeState where
   messages : Array RawMessage := #[]
   deriving Inhabited
 
-private partial def parseBuffered (buffered : ByteArray) (messages : Array RawMessage) :
-    Except String DecodeState := do
+private def parseBuffered (buffered : ByteArray) (messages : Array RawMessage) :
+    Except String DecodeState :=
   if buffered.size < 1 + lengthFieldSize then
     pure { buffered, messages }
   else
-    let tag := buffered.get! 0
-    let some len32 := getUInt32? buffered 1
-      | pure { buffered, messages }
-    let len := len32.toNat
-    if len < lengthFieldSize || len > maxMessageLength then
-      throw s!"invalid message length {len} (tag {tag})"
-    let endPos := 1 + len
-    if buffered.size < endPos then
-      pure { buffered, messages }
-    else
-      let payload := buffered.extract (1 + lengthFieldSize) endPos
-      let rest := buffered.extract endPos buffered.size
-      parseBuffered rest (messages.push { tag, payload })
+    match getUInt32? buffered 1 with
+    | none => pure { buffered, messages }
+    | some len32 =>
+      let tag := buffered.get! 0
+      let len := len32.toNat
+      if hlen : len < lengthFieldSize || len > maxMessageLength then
+        throw s!"invalid message length {len} (tag {tag})"
+      else if hend : buffered.size < 1 + len then
+        pure { buffered, messages }
+      else
+        let payload := buffered.extract (1 + lengthFieldSize) (1 + len)
+        let rest := buffered.extract (1 + len) buffered.size
+        parseBuffered rest (messages.push { tag, payload })
+  termination_by buffered.size
+  decreasing_by
+    simp only [ByteArray.size_extract, lengthFieldSize] at *
+    simp only [decide_eq_true_eq, Bool.or_eq_true, not_or] at hlen
+    omega
 
 def DecodeState.feed (state : DecodeState) (chunk : ByteArray) :
     Except String DecodeState :=
@@ -291,6 +299,178 @@ def encodeQuery (sql : String) : ByteArray :=
 
 def encodeTerminate : ByteArray :=
   frame .terminate
+
+/-!
+### Framing laws
+
+Conservation: a successful `DecodeState.feed` step neither invents nor drops
+bytes — re-encoding every accumulated message and appending the retained
+buffer reproduces exactly the bytes fed so far. `RawMessage.encode` is
+byte-exact for decoded frames because the decoder only accepts frames whose
+length field equals `payload.size + lengthFieldSize`, which is precisely what
+the encoder writes back.
+-/
+
+/-- Byte-exact re-encoder for a decoded message stream. -/
+def encodeMessages (msgs : Array RawMessage) : ByteArray :=
+  msgs.foldl (fun acc m => acc ++ m.encode) ByteArray.empty
+
+theorem encodeMessages_push (msgs : Array RawMessage) (m : RawMessage) :
+    encodeMessages (msgs.push m) = encodeMessages msgs ++ m.encode := by
+  simp [encodeMessages]
+
+private theorem get!_eq_getElem {a : ByteArray} {i : Nat} (h : i < a.size) :
+    a.get! i = a[i] := by
+  rcases a with ⟨data⟩
+  show data[i]! = _
+  rw [getElem!_pos data i (by simpa using h)]
+  simp [ByteArray.getElem_eq_getElem_data]
+
+theorem getUInt32?_bound {bytes : ByteArray} {off : Nat} {v : UInt32}
+    (h : getUInt32? bytes off = some v) : off + 4 ≤ bytes.size := by
+  by_cases hle : off + 4 ≤ bytes.size
+  · exact hle
+  · simp [getUInt32?, hle] at h
+
+private theorem getUInt32?_spec {bytes : ByteArray} {off : Nat} {v : UInt32}
+    (h : getUInt32? bytes off = some v) (h4 : off + 4 ≤ bytes.size) :
+    v = (bytes[off]'(by omega)).toUInt32 <<< 24 |||
+        (bytes[off + 1]'(by omega)).toUInt32 <<< 16 |||
+        (bytes[off + 2]'(by omega)).toUInt32 <<< 8 |||
+        (bytes[off + 3]'(by omega)).toUInt32 := by
+  simp only [getUInt32?, if_pos h4, Option.some.injEq] at h
+  rw [← h,
+    get!_eq_getElem (show off < bytes.size by omega),
+    get!_eq_getElem (show off + 1 < bytes.size by omega),
+    get!_eq_getElem (show off + 2 < bytes.size by omega),
+    get!_eq_getElem (show off + 3 < bytes.size by omega)]
+
+/-- Big-endian packing then unpacking each byte is the identity. -/
+private theorem pack_unpack (b0 b1 b2 b3 : UInt8) :
+    (((b0.toUInt32 <<< 24 ||| b1.toUInt32 <<< 16 ||| b2.toUInt32 <<< 8 |||
+        b3.toUInt32) >>> 24).toUInt8 = b0) ∧
+    (((b0.toUInt32 <<< 24 ||| b1.toUInt32 <<< 16 ||| b2.toUInt32 <<< 8 |||
+        b3.toUInt32) >>> 16).toUInt8 = b1) ∧
+    (((b0.toUInt32 <<< 24 ||| b1.toUInt32 <<< 16 ||| b2.toUInt32 <<< 8 |||
+        b3.toUInt32) >>> 8).toUInt8 = b2) ∧
+    ((b0.toUInt32 <<< 24 ||| b1.toUInt32 <<< 16 ||| b2.toUInt32 <<< 8 |||
+        b3.toUInt32).toUInt8 = b3) := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> bv_decide
+
+private theorem putUInt32_empty (v : UInt32) :
+    putUInt32 ByteArray.empty v =
+      [(v >>> 24).toUInt8, (v >>> 16).toUInt8, (v >>> 8).toUInt8, v.toUInt8].toByteArray := by
+  show ((((ByteArray.empty.push _).push _).push _).push _) = _
+  simp only [← ByteArray.append_toByteArray_singleton, ← List.toByteArray_append,
+    ByteArray.empty_append, List.cons_append, List.nil_append]
+
+/-- A decoded frame re-encodes to exactly the bytes it was cut from. -/
+private theorem encode_extract {buffered : ByteArray} {len32 : UInt32}
+    (hget : getUInt32? buffered 1 = some len32)
+    (hlen : lengthFieldSize ≤ len32.toNat)
+    (hsize : 1 + len32.toNat ≤ buffered.size) :
+    RawMessage.encode
+        { tag := buffered.get! 0
+          payload := buffered.extract (1 + lengthFieldSize) (1 + len32.toNat) } =
+      buffered.extract 0 (1 + len32.toNat) := by
+  have h5 : 1 + 4 ≤ buffered.size := getUInt32?_bound hget
+  simp only [lengthFieldSize] at hlen ⊢
+  have hpay : (buffered.extract (1 + 4) (1 + len32.toNat)).size = len32.toNat - 4 := by
+    simp only [ByteArray.size_extract]; omega
+  have hv : ((buffered.extract (1 + 4) (1 + len32.toNat)).size + 4).toUInt32 = len32 := by
+    rw [hpay]
+    have : len32.toNat - 4 + 4 = len32.toNat := by omega
+    rw [this]
+    exact UInt32.ofNat_toNat
+  rw [RawMessage.encode]
+  simp only [lengthFieldSize, hv]
+  have hspec := getUInt32?_spec hget (by omega)
+  obtain ⟨e0, e1, e2, e3⟩ := pack_unpack (buffered[1]'(by omega))
+    (buffered[1 + 1]'(by omega)) (buffered[1 + 2]'(by omega)) (buffered[1 + 3]'(by omega))
+  rw [ByteArray.extract_eq_extract_append_extract (a := buffered) (i := 0)
+      (k := 1 + len32.toNat) 1 (by omega) (by omega),
+    ByteArray.extract_eq_extract_append_extract (a := buffered) (i := 1)
+      (k := 1 + len32.toNat) (1 + 4) (by omega) (by omega)]
+  have hhead : (ByteArray.empty.push (buffered.get! 0)) = buffered.extract 0 1 := by
+    rw [ByteArray.extract_add_one (i := 0) (by omega)]
+    rw [get!_eq_getElem (show 0 < buffered.size by omega)]
+    rw [← ByteArray.append_toByteArray_singleton, ByteArray.empty_append]
+    rfl
+  have hlenbytes : putUInt32 ByteArray.empty len32 = buffered.extract 1 (1 + 4) := by
+    rw [putUInt32_empty, ByteArray.extract_add_four (by omega), hspec, e0, e1, e2, e3]
+    rfl
+  calc putUInt32 (ByteArray.empty.push (buffered.get! 0)) len32 ++
+          buffered.extract (1 + 4) (1 + len32.toNat)
+      = (ByteArray.empty.push (buffered.get! 0) ++ putUInt32 ByteArray.empty len32) ++
+          buffered.extract (1 + 4) (1 + len32.toNat) := by
+        rw [putUInt32, putUInt32]
+        simp only [← ByteArray.append_toByteArray_singleton, ByteArray.append_assoc,
+          ByteArray.empty_append]
+    _ = buffered.extract 0 1 ++ (buffered.extract 1 (1 + 4) ++
+          buffered.extract (1 + 4) (1 + len32.toNat)) := by
+        rw [hhead, hlenbytes, ByteArray.append_assoc]
+
+/-- Parsing never invents or drops bytes: re-encoding all accumulated messages
+and appending the retained buffer is a left-invariant of the scan. -/
+private theorem parseBuffered_conservation {buffered : ByteArray}
+    {messages : Array RawMessage} :
+    ∀ {st : DecodeState}, parseBuffered buffered messages = .ok st →
+      encodeMessages st.messages ++ st.buffered = encodeMessages messages ++ buffered := by
+  fun_induction parseBuffered buffered messages with
+  | case1 buffered messages _ =>
+    intro st h
+    cases h
+    rfl
+  | case2 buffered messages _ _ =>
+    intro st h
+    cases h
+    rfl
+  | case3 =>
+    intro st h
+    cases h
+  | case4 =>
+    intro st h
+    cases h
+    rfl
+  | case5 =>
+    rename_i buffered messages hsize len32 hget tag len hlen hend payload rest ih
+    intro st h
+    have hstep := ih h
+    rw [encodeMessages_push] at hstep
+    rw [hstep, ByteArray.append_assoc]
+    congr 1
+    have hlenEq : len = len32.toNat := rfl
+    simp only [decide_eq_true_eq, Bool.or_eq_true, not_or] at hlen
+    have hlen4 : lengthFieldSize ≤ len32.toNat := by
+      rw [← hlenEq]; exact Nat.le_of_not_lt hlen.1
+    show RawMessage.encode
+        { tag := buffered.get! 0
+          payload := buffered.extract (1 + lengthFieldSize) (1 + len32.toNat) } ++
+        buffered.extract (1 + len32.toNat) buffered.size = buffered
+    rw [encode_extract hget hlen4 (by omega)]
+    rw [← ByteArray.extract_eq_extract_append_extract (a := buffered) (i := 0)
+      (k := buffered.size) (1 + len32.toNat) (by omega) (by omega)]
+    exact ByteArray.extract_zero_size
+
+/-- Conservation for the shell entry point: one successful `feed` preserves
+the byte stream exactly — re-encoded messages plus the retained buffer equal
+the previously retained buffer plus the fed chunk. -/
+theorem DecodeState.feed_conservation {s : DecodeState} {chunk : ByteArray}
+    {s' : DecodeState} (h : s.feed chunk = .ok s') :
+    encodeMessages s'.messages ++ s'.buffered =
+      encodeMessages s.messages ++ (s.buffered ++ chunk) := by
+  have := parseBuffered_conservation (buffered := s.buffered ++ chunk)
+    (messages := s.messages) h
+  exact this
+
+/-- Conservation in drained form (`messages` empty, e.g. right after `take`):
+the emitted messages plus the retained buffer are exactly the input bytes. -/
+theorem DecodeState.feed_conservation_drained {s : DecodeState} {chunk : ByteArray}
+    {s' : DecodeState} (hm : s.messages = #[]) (h : s.feed chunk = .ok s') :
+    encodeMessages s'.messages ++ s'.buffered = s.buffered ++ chunk := by
+  have := DecodeState.feed_conservation h
+  rwa [hm, show encodeMessages #[] = ByteArray.empty from rfl,
+    ByteArray.empty_append] at this
 
 end Protocol
 end Pg
