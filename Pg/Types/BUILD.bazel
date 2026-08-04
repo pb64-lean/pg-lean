@@ -8,6 +8,7 @@ lean_library(
     name = "types",
     srcs = [
         "Codec.lean",
+        "Digits.lean",
         "Interval.lean",
         "Numeric.lean",
         "Oid.lean",

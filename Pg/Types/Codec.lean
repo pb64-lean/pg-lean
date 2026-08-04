@@ -3,6 +3,7 @@ module
 public import Std.Time
 public import Pg.Protocol.Message
 public import Pg.Crypto.Hex
+public import Pg.Types.Digits
 public import Pg.Types.Oid
 public import Pg.Types.Numeric
 public import Pg.Types.Interval
@@ -270,64 +271,11 @@ instance : PgEncode ByteArray where
   typeOid := Oid.bytea
   encode v := some v
 
--- ── decimal digit strings ─────────────────────────────────────────────────
-
-/-!
-PostgreSQL's temporal text formats are fixed-width zero-padded decimal fields,
-so the roundtrip proofs have to walk digits. Neither `Nat.repr` nor
-`String.toNat?` can carry that: `Nat.digitChar` is not exposed to the kernel,
-and core ships no lemma about `String.toNat?` of a zero-padded argument. These
-four functions render and parse exactly the same decimal strings while staying
-kernel-visible.
--/
-
-@[expose] def isAsciiDigit (c : Char) : Bool := 48 ≤ c.toNat && c.toNat ≤ 57
-
-@[expose] def digitChar (d : Nat) : Char := Char.ofNat (48 + d % 10)
-
-/-- Decimal digits of `n`, most significant first (`0` is `['0']`) — the same
-characters `toString n` produces. -/
-def natDigits (n : Nat) : List Char :=
-  if n < 10 then [digitChar n] else natDigits (n / 10) ++ [digitChar (n % 10)]
-termination_by n
-decreasing_by exact Nat.div_lt_self (by omega) (by omega)
-
-/-- `n` in decimal, left-padded with `'0'` to at least `width` characters
-(never truncated — a wider value keeps all its digits, as PostgreSQL does with
-5-digit years). -/
-def padDigits (width n : Nat) : List Char :=
-  List.replicate (width - (natDigits n).length) '0' ++ natDigits n
-
-/-- Fold a decimal digit list onto an accumulator; `none` on any non-digit. -/
-def natOfDigits (acc : Nat) : List Char → Option Nat
-  | [] => some acc
-  | c :: rest =>
-    if isAsciiDigit c then natOfDigits (acc * 10 + (c.toNat - 48)) rest else none
-
-/-- A whole decimal field: at least one character, all of them digits. -/
-def natOfDigitsFull : List Char → Option Nat
-  | [] => none
-  | chars => natOfDigits 0 chars
-
 -- ── temporal types ─────────────────────────────────────────────────────────
-
-def parseNatField (s : String) (what : String) : Except String Nat :=
-  match natOfDigitsFull s.toList with
-  | some v => pure v
-  | none => throw s!"bad {what}: {s}"
 
 def rejectInfinity (s : String) : Except String Unit := do
   if s == "infinity" || s == "-infinity" then
     throw "date/timestamp infinity is not representable"
-
-/-- Split a string at every occurrence of one character.
-
-Deliberately not `String.splitOn`: `String.splitOnAux` is `@[irreducible]` and
-core ships no lemmas about it, so a `String.splitOn`-based parser is opaque to
-the kernel. `List.splitOn` has a full lemma set and agrees with it for a
-single-character separator. (Same trick as `Pg.Sasl.Scram.splitOnChar`.) -/
-def splitOnChar (c : Char) (s : String) : List String :=
-  (s.toList.splitOn c).map String.ofList
 
 /-- The three decimal fields of a `YYYY-MM-DD` date, before any calendar
 validation. -/
@@ -673,14 +621,6 @@ def arrayScan (src : String) : ArrayScan → List Char → Except String ArraySc
         arrayScan src
           { st with buf := [], quoted := false, sawAny := c == ',', closed := c == '}' } rest
     else arrayScan src { st with buf := c :: st.buf, sawAny := true } rest
-
-@[expose] def isAsciiSpace (c : Char) : Bool :=
-  c == ' ' || c == '\t' || c == '\n' || c == '\r'
-
-/-- Trim ASCII whitespace on the character list. `String.trimAscii` goes
-through `String.Slice`, which the kernel cannot follow. -/
-def trimAsciiChars (l : List Char) : List Char :=
-  ((l.dropWhile isAsciiSpace).reverse.dropWhile isAsciiSpace).reverse
 
 /-- Parse `{a,"quo\"ted",NULL}` into raw element texts. 1-D only. -/
 def parseArrayText (s : String) : Except String (Array (Option String)) :=
@@ -1042,184 +982,6 @@ theorem PgInterval.fromBinary_toBinary (m d : Int32) (u : Int64) :
   rw [hsize, if_pos rfl, hrd64, hrd8, hrd12]
 
 /-!
-### Decimal digit strings
-
-The temporal text codecs are proved through these: `natOfDigits` reads back
-exactly what `natDigits`/`padDigits` wrote, at any padding width.
--/
-
-theorem toNat_ofNat_ascii {n : Nat} (h : n ≤ 127) : (Char.ofNat n).toNat = n := by
-  show (Char.ofNat n).val.toNat = n
-  unfold Char.ofNat
-  rw [dif_pos (by unfold Nat.isValidChar; omega)]
-  unfold Char.ofNatAux
-  simp [UInt32.toNat]
-
-theorem toNat_digitChar {d : Nat} (h : d < 10) : (digitChar d).toNat = 48 + d := by
-  unfold digitChar
-  rw [Nat.mod_eq_of_lt h, toNat_ofNat_ascii (by omega)]
-
-theorem isAsciiDigit_digitChar {d : Nat} (h : d < 10) :
-    isAsciiDigit (digitChar d) = true := by
-  unfold isAsciiDigit
-  rw [toNat_digitChar h]
-  simp only [Bool.and_eq_true, decide_eq_true_eq]
-  omega
-
-theorem natOfDigits_append : ∀ (l₁ : List Char) (acc : Nat) (l₂ : List Char),
-    natOfDigits acc (l₁ ++ l₂)
-      = (natOfDigits acc l₁).bind (fun a => natOfDigits a l₂) := by
-  intro l₁
-  induction l₁ with
-  | nil => intro acc l₂; rfl
-  | cons c t ih =>
-    intro acc l₂
-    simp only [List.cons_append, natOfDigits]
-    split
-    · exact ih _ _
-    · rfl
-
-/-- `natDigits` is never empty, so a rendered field always has a digit. -/
-theorem natDigits_ne_nil (n : Nat) : natDigits n ≠ [] := by
-  unfold natDigits
-  split
-  · exact List.cons_ne_nil _ _
-  · exact List.append_ne_nil_of_right_ne_nil _ (List.cons_ne_nil _ _)
-
-theorem natOfDigits_natDigits : ∀ (n : Nat) (acc : Nat),
-    natOfDigits acc (natDigits n) = some (acc * 10 ^ (natDigits n).length + n) := by
-  intro n
-  induction n using Nat.strongRecOn with
-  | _ n ih =>
-    intro acc
-    by_cases h : n < 10
-    · have hd : natDigits n = [digitChar n] := by rw [natDigits, if_pos h]
-      rw [hd]
-      simp only [natOfDigits, isAsciiDigit_digitChar h, if_pos, List.length_cons,
-        List.length_nil, toNat_digitChar h]
-      congr 1
-      omega
-    · have h10 : 10 ≤ n := by omega
-      have hmod : n % 10 < 10 := Nat.mod_lt _ (by omega)
-      have hd : natDigits n = natDigits (n / 10) ++ [digitChar (n % 10)] := by
-        rw [natDigits, if_neg h]
-      rw [hd, natOfDigits_append, ih (n / 10) (Nat.div_lt_self (by omega) (by omega)) acc]
-      simp only [Option.bind_some, natOfDigits, isAsciiDigit_digitChar hmod, if_pos,
-        toNat_digitChar hmod, List.length_append, List.length_cons, List.length_nil]
-      congr 1
-      rw [show 48 + n % 10 - 48 = n % 10 from by omega, Nat.pow_succ,
-        Nat.add_mul, Nat.mul_assoc, Nat.add_assoc, Nat.div_add_mod']
-
-theorem natOfDigits_zeros : ∀ (k acc : Nat),
-    natOfDigits acc (List.replicate k '0') = some (acc * 10 ^ k) := by
-  intro k
-  induction k with
-  | zero => intro acc; simp only [List.replicate_zero, natOfDigits, Nat.pow_zero, Nat.mul_one]
-  | succ j ih =>
-    intro acc
-    have hz : ('0' : Char).toNat = 48 := by decide
-    have hdig : isAsciiDigit '0' = true := by decide
-    rw [List.replicate_succ]
-    simp only [natOfDigits, hdig, if_pos, hz]
-    rw [ih (acc * 10 + (48 - 48))]
-    congr 1
-    rw [show (48 : Nat) - 48 = 0 from rfl, Nat.add_zero, Nat.pow_succ, Nat.mul_assoc,
-      Nat.mul_comm (10 : Nat) (10 ^ j)]
-
-/-- **A padded decimal field reads back as the number it was rendered from**,
-at any width. -/
-theorem natOfDigits_padDigits (width n : Nat) :
-    natOfDigits 0 (padDigits width n) = some n := by
-  unfold padDigits
-  rw [natOfDigits_append, natOfDigits_zeros, Option.bind_some, natOfDigits_natDigits]
-  simp
-
-theorem natOfDigitsFull_padDigits (width n : Nat) :
-    natOfDigitsFull (padDigits width n) = some n := by
-  have hval := natOfDigits_padDigits width n
-  cases hl : padDigits width n with
-  | nil => exact absurd (List.append_eq_nil_iff.mp hl).2 (natDigits_ne_nil n)
-  | cons c t =>
-    rw [hl] at hval
-    exact hval
-
-theorem parseNatField_padDigits (width n : Nat) (what : String) :
-    parseNatField (String.ofList (padDigits width n)) what = .ok n := by
-  unfold parseNatField
-  rw [String.toList_ofList, natOfDigitsFull_padDigits]
-  rfl
-
-/-- Every character of a rendered decimal field is a digit — which is what
-makes the `-`, `:` and `.` separators unambiguous. -/
-theorem isAsciiDigit_of_mem_natDigits : ∀ (n : Nat) (c : Char),
-    c ∈ natDigits n → isAsciiDigit c = true := by
-  intro n
-  induction n using Nat.strongRecOn with
-  | _ n ih =>
-    intro c hc
-    by_cases h : n < 10
-    · rw [natDigits, if_pos h] at hc
-      rcases List.mem_singleton.mp hc with rfl
-      exact isAsciiDigit_digitChar h
-    · rw [natDigits, if_neg h] at hc
-      rcases List.mem_append.mp hc with hc | hc
-      · exact ih (n / 10) (Nat.div_lt_self (by omega) (by omega)) c hc
-      · rcases List.mem_singleton.mp hc with rfl
-        exact isAsciiDigit_digitChar (Nat.mod_lt _ (by omega))
-
-theorem isAsciiDigit_of_mem_padDigits {width n : Nat} {c : Char}
-    (hc : c ∈ padDigits width n) : isAsciiDigit c = true := by
-  unfold padDigits at hc
-  rcases List.mem_append.mp hc with hc | hc
-  · rw [List.eq_of_mem_replicate hc]; decide
-  · exact isAsciiDigit_of_mem_natDigits n c hc
-
-/-- A separator that is not a digit never occurs inside a rendered field. -/
-theorem ne_of_mem_padDigits {width n : Nat} {sep : Char}
-    (hsep : isAsciiDigit sep = false) : ∀ c ∈ padDigits width n, c ≠ sep := by
-  intro c hc heq
-  have hd := isAsciiDigit_of_mem_padDigits hc
-  rw [heq, hsep] at hd
-  exact Bool.false_ne_true hd
-
-/-- A decimal rendering of `n < 10^(k+1)` is at most `k+1` characters. -/
-theorem natDigits_length_le : ∀ (k n : Nat), n < 10 ^ (k + 1) →
-    (natDigits n).length ≤ k + 1 := by
-  intro k
-  induction k with
-  | zero =>
-    intro n h
-    rw [Nat.pow_one] at h
-    rw [natDigits, if_pos h]
-    simp
-  | succ j ih =>
-    intro n h
-    by_cases hs : n < 10
-    · rw [natDigits, if_pos hs]
-      simp only [List.length_cons, List.length_nil]
-      omega
-    · rw [natDigits, if_neg hs]
-      have hdiv : n / 10 < 10 ^ (j + 1) := by
-        have : (10 : Nat) ^ (j + 1 + 1) = 10 ^ (j + 1) * 10 := Nat.pow_succ ..
-        omega
-      have := ih (n / 10) hdiv
-      simp only [List.length_append, List.length_cons, List.length_nil]
-      omega
-
-theorem padDigits_length {width n : Nat} (h : (natDigits n).length ≤ width) :
-    (padDigits width n).length = width := by
-  unfold padDigits
-  rw [List.length_append, List.length_replicate]
-  omega
-
-theorem padDigits_ne_nil (width n : Nat) : padDigits width n ≠ [] :=
-  fun h => absurd (List.append_eq_nil_iff.mp h).2 (natDigits_ne_nil n)
-
-theorem not_mem_padDigits {width n : Nat} {sep : Char}
-    (hsep : isAsciiDigit sep = false) : sep ∉ padDigits width n :=
-  fun hmem => (ne_of_mem_padDigits hsep sep hmem) rfl
-
-/-!
 ### Temporal text roundtrips
 
 PostgreSQL renders `date` and `time` as fixed-width decimal fields; these laws
@@ -1229,19 +991,6 @@ roundtrip (shortest-representation printing plus decimal-to-binary rounding),
 and stating the true law needs real-arithmetic support this repository does not
 have (core + Std only, no Mathlib).
 -/
-
-theorem splitOnChar_singleton {c : Char} {s : String} (h : c ∉ s.toList) :
-    splitOnChar c s = [s] := by
-  unfold splitOnChar
-  rw [List.splitOn_eq_singleton h]
-  simp only [List.map_cons, List.map_nil, String.ofList_toList]
-
-theorem splitOnChar_cons {c : Char} {p rest : List Char} (h : c ∉ p) :
-    splitOnChar c (String.ofList (p ++ c :: rest)) =
-      String.ofList p :: splitOnChar c (String.ofList rest) := by
-  unfold splitOnChar
-  rw [String.toList_ofList, List.splitOn_append_cons_self_of_not_mem h,
-    String.toList_ofList, List.map_cons]
 
 /-- **A rendered date parses back to its own three fields.** -/
 theorem dateFields_renderDate {d : PlainDate} (hyear : 0 ≤ d.year) :
