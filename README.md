@@ -39,7 +39,9 @@ ALL PASS
 ```lean
 import Pg
 
-def demo : IO Unit := do
+open Std.Async
+
+def demo : Async Unit := do
   -- `verify-full` authenticates both the certificate chain and server name.
   let conn ← Pg.connectUri
     "postgres://bill:secret@localhost:5432/mydb?sslmode=verify-full&sslrootcert=/path/to/root.crt"
@@ -61,7 +63,15 @@ def demo : IO Unit := do
   let _ ← conn.waitNotification 1000
   conn.cancel   -- from another task, via a separate CancelRequest connection
   conn.close
+
+-- Block once, at the executable boundary; library callers compose `demo`
+-- directly with other cooperative `Async` work.
+def main : IO Unit := demo.block
 ```
+
+Connection and query operations return `Std.Async.Async`. Multiple callers may
+submit bounded batches to one connection concurrently; none of them drives the
+socket or occupies a worker while waiting for its reply.
 
 `pg_lean` (`Cmd/PgLean.lean`) is the command-line query client — a minimal
 non-interactive psql that works against any supported connection (all auth
@@ -95,11 +105,14 @@ bazel run //Cmd:pg_lean -- -e -b postgres://postgres@localhost/postgres \
 - **Simple query** incl. multi-statement and empty-query; **extended query**
   (Parse/Bind/Describe/Execute/Close/Flush/Sync), named statements, portals
   with suspension/resume, parameter + result formats (text and binary).
-- **Pipelining** with the protocol's error recovery: skip-until-Sync, and
-  Flush-driven aborts gate submits until the user supplies a Sync
-  (libpq's `PGRES_PIPELINE_ABORTED` analogue).
-- **COPY IN/OUT** streaming; **LISTEN/NOTIFY** with a notification queue and
-  selector-based waits; **cancellation** via separate-connection
+- **Concurrent, owner-tagged pipelining**: bounded batches are admitted and
+  written in coordinator order, while one background reader attributes every
+  reply to the submitting caller. Extended batches end in their own Sync, so
+  skip-until-Sync recovery cannot cross an owner boundary. Generic `run`
+  rejects ambiguous multi-boundary and protocol-control batches.
+- **COPY IN/OUT** streaming with exclusive connection ownership for the COPY
+  lifetime; **LISTEN/NOTIFY** with an independent queue that receives messages
+  even while no request is pending; **cancellation** via separate-connection
   CancelRequest (3.0 4-byte and 3.2 variable-length keys), with a fresh TLS
   handshake when the original connection used TLS.
 - **Codecs** (text + binary): bool, int2/4/8, float4/8, text/varchar/bpchar,
@@ -160,10 +173,13 @@ Sans-IO core + thin async shell (the grpc-lean/PostgresNIO pattern):
 - `Pg/Types/*` — OIDs, `PgDecode`/`PgEncode`, `PgNumeric`, `PgInterval`. Every
   codec is explicit recursion, not a `for` loop over mutable state: a `forIn`
   body is opaque to the kernel, so the roundtrip laws would not be statable.
-- `Pg/Connection.lean` — async shell over `Std.Async.TCP`: DNS, Mutex-held
-  exchanges, notification queue (`recvSelector` raced against timers via
-  `Selectable.one`), PostgreSQL SSL negotiation and TLS transport, COPY pumps,
-  cancel.
+- `Pg/Connection.lean` — cooperative shell over `Std.Async.TCP`: one reader,
+  one writer, and a short-held coordinator that assigns owner tags, advances
+  the pure machine, seals TLS records, and inserts socket-ready bytes in the
+  same order. User callbacks, COPY producers/sinks, notification waits, and
+  all socket waits run outside the coordinator. COPY is exclusive; ordinary
+  bounded batches pipeline concurrently. Only CLI/test `main` functions call
+  `Async.block`.
 - `Cmd/PgProbe.lean`, `Integration/LiveTest.lean` — probing CLI + checklist.
 
 ## Proved properties (kernel-checked, no `sorry`, core + Std only)
@@ -183,7 +199,11 @@ section docstring states its scope.
   `runSteps_fifo`, `feed_fifo`) and submission (`submit_fifo`). Headline:
   `terminal_pops_head` — every user-visible success pops exactly the head
   operation, in submission order, COPY included — with
-  `nonterminal_preserves_fifo` and `error_drops_to_sync` as complements.
+  `nonterminal_preserves_fifo` and `error_drops_to_sync` as complements. The
+  owner-tagged refinement proves erasing owner metadata commutes with recovery,
+  each event, whole feeds, and append; `tagged_terminal_pops_head` proves a
+  terminal event removes exactly the tagged head used by the live
+  coordinator's completion criterion.
 - **Startup ordering** — `AuthStep`/`AuthReach` are PostgreSQL's documented
   authentication sequences; `step_startup_order` and `runSteps_startup_order`
   prove the machine refines them, `authStep_stage_le` that the exchange never
@@ -348,8 +368,8 @@ the language server after first checkout. Verify Lean sources with
 - PostgreSQL direct TLS negotiation (`sslnegotiation=direct`, ALPN
   `postgresql`), AES-GCM suites, and HelloRetryRequest.
 - Full SASLprep (NFKC tables) for non-ASCII passwords.
-- Connection pooling; a background reader task (today: single in-flight
-  operation per connection, notifications queue during operations).
+- Connection pooling and bounded/backpressured queues for applications that
+  need explicit memory caps under sustained pipeline or COPY load.
 - `date`/`timestamp` ±infinity (Std.Time has no representation; currently a
   decode error), BC dates, multi-dimensional arrays, exotic types via an
   extensible registry.

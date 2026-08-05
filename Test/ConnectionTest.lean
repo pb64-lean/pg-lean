@@ -20,6 +20,8 @@ open Pg.TestSupport.Be
 def expect (cond : Bool) (msg : String) : IO Unit := do
   unless cond do throw (IO.userError msg)
 
+private def runAsync (action : Async α) : IO α := action.block
+
 partial def readAtLeast (client : TCP.Socket.Client) (n : Nat)
     (acc : ByteArray := ByteArray.empty) : IO ByteArray := do
   if acc.size ≥ n then
@@ -204,6 +206,38 @@ partial def serveCopy (server : TCP.Socket.Server) : IO Unit := do
   expect (tag == 88) "copy server: expected Terminate"
   (client.shutdown).block
 
+/-- While no request is pending, send an asynchronous notification, then
+accept two request batches before either response is written.  The server
+answers both in one TCP chunk, in wire order, with payloads derived from the
+received SQL so caller attribution can be checked independently of task
+scheduling order. -/
+def serveConcurrent (server : TCP.Socket.Server) (sendIdle : IO.Promise Unit)
+    (requestCount : Nat) : IO Unit := do
+  let client ← server.accept.block
+  let _ ← readStartup client
+  let sc ← ServerConn.mk' client
+  send client (authOk ++ readyForQuery 'I')
+  -- The client releases this gate only after `connect` has returned and its
+  -- background reader is running, so this exercises truly idle routing.
+  match sendIdle.result?.get with
+  | none => throw (IO.userError "concurrent server: idle-notification gate dropped")
+  | some () => send client (notification 11 "idle_jobs" "ready")
+  let mut requests : Array RawMessage := #[]
+  for _ in [0:requestCount] do
+    let request ← readMsg sc
+    expect (request.tag == 81) "concurrent server: expected Query message"
+    requests := requests.push request
+  let queryText (msg : RawMessage) : String :=
+    (String.fromUTF8? (msg.payload.extract 0 (msg.payload.size - 1))).getD ""
+  let response (sql : String) : ByteArray :=
+    rowDescription #[col "value" 25] ++ row #[sql] ++
+      commandComplete "SELECT 1" ++ readyForQuery 'I'
+  send client (requests.foldl (fun bytes request =>
+    bytes ++ response (queryText request)) ByteArray.empty)
+  let tag ← readTagged sc
+  expect (tag == 88) "concurrent server: expected Terminate"
+  (client.shutdown).block
+
 /-- EOF server: dies mid-response. -/
 def serveEof (server : TCP.Socket.Server) : IO Unit := do
   let client ← server.accept.block
@@ -225,8 +259,8 @@ def mkServer : IO (TCP.Socket.Server × UInt16) := do
 
 def expectConnectFailure (cfg : ConnectConfig) (label : String) : IO Unit := do
   let failed ← try
-      let conn ← connect cfg
-      conn.close
+      let conn ← runAsync (connect cfg)
+      runAsync conn.close
       pure false
     catch _ =>
       pure true
@@ -235,8 +269,8 @@ def expectConnectFailure (cfg : ConnectConfig) (label : String) : IO Unit := do
 def expectConnectFailureContaining (cfg : ConnectConfig) (needle label : String) :
     IO Unit := do
   try
-    let conn ← connect cfg
-    conn.close
+    let conn ← runAsync (connect cfg)
+    runAsync conn.close
     throw (IO.userError s!"{label}: connection unexpectedly succeeded")
   catch e =>
     unless (toString e).contains needle do
@@ -250,6 +284,10 @@ def main : IO Unit := do
   expect ((toString (Pg.Error.tlsChainVerification
     (.expired 7 10 11))).contains "expired")
     "expired TLS error reason"
+  expect ((toString (Pg.Error.tlsChainVerification
+    (.leafDigitalSignatureMissing 7))).contains
+      "leaf certificate cannot sign TLS handshakes")
+    "leaf digitalSignature TLS error reason"
   expect ((toString (Pg.Error.tlsHostnameVerification
     .dnsSubjectAltNameMismatch)).contains "hostname")
     "hostname TLS error reason"
@@ -343,9 +381,9 @@ def main : IO Unit := do
   -- PostgreSQL's unframed SSLRequest negotiation.
   let (sslPreferServer, sslPreferPort) ← mkServer
   let sslPreferTask ← IO.asTask (serveSslPreferN sslPreferServer)
-  let sslPreferConn ← connect {
-    host := "127.0.0.1", port := sslPreferPort, user := "u", sslMode := .prefer }
-  sslPreferConn.close
+  let sslPreferConn ← runAsync (connect {
+    host := "127.0.0.1", port := sslPreferPort, user := "u", sslMode := .prefer })
+  runAsync sslPreferConn.close
   match sslPreferTask.get with
   | .ok () => pure ()
   | .error e => throw e
@@ -381,13 +419,13 @@ def main : IO Unit := do
   let (server, port) ← mkServer
   let serverTask ← IO.asTask (serveHappy server)
   let inactiveRoot : System.FilePath := "/must/not/be/read/root.crt"
-  let conn ← connect {
+  let conn ← runAsync (connect {
     host := "127.0.0.1", port, user := "u", database := some "d"
     sslRootCert := some inactiveRoot
-  }
+  })
   expect (conn.sslMode == .disable && conn.sslRootCert == some inactiveRoot)
     "connection did not retain TLS policy for cancellation"
-  expect ((← conn.negotiatedSaslMechanism?).isNone)
+  expect ((← runAsync conn.negotiatedSaslMechanism?).isNone)
     "trust-auth connection unexpectedly retained a SASL mechanism"
 
   -- A TLS connection must also negotiate TLS on its fresh cancellation
@@ -407,7 +445,7 @@ def main : IO Unit := do
     connectTimeoutMs := 1000
   }
   let cancelRejected ← try
-      tlsCancelConn.cancel
+      runAsync tlsCancelConn.cancel
       pure false
     catch _ =>
       pure true
@@ -416,8 +454,8 @@ def main : IO Unit := do
   | .ok () => pure ()
   | .error e => throw e
 
-  expect ((← conn.parameter? "server_version") == some "17.5") "param tracked"
-  match ← conn.query "SELECT 1" with
+  expect ((← runAsync (conn.parameter? "server_version")) == some "17.5") "param tracked"
+  match ← runAsync (conn.query "SELECT 1") with
   | .error e => throw (IO.userError s!"query: {toString e}")
   | .ok results =>
     expect (results.size == 1) "one statement result"
@@ -426,16 +464,16 @@ def main : IO Unit := do
     expect (results[0]!.rows[0]! == #[some (ascii "1")]) "row value"
     expect (results[0]!.tag == "SELECT 1") "tag"
   -- the notification that arrived mid-query is queued
-  match ← conn.waitNotification 50 with
+  match ← runAsync (conn.waitNotification 50) with
   | .ok (some n) =>
     expect (n.channel == "jobs" && n.payload == "hello" && n.processId == 9) "notification"
   | other => throw (IO.userError s!"waitNotification: {repr (match other with | .ok n => n | _ => none)}")
   -- nothing further: timeout path (selector vs timer race)
-  match ← conn.waitNotification 100 with
+  match ← runAsync (conn.waitNotification 100) with
   | .ok none => pure ()
   | .ok (some n) => throw (IO.userError s!"unexpected notification {repr n}")
   | .error e => throw (IO.userError s!"waitNotification timeout: {toString e}")
-  conn.close
+  runAsync conn.close
   match serverTask.get with
   | .ok () => pure ()
   | .error e => throw e
@@ -443,27 +481,27 @@ def main : IO Unit := do
   -- extended protocol against the fake server
   let (server3, port3) ← mkServer
   let serverTask3 ← IO.asTask (serveExtended server3)
-  let conn3 ← connect { host := "127.0.0.1", port := port3, user := "u" }
-  match ← conn3.prepare "st" "SELECT $1::int4 + $2::int4 AS sum" with
+  let conn3 ← runAsync (connect { host := "127.0.0.1", port := port3, user := "u" })
+  match ← runAsync (conn3.prepare "st" "SELECT $1::int4 + $2::int4 AS sum") with
   | .error e => throw (IO.userError s!"prepare: {toString e}")
   | .ok stmt =>
     expect (stmt.paramTypes == #[23]) "statement param types"
     expect (stmt.columns.map (·.name) == #["sum"]) "statement columns"
-  match ← conn3.execute "st" #[some (ascii "3"), some (ascii "5")] with
+  match ← runAsync (conn3.execute "st" #[some (ascii "3"), some (ascii "5")]) with
   | .error e => throw (IO.userError s!"execute: {toString e}")
   | .ok rows =>
     expect (rows.columns.map (·.name) == #["sum"]) "execute columns"
     expect (rows.rows == #[#[some (ascii "8")]]) "execute row"
     expect (rows.tag == "SELECT 1") "execute tag"
-  match ← conn3.execute "st" #[some (ascii "1"), some (ascii "0")] with
+  match ← runAsync (conn3.execute "st" #[some (ascii "1"), some (ascii "0")]) with
   | .error (.server fields) =>
     expect (fields.sqlState? == some "22012") "execute server error sqlstate"
   | other => throw (IO.userError s!"expected server error, got ok/other ({other matches .ok _})")
   -- the connection survived the error
-  match ← conn3.query "SELECT 'yes' AS ok" with
+  match ← runAsync (conn3.query "SELECT 'yes' AS ok") with
   | .error e => throw (IO.userError s!"recovery query: {toString e}")
   | .ok results => expect (results[0]!.rows == #[#[some (ascii "yes")]]) "recovery row"
-  conn3.close
+  runAsync conn3.close
   match serverTask3.get with
   | .ok () => pure ()
   | .error e => throw e
@@ -471,30 +509,95 @@ def main : IO Unit := do
   -- COPY IN / COPY OUT through the shell
   let (server4, port4) ← mkServer
   let serverTask4 ← IO.asTask (serveCopy server4)
-  let conn4 ← connect { host := "127.0.0.1", port := port4, user := "u" }
-  match ← conn4.copyInChunks "COPY t FROM STDIN"
-      #[ascii "1\ta\n", ascii "2\tb\n", ascii "3\tc\n"] with
+  let conn4 ← runAsync (connect { host := "127.0.0.1", port := port4, user := "u" })
+  match ← runAsync (conn4.copyInChunks "COPY t FROM STDIN"
+      #[ascii "1\ta\n", ascii "2\tb\n", ascii "3\tc\n"]) with
   | .error e => throw (IO.userError s!"copyIn: {toString e}")
   | .ok tag => expect (tag == "COPY 3") s!"copyIn tag {tag}"
   let collected ← IO.mkRef ByteArray.empty
-  match ← conn4.copyOut "COPY t TO STDOUT" (fun b => collected.modify (· ++ b)) with
+  match ← runAsync (conn4.copyOut "COPY t TO STDOUT" (fun b => collected.modify (· ++ b))) with
   | .error e => throw (IO.userError s!"copyOut: {toString e}")
   | .ok tag => expect (tag == "COPY 2") s!"copyOut tag {tag}"
   expect ((← collected.get) == ascii "x\t1\ny\t2\n") "copyOut data"
-  conn4.close
+  runAsync conn4.close
   match serverTask4.get with
+  | .ok () => pure ()
+  | .error e => throw e
+
+  -- Concurrent batches share one reader/writer but retain distinct owners.
+  let (concurrentServer, concurrentPort) ← mkServer
+  let sendIdle ← IO.Promise.new
+  let burstSize := 32
+  let concurrentServerTask ← IO.asTask
+    (serveConcurrent concurrentServer sendIdle burstSize)
+  let concurrentConn ← runAsync (connect {
+    host := "127.0.0.1", port := concurrentPort, user := "u" })
+  discard <| sendIdle.resolve ()
+  match ← runAsync (concurrentConn.waitNotification 1000) with
+  | .ok (some n) =>
+    expect (n.channel == "idle_jobs" && n.payload == "ready" && n.processId == 11)
+      "idle notification attribution"
+  | other =>
+    throw (IO.userError s!"idle waitNotification: {repr (match other with | .ok n => n | _ => none)}")
+  -- Invalid generic batches fail before writing anything or perturbing the
+  -- coordinator's protocol state.
+  let expectRejected (result : Except Pg.Error (Array Machine.Event)) (label : String) :=
+    expect (result matches .error (.rejected _)) label
+  expectRejected (← runAsync (concurrentConn.run #[])) "empty run rejected"
+  expectRejected (← runAsync (concurrentConn.run #[.parse "" "SELECT 1"]))
+    "unbounded run rejected"
+  expectRejected (← runAsync (concurrentConn.run #[.simpleQuery "SELECT 1", .simpleQuery "SELECT 2"]))
+    "multiple response boundaries rejected"
+  expectRejected (← runAsync (concurrentConn.run #[.flush, .sync]))
+    "control request rejected"
+  -- Release a synchronized burst of callers.  The server withholds all
+  -- replies until every Query is on the wire, which makes any divergence
+  -- between coordinator/owner order and writer-queue order swap results.
+  let ready : Std.CloseableChannel Unit ← Std.CloseableChannel.new
+  let startBurst ← IO.Promise.new
+  let mut queryTasks := #[]
+  for i in [0:burstSize] do
+    let task ← Async.toIO do
+      discard <| ready.trySend ()
+      await startBurst
+      concurrentConn.query s!"burst-{i}"
+    queryTasks := queryTasks.push task
+  for _ in [0:burstSize] do
+    runAsync do
+      match ← await (← ready.recv) with
+      | some () => pure ()
+      | none => throw (IO.userError "concurrent barrier closed early")
+  discard <| startBurst.resolve ()
+  let value (result : Except Pg.Error (Array Pg.Rows)) : Option ByteArray :=
+    result.toOption.bind fun results =>
+      results[0]?.bind fun rows =>
+        rows.rows[0]?.bind fun cells => cells[0]?.bind id
+  -- Await in reverse creation order: no caller may need to drive the shared
+  -- socket, and every response must still reach the owner of its SQL text.
+  for offset in [0:burstSize] do
+    let i := burstSize - 1 - offset
+    let result ← runAsync (Async.ofAsyncTask queryTasks[i]!)
+    expect (value result == some (ascii s!"burst-{i}"))
+      s!"concurrent burst attribution {i}"
+  let closeOne ← Async.toIO concurrentConn.close
+  let closeTwo ← Async.toIO concurrentConn.close
+  runAsync (Async.ofAsyncTask closeTwo)
+  runAsync (Async.ofAsyncTask closeOne)
+  expect ((← runAsync (concurrentConn.query "SELECT 'after close'")) matches .error .closed)
+    "work after close rejected"
+  match concurrentServerTask.get with
   | .ok () => pure ()
   | .error e => throw e
 
   -- EOF mid-response poisons the query with .disconnected
   let (server2, port2) ← mkServer
   let serverTask2 ← IO.asTask (serveEof server2)
-  let conn2 ← connect { host := "127.0.0.1", port := port2, user := "u" }
-  match ← conn2.query "SELECT 1" with
+  let conn2 ← runAsync (connect { host := "127.0.0.1", port := port2, user := "u" })
+  match ← runAsync (conn2.query "SELECT 1") with
   | .error .disconnected => pure ()
   | .error e => throw (IO.userError s!"expected disconnected, got {toString e}")
   | .ok _ => throw (IO.userError "expected disconnected, got ok")
-  conn2.close
+  runAsync conn2.close
   match serverTask2.get with
   | .ok () => pure ()
   | .error e => throw e

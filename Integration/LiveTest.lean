@@ -19,24 +19,25 @@ bar.
 
 open Pg
 open Pg.Protocol
+open Std.Async
 
 structure Ctx where
   url : String
   failures : IO.Ref Nat
 
-def item (ctx : Ctx) (name : String) (act : IO (Option String)) : IO Unit := do
+def item (ctx : Ctx) (name : String) (act : Async (Option String)) : Async Unit := do
   match ← try act catch e => pure (some s!"exception: {e}") with
   | none => IO.println s!"PASS {name}"
   | some why =>
     IO.println s!"FAIL {name}: {why}"
     ctx.failures.modify (· + 1)
 
-def ok! (r : Except Error α) : IO α :=
+def ok! (r : Except Error α) : Async α :=
   match r with
   | .ok v => pure v
   | .error e => throw (IO.userError (toString e))
 
-def expectIs (cond : Bool) (why : String) : IO (Option String) :=
+def expectIs (cond : Bool) (why : String) : Async (Option String) :=
   pure (if cond then none else some why)
 
 def okEq [BEq α] (r : Except String α) (v : α) : Bool :=
@@ -56,7 +57,7 @@ def serverErrors (events : Array Machine.Event) : Array ErrorFields :=
 
 -- ── items ──────────────────────────────────────────────────────────────────
 
-def copyRoundtrip (ctx : Ctx) : IO (Option String) := do
+def copyRoundtrip (ctx : Ctx) : Async (Option String) := do
   let conn ← connectUri ctx.url
   let _ ← ok! (← conn.exec "CREATE TEMP TABLE copy_test (id int4, label text)")
   let rows := 100000
@@ -86,7 +87,7 @@ def copyRoundtrip (ctx : Ctx) : IO (Option String) := do
     return some s!"copy out tag {tagOut}"
   expectIs ((← linesOut.get) == rows) s!"copy out lines {← linesOut.get}"
 
-def listenNotify (ctx : Ctx) : IO (Option String) := do
+def listenNotify (ctx : Ctx) : Async (Option String) := do
   let listener ← connectUri ctx.url
   let sender ← connectUri ctx.url
   let _ ← ok! (← listener.listen "pg_lean_events")
@@ -106,12 +107,15 @@ def listenNotify (ctx : Ctx) : IO (Option String) := do
   sender.close
   pure r
 
-def cancelSleep (ctx : Ctx) : IO (Option String) := do
+def cancelSleep (ctx : Ctx) : Async (Option String) := do
   let conn ← connectUri ctx.url
-  let task ← IO.asTask (conn.query "SELECT pg_sleep(30)")
-  IO.sleep 500
+  let task ← Async.toIO (conn.query "SELECT pg_sleep(30)")
+  Std.Async.sleep (Std.Time.Millisecond.Offset.ofNat 500)
   conn.cancel
-  let outcome := task.get
+  let outcome : Except IO.Error (Except Error (Array Rows)) ←
+    try
+      pure (Except.ok (← Async.ofAsyncTask task))
+    catch e => pure (Except.error e)
   let r ← match outcome with
     | .error e => pure (some s!"task error {e}")
     | .ok (.error (.server fields)) =>
@@ -127,7 +131,7 @@ def cancelSleep (ctx : Ctx) : IO (Option String) := do
     conn.close
     pure (some s!"connection unusable after cancel: {toString e}")
 
-def extendedPrepare (ctx : Ctx) : IO (Option String) := do
+def extendedPrepare (ctx : Ctx) : Async (Option String) := do
   let conn ← connectUri ctx.url
   let stmt ← ok! (← conn.prepare "st" "SELECT $1::int4 + $2::int4 AS total")
   let r ←
@@ -144,7 +148,7 @@ def extendedPrepare (ctx : Ctx) : IO (Option String) := do
   conn.close
   pure r
 
-def portalSuspend (ctx : Ctx) : IO (Option String) := do
+def portalSuspend (ctx : Ctx) : Async (Option String) := do
   let conn ← connectUri ctx.url
   let _ ← ok! (← conn.exec "BEGIN")
   let events ← ok! (← conn.run #[
@@ -166,10 +170,10 @@ def portalSuspend (ctx : Ctx) : IO (Option String) := do
   conn.close
   pure r
 
-def codecParamRoundtrip (ctx : Ctx) : IO (Option String) := do
+def codecParamRoundtrip (ctx : Ctx) : Async (Option String) := do
   let conn ← connectUri ctx.url
   let bad ← IO.mkRef (#[] : Array String)
-  let roundtrip (α : Type) [PgDecode α] [PgEncode α] (cast : String) (x : α) : IO Unit := do
+  let roundtrip (α : Type) [PgDecode α] [PgEncode α] (cast : String) (x : α) : Async Unit := do
     let fmt := PgEncode.format α
     let bytes := PgEncode.encode x
     let record (why : String) : IO Unit := bad.modify (·.push s!"{cast}: {why}")
@@ -206,16 +210,25 @@ def codecParamRoundtrip (ctx : Ctx) : IO (Option String) := do
   let failures ← bad.get
   expectIs failures.isEmpty (String.intercalate "; " failures.toList)
 
-def pipelineMidError (ctx : Ctx) : IO (Option String) := do
+def pipelineMidError (ctx : Ctx) : Async (Option String) := do
   let conn ← connectUri ctx.url
-  let events ← ok! (← conn.run #[
+  let first := conn.run #[
     .parse "pa" "SELECT 1",
-    .bind "" "pa", .execute "" 0, .sync,
+    .bind "" "pa", .execute "" 0, .sync]
+  let failing := conn.run #[
     .parse "pb" "SELECT * FROM nonexistent_table_xyz",
-    .bind "" "pb", .execute "" 0, .sync,
+    .bind "" "pb", .execute "" 0, .sync]
+  let last := conn.run #[
     .parse "pc" "SELECT 3",
-    .bind "" "pc", .execute "" 0, .sync])
+    .bind "" "pc", .execute "" 0, .sync]
+  let (firstResult, failingResult, lastResult) ← do
+    let (firstResult, rest) ← Async.concurrently first (Async.concurrently failing last)
+    pure (firstResult, rest.1, rest.2)
+  let firstEvents ← ok! firstResult
+  let failingEvents ← ok! failingResult
+  let lastEvents ← ok! lastResult
   conn.close
+  let events := firstEvents ++ failingEvents ++ lastEvents
   let readies := readyStatuses events
   let errors := serverErrors events
   let parses := (events.filter (· matches .parseComplete)).size
@@ -223,7 +236,7 @@ def pipelineMidError (ctx : Ctx) : IO (Option String) := do
       (errors[0]!.sqlState? == some "42P01") && parses == 2)
     s!"readies {readies.size} errors {errors.size} parses {parses}"
 
-def txStatusTracking (ctx : Ctx) : IO (Option String) := do
+def txStatusTracking (ctx : Ctx) : Async (Option String) := do
   let conn ← connectUri ctx.url
   let lastTx (events : Array Machine.Event) : Option TxStatus :=
     (readyStatuses events)[0]?
@@ -235,7 +248,7 @@ def txStatusTracking (ctx : Ctx) : IO (Option String) := do
       lastTx e3 == some .idle && (serverErrors e2)[0]?.bind (·.sqlState?) == some "22012")
     s!"tx {repr (lastTx e1)} {repr (lastTx e2)} {repr (lastTx e3)}"
 
-def bigRow (ctx : Ctx) : IO (Option String) := do
+def bigRow (ctx : Ctx) : Async (Option String) := do
   let conn ← connectUri ctx.url
   let n := 10 * 1024 * 1024
   let rows ← ok! (← conn.query s!"SELECT repeat('x', {n}) AS big")
@@ -244,7 +257,7 @@ def bigRow (ctx : Ctx) : IO (Option String) := do
   | .ok s => expectIs (s.length == n) s!"length {s.length}"
   | .error e => pure (some e)
 
-def unicodeRoundtrip (ctx : Ctx) : IO (Option String) := do
+def unicodeRoundtrip (ctx : Ctx) : Async (Option String) := do
   let conn ← connectUri ctx.url
   let _ ← ok! (← conn.exec "CREATE TEMP TABLE データ (名前 text)")
   let _ ← ok! (← conn.exec "INSERT INTO データ VALUES ('héllo🐘')")
@@ -254,7 +267,7 @@ def unicodeRoundtrip (ctx : Ctx) : IO (Option String) := do
   let r := rows[0]!.getByName (α := String) 0 "名前"
   expectIs (okEq r "héllo🐘" && encoding != some "SQL_ASCII") s!"got {repr r}"
 
-def errorFieldCompleteness (ctx : Ctx) : IO (Option String) := do
+def errorFieldCompleteness (ctx : Ctx) : Async (Option String) := do
   let conn ← connectUri ctx.url
   let _ ← ok! (← conn.exec "CREATE TEMP TABLE dup_test (id int4 PRIMARY KEY)")
   let _ ← ok! (← conn.exec "INSERT INTO dup_test VALUES (1)")
@@ -268,7 +281,7 @@ def errorFieldCompleteness (ctx : Ctx) : IO (Option String) := do
   conn.close
   pure r
 
-def noticeDelivery (ctx : Ctx) : IO (Option String) := do
+def noticeDelivery (ctx : Ctx) : Async (Option String) := do
   let collected ← IO.mkRef (#[] : Array String)
   let conn ← connectUri ctx.url (onNotice := fun fields =>
     collected.modify (·.push (fields.message?.getD "")))
@@ -277,7 +290,7 @@ def noticeDelivery (ctx : Ctx) : IO (Option String) := do
   expectIs ((← collected.get).contains "pg-lean says hi")
     s!"notices {repr (← collected.get)}"
 
-def simpleShapes (ctx : Ctx) : IO (Option String) := do
+def simpleShapes (ctx : Ctx) : Async (Option String) := do
   let conn ← connectUri ctx.url
   let empty ← ok! (← conn.query "")
   let multi ← ok! (← conn.query "SELECT 1 AS a; SELECT 2 AS b, 3 AS c")
@@ -286,7 +299,7 @@ def simpleShapes (ctx : Ctx) : IO (Option String) := do
       okEq (multi[1]!.get (α := Int) 0 1) 3)
     s!"empty {repr (empty.map (·.tag))} multi {multi.size}"
 
-def transportSecurity (ctx : Ctx) : IO (Option String) := do
+def transportSecurity (ctx : Ctx) : Async (Option String) := do
   let cfg ← match ConnectConfig.parseUri ctx.url with
     | .ok cfg => pure cfg
     | .error e => return some s!"url: {e}"
@@ -308,7 +321,7 @@ def transportSecurity (ctx : Ctx) : IO (Option String) := do
   else
     pure none
 
-def protocolNegotiation (ctx : Ctx) : IO (Option String) := do
+def protocolNegotiation (ctx : Ctx) : Async (Option String) := do
   let cfg ← match ConnectConfig.parseUri ctx.url with
     | .ok cfg => pure cfg
     | .error e => return some s!"url: {e}"
@@ -325,10 +338,14 @@ def protocolNegotiation (ctx : Ctx) : IO (Option String) := do
       else if keySize ≤ 4 then pure (some s!"expected long cancel key, got {keySize}")
       else do
         -- cancellation must work with the long key
-        let task ← IO.asTask (conn.query "SELECT pg_sleep(30)")
-        IO.sleep 500
+        let task ← Async.toIO (conn.query "SELECT pg_sleep(30)")
+        Std.Async.sleep (Std.Time.Millisecond.Offset.ofNat 500)
         conn.cancel
-        match task.get with
+        let outcome : Except IO.Error (Except Error (Array Rows)) ←
+          try
+            pure (Except.ok (← Async.ofAsyncTask task))
+          catch e => pure (Except.error e)
+        match outcome with
         | .ok (.error (.server fields)) =>
           expectIs (fields.sqlState? == some "57014") "3.2 cancel sqlstate"
         | _ => pure (some "3.2 cancel did not interrupt")
@@ -342,7 +359,7 @@ def protocolNegotiation (ctx : Ctx) : IO (Option String) := do
   | .ok _ => pure r
   | .error e => pure (some s!"connection dead after negotiation: {toString e}")
 
-def runChecklist : IO UInt32 := do
+def runChecklist : Async UInt32 := do
   let some url ← IO.getEnv "PG_URL"
     | do
       IO.eprintln "PG_URL not set (postgres://user[:pass]@host:port/db)"
@@ -374,7 +391,7 @@ def runChecklist : IO UInt32 := do
     IO.println s!"{failures} FAILURE(S)"
     return 1
 
-def connectOnly (url : String) : IO UInt32 := do
+def connectOnly (url : String) : Async UInt32 := do
   try
     let conn ← connectUri url
     match ← conn.query "SELECT 1" with
@@ -390,7 +407,7 @@ def connectOnly (url : String) : IO UInt32 := do
     IO.eprintln s!"CONNECT FAIL: {e}"
     return (1 : UInt32)
 
-def connectExpectMechanism (url expected : String) : IO UInt32 := do
+def connectExpectMechanism (url expected : String) : Async UInt32 := do
   try
     let conn ← connectUri url
     let actual ← conn.negotiatedSaslMechanism?
@@ -411,7 +428,7 @@ def connectExpectMechanism (url expected : String) : IO UInt32 := do
     IO.eprintln s!"CONNECT FAIL: {e}"
     return (1 : UInt32)
 
-def main (args : List String) : IO UInt32 := do
+private def asyncMain (args : List String) : Async UInt32 := do
   match args with
   | [] => runChecklist
   | ["--connect", url] => connectOnly url
@@ -421,3 +438,6 @@ def main (args : List String) : IO UInt32 := do
     IO.eprintln
       "usage: pg_live_test [--connect URL | --connect-expect-mechanism URL MECHANISM]"
     return (2 : UInt32)
+
+def main (args : List String) : IO UInt32 :=
+  Async.block (asyncMain args)

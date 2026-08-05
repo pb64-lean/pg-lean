@@ -2032,6 +2032,111 @@ def shellStep (fifo : List OpKind) (ev : Event) : List OpKind :=
 def shellRun (fifo : List OpKind) (evs : Array Event) : List OpKind :=
   evs.foldl shellStep fifo
 
+/-!
+### Caller-tagged shell routing
+
+The live connection shell admits whole request batches concurrently.  Tags are
+shell metadata only: PostgreSQL never carries them on the wire.  Erasing the
+tags from the shell queue therefore has to recover the machine queue exactly.
+The following model makes that obligation explicit rather than relying on an
+informal argument in the I/O implementation.
+-/
+
+/-- Monotone identifier assigned to one public operation by the connection
+coordinator.  Every protocol operation emitted by a batch carries the same
+owner. -/
+abbrev OwnerId := Nat
+
+/-- A pending protocol operation together with the public call that owns its
+event stream. -/
+structure TaggedOp where
+  owner : OwnerId
+  kind : OpKind
+  deriving Repr, BEq, Inhabited
+
+/-- Forget shell-only caller attribution. -/
+def eraseOwners : List TaggedOp → List OpKind
+  | [] => []
+  | op :: rest => op.kind :: eraseOwners rest
+
+/-- Tagged counterpart of `dropUntilSync`. -/
+def taggedDropUntilSync : List TaggedOp → List TaggedOp
+  | [] => []
+  | op :: rest =>
+      if op.kind == OpKind.sync then op :: rest else taggedDropUntilSync rest
+
+/-- One caller-tagged routing transition.  Its guards are deliberately the
+same guards as `shellStep`; only the retained payload is richer. -/
+def taggedStep (fifo : List TaggedOp) (ev : Event) : List TaggedOp :=
+  match fifo with
+  | [] => []
+  | op :: rest =>
+    if isTerminal op.kind ev then rest
+    else if isRecoverableError ev &&
+        !(op.kind == OpKind.sync) && !(op.kind == OpKind.simpleQuery) then
+      taggedDropUntilSync rest
+    else
+      op :: rest
+
+/-- A terminal reply removes exactly the tagged head.  In particular, when
+that head is an owner's final boundary, the next visible tag (if any) is the
+next caller the connection coordinator must complete toward. -/
+theorem tagged_terminal_pops_head {op : TaggedOp} {rest : List TaggedOp} {ev : Event}
+    (hterm : isTerminal op.kind ev = true) :
+    taggedStep (op :: rest) ev = rest := by
+  simp only [taggedStep]
+  rw [if_pos hterm]
+
+/-- Caller-tagged queue evolution over one decoded TCP chunk. -/
+def taggedRun (fifo : List TaggedOp) (evs : Array Event) : List TaggedOp :=
+  evs.foldl taggedStep fifo
+
+/-- Tag erasure commutes with PostgreSQL's error-recovery drop. -/
+theorem eraseOwners_taggedDropUntilSync (fifo : List TaggedOp) :
+    eraseOwners (taggedDropUntilSync fifo) = dropUntilSync (eraseOwners fifo) := by
+  induction fifo with
+  | nil => rfl
+  | cons op rest ih =>
+    unfold taggedDropUntilSync dropUntilSync
+    split <;> simp_all [eraseOwners]
+
+/-- Tag erasure commutes with one event-routing transition. -/
+theorem eraseOwners_taggedStep (fifo : List TaggedOp) (ev : Event) :
+    eraseOwners (taggedStep fifo ev) = shellStep (eraseOwners fifo) ev := by
+  cases fifo with
+  | nil => rfl
+  | cons op rest =>
+    simp only [taggedStep, shellStep, eraseOwners]
+    split
+    · rfl
+    · split
+      · exact eraseOwners_taggedDropUntilSync rest
+      · rfl
+
+private theorem eraseOwners_fold (events : List Event) (fifo : List TaggedOp) :
+    eraseOwners (events.foldl taggedStep fifo) =
+      events.foldl shellStep (eraseOwners fifo) := by
+  induction events generalizing fifo with
+  | nil => rfl
+  | cons ev rest ih =>
+    simp only [List.foldl_cons]
+    rw [ih, eraseOwners_taggedStep]
+
+/-- Whole-chunk routing refines the verified untagged shell exactly. -/
+theorem eraseOwners_taggedRun (fifo : List TaggedOp) (evs : Array Event) :
+    eraseOwners (taggedRun fifo evs) = shellRun (eraseOwners fifo) evs := by
+  unfold taggedRun shellRun
+  rw [← Array.foldl_toList, ← Array.foldl_toList]
+  exact eraseOwners_fold evs.toList fifo
+
+/-- Appending a caller's batch changes only the tags, never the protocol FIFO
+visible to the machine. -/
+theorem eraseOwners_append (before batch : List TaggedOp) :
+    eraseOwners (before ++ batch) = eraseOwners before ++ eraseOwners batch := by
+  induction before with
+  | nil => rfl
+  | cons op rest ih => simp [eraseOwners, ih]
+
 private theorem shellRun_single (fifo : List OpKind) (ev : Event) :
     shellRun fifo #[ev] = shellStep fifo ev := by rfl
 
@@ -2480,6 +2585,20 @@ theorem feed_fifo {s : State} {pipe : Pipeline} {chunk : ByteArray} {s' : State}
   · split at h
     rename_i fed hd msgs decode htake
     exact runSteps_fifo (s := { s with decode := decode }) hph hwf h
+
+/-- **Tagged FIFO refinement, whole TCP chunk**: if erasing caller tags agrees
+with the machine before a feed, it agrees again after routing every emitted
+event.  This is the proof boundary used by the concurrent connection shell. -/
+theorem tagged_feed_fifo {s : State} {pipe : Pipeline} {chunk : ByteArray}
+    {s' : State} {evs : Array Event} {out : ByteArray} {fifo : List TaggedOp}
+    (hph : s.phase = .running pipe) (hwf : pipe.WellFormed)
+    (herase : eraseOwners fifo = pipe.pending)
+    (h : feed s chunk = .ok (s', evs, out)) :
+    ∃ pipe', s'.phase = .running pipe' ∧
+      pipe'.pending = eraseOwners (taggedRun fifo evs) := by
+  obtain ⟨pipe', hph', hpending⟩ := feed_fifo hph hwf h
+  refine ⟨pipe', hph', ?_⟩
+  rw [hpending, eraseOwners_taggedRun, herase]
 
 /-- **Attribution**: a user-visible success is the terminal reply of the op at
 the *head* of the correlation FIFO, and it removes exactly that one entry — so

@@ -2,6 +2,7 @@ package(default_visibility = ["//visibility:public"])
 
 load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
 load("//:assurance.bzl", "PG_ALLOWED_AXIOMS")
+load("//:assurance_types.bzl", "PG_PROTOCOL_PRINCIPAL_TYPES")
 
 # Wire protocol: byte framing, typed message catalog, and the sans-IO
 # connection state machine.
@@ -36,8 +37,8 @@ lean_library(
 lean_assurance_test(
     name = "protocol_assurance",
     allowed_axioms = PG_ALLOWED_AXIOMS,
-    allowed_extern_modules = [],
     module_prefixes = ["Pg"],
+    policy_mode = "exact",
     principal_theorems = [
         # Framing: bytes are conserved and the split point does not matter.
         "Pg.Protocol.DecodeState.feed_conservation",
@@ -62,6 +63,14 @@ lean_assurance_test(
         "Pg.Protocol.Machine.terminal_pops_head",
         "Pg.Protocol.Machine.nonterminal_preserves_fifo",
         "Pg.Protocol.Machine.error_drops_to_sync",
+        # Caller ownership is metadata: erasing it commutes with recovery,
+        # per-event routing, whole-chunk routing, and queue append.
+        "Pg.Protocol.Machine.eraseOwners_taggedDropUntilSync",
+        "Pg.Protocol.Machine.eraseOwners_taggedStep",
+        "Pg.Protocol.Machine.eraseOwners_taggedRun",
+        "Pg.Protocol.Machine.eraseOwners_append",
+        "Pg.Protocol.Machine.tagged_terminal_pops_head",
+        "Pg.Protocol.Machine.tagged_feed_fifo",
         # Byte accounting through the machine, not just the framer.
         "Pg.Protocol.Machine.step_decode",
         "Pg.Protocol.Machine.submit_decode",
@@ -96,5 +105,12 @@ lean_assurance_test(
         "Pg.Protocol.Machine.completes_execute_copyOut",
         "Pg.Protocol.Machine.completes_simpleQuery",
     ],
+    principal_theorem_types = PG_PROTOCOL_PRINCIPAL_TYPES,
+    expected_unsafe_constants = [],
+    expected_partial_definitions = [],
+    expected_opaque_constants = [],
+    expected_implemented_by = {},
+    expected_extern_declarations = {},
+    expected_native_targets = [],
     deps = [":protocol"],
 )

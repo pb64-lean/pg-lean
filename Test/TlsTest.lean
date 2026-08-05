@@ -1022,8 +1022,12 @@ def testApplicationAndPostHandshake : IO Unit := do
   let closeAlert := ByteArray.mk #[1, 0]
   let (_, closeWire) ← must
     (Record.seal updatedServerKeys .alert closeAlert) "seal peer close_notify"
-  let closed ← must (driveClientChunks afterUpdate.state closeWire 2) "feed close_notify"
-  expect closed.state.closed "close_notify exchange did not close both directions"
+  let peerClosed ← must (driveClientChunks afterUpdate.state closeWire 2) "feed close_notify"
+  expect (peerClosed.state.peerClosed && !peerClosed.state.localClosed &&
+    peerClosed.wireBytes.isEmpty)
+    "peer close_notify did not preserve the local write direction"
+  let closed ← must (Client.closeNotify peerClosed.state) "reciprocate close_notify"
+  expect closed.state.closed "explicit close_notify did not close both directions"
   let closeResponseRecords ← decodeRecords closed.wireBytes
   expect (closeResponseRecords.size == 1) "close_notify response record count"
   let (_, closePlaintext) ← must

@@ -21,6 +21,10 @@ inductive Error where
   | fatal (e : Protocol.Machine.PgError)
   /-- The socket reached EOF mid-conversation. -/
   | disconnected
+  /-- A socket, TLS record, or background transport task failed. -/
+  | transport (message : String)
+  /-- The connection has begun or completed local shutdown. -/
+  | closed
   /-- A TLS peer certificate could not be chained to the configured trust
   store or failed an X.509 path constraint. -/
   | tlsChainVerification (failure : TLS13.X509.Chain.Failure)
@@ -45,6 +49,7 @@ private def chainFailureCategory : TLS13.X509.Chain.Failure → String
   | .badSignature .. => "bad signature"
   | .notCA _ => "issuer is not a CA"
   | .keyCertSignMissing _ => "issuer cannot sign certificates"
+  | .leafDigitalSignatureMissing _ => "leaf certificate cannot sign TLS handshakes"
   | .pathLenExceeded .. => "path length exceeded"
   | .unhandledCriticalExtension .. => "unhandled critical extension"
   | .loop _ => "certificate path loop"
@@ -63,6 +68,8 @@ def toMessage : Error → String
     s!"fatal server error {code}: {msg}"
   | .fatal e => s!"connection error: {repr e}"
   | .disconnected => "server closed the connection"
+  | .transport message => s!"transport error: {message}"
+  | .closed => "connection is closed"
   | .tlsChainVerification failure =>
     s!"TLS certificate verification failed ({chainFailureCategory failure}): {failure}"
   | .tlsHostnameVerification failure =>

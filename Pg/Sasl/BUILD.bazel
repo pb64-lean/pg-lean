@@ -2,6 +2,7 @@ package(default_visibility = ["//visibility:public"])
 
 load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
 load("//:assurance.bzl", "PG_ALLOWED_AXIOMS")
+load("//:assurance_types.bzl", "PG_SASL_PRINCIPAL_TYPES")
 
 lean_library(
     name = "sasl",
@@ -19,8 +20,8 @@ lean_library(
 lean_assurance_test(
     name = "sasl_assurance",
     allowed_axioms = PG_ALLOWED_AXIOMS,
-    allowed_extern_modules = [],
     module_prefixes = ["Pg"],
+    policy_mode = "exact",
     principal_theorems = [
         "Pg.Sasl.Scram.clientFirst_message",
         "Pg.Sasl.Scram.clientFirst_state",
@@ -30,5 +31,12 @@ lean_assurance_test(
         "Pg.Sasl.Scram.clientFinal_spec",
         "Pg.Sasl.Scram.verifyServerFinal_spec",
     ],
+    principal_theorem_types = PG_SASL_PRINCIPAL_TYPES,
+    expected_unsafe_constants = [],
+    expected_partial_definitions = [],
+    expected_opaque_constants = [],
+    expected_implemented_by = {},
+    expected_extern_declarations = {},
+    expected_native_targets = [],
     deps = [":sasl"],
 )

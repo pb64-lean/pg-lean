@@ -5,6 +5,7 @@ public import Std.Async.DNS
 public import Std.Async.Timer
 public import Std.Async.Select
 public import Std.Sync.Mutex
+public import Std.Sync.Channel
 public import Std.Time
 public import Pg.Protocol.Machine
 public import Pg.Sasl.Scram
@@ -22,14 +23,13 @@ open Std.Async
 open Pg.Protocol
 
 /-!
-The async IO shell over the pure `Machine`: a TCP socket, the machine state
-behind a `Std.Mutex`, and a queue of asynchronously received notifications.
-
-Concurrency model (v1): one logical operation at a time. Public operations
-hold the state mutex across their whole request/response exchange (the
-grpc-lean pattern); LISTEN/NOTIFY traffic received meanwhile is queued and
-surfaced via `waitNotification`. A notice callback runs while the lock is
-held, so it must not call back into the connection.
+The cooperative shell over the pure `Machine`.  One reader owns socket reads,
+one writer owns socket writes, and a short coordinator mutex sequences bounded
+machine/routing transitions, TLS record advancement, and FIFO insertion. Public
+operations may therefore pipeline concurrently without holding a worker or a
+mutex while waiting for the peer. Caller tags are erased by
+`Machine.tagged_feed_fifo`, so routing is a refinement of the machine's verified
+FIFO rather than a second protocol implementation.
 -/
 
 structure Notification where
@@ -65,16 +65,52 @@ def getByName (rs : Rows) (row : Nat) (name : String) [PgDecode α] : Except Str
 
 end Rows
 
+inductive Life where
+  | open
+  | closing
+  | closed
+  deriving BEq, Inhabited
+
+structure PendingCall where
+  owner : Machine.OwnerId
+  events : Array Machine.Event := #[]
+  completion : IO.Promise (Except Error (Array Machine.Event))
+  copyStarted : Option (IO.Promise (Except Error Machine.CopyInfo)) := none
+  copyData : Option (Std.CloseableChannel ByteArray) := none
+
 structure ConnState where
   machine : Machine.State
-  notifications : Array Notification := #[]
+  routing : List Machine.TaggedOp := []
+  pending : Array PendingCall := #[]
+  nextOwner : Machine.OwnerId := 0
+  life : Life := .open
+  /-- COPY reverses or streams the wire direction.  No later batch is admitted
+  until its ReadyForQuery boundary has retired this owner. -/
+  exclusiveOwner : Option Machine.OwnerId := none
+
+inductive Outbound where
+  /-- Plaintext PostgreSQL is unchanged; TLS records are sealed before they
+  enter this queue.  The sole writer therefore performs socket I/O only and
+  cannot observe TLS state newer than the queued record. -/
+  | wire (bytes : ByteArray)
+
+structure Background where
+  reader : Option (AsyncTask Unit) := none
+  writer : Option (AsyncTask Unit) := none
 
 structure Connection where
   socket : TCP.Socket.Client
-  /-- TLS state is mutated only while `state` is held (except during the
-  single-threaded startup handshake). `none` is a plaintext connection. -/
+  /-- `none` is plaintext.  After startup, every record transition is guarded
+  by `tlsLock` and sequenced under `state`; socket I/O itself is never performed
+  under either lock. -/
   tls : Option (IO.Ref Tls.Client.State)
+  tlsLock : Std.Mutex Unit
   state : Std.Mutex ConnState
+  outbound : Std.CloseableChannel Outbound
+  notifications : Std.CloseableChannel Notification
+  background : IO.Ref Background
+  drained : IO.Promise Unit
+  closeDone : IO.Promise Unit
   onNotice : ErrorFields → IO Unit
   host : String
   port : UInt16
@@ -83,16 +119,16 @@ structure Connection where
   the server-identity policy of the original connection. -/
   sslMode : SslMode := .disable
   sslRootCert : Option System.FilePath := none
-  /-- BackendKeyData, held outside the op mutex so `cancel` can read it while
-  another task's query holds the lock. -/
+  /-- BackendKeyData is immutable after startup and may be read by a fresh
+  cancellation connection without touching the coordinator. -/
   cancelKey : Option Machine.BackendKey
 
-private def sendWire (socket : TCP.Socket.Client) (bytes : ByteArray) : IO Unit := do
+private def sendWire (socket : TCP.Socket.Client) (bytes : ByteArray) : Async Unit := do
   if bytes.size > 0 then
-    (socket.send bytes).block
+    socket.send bytes
 
 private def sendTlsFatalAlert (socket : TCP.Socket.Client)
-    (state : Tls.Client.State) (error : Tls.Client.Error) : IO Unit := do
+    (state : Tls.Client.State) (error : Tls.Client.Error) : Async Unit := do
   let some description := error.fatalAlertDescription?
     | return
   match Tls.Client.sealFatalAlert state description with
@@ -100,11 +136,11 @@ private def sendTlsFatalAlert (socket : TCP.Socket.Client)
   | .ok output =>
     try sendWire socket output.wireBytes catch _ => pure ()
 
-private def recvWire (socket : TCP.Socket.Client) : IO (Option ByteArray) :=
-  (socket.recv? 65536).block
+private def recvWire (socket : TCP.Socket.Client) : Async (Option ByteArray) :=
+  socket.recv? 65536
 
-private def shutdownSocket (socket : TCP.Socket.Client) : IO Unit := do
-  try (socket.shutdown).block catch _ => pure ()
+private def shutdownSocket (socket : TCP.Socket.Client) : Async Unit := do
+  try socket.shutdown catch _ => pure ()
 
 private def tlsFailure (context : String) (e : Tls.Client.Error) : IO.Error :=
   IO.userError s!"TLS {context}: {e}"
@@ -113,7 +149,7 @@ private def tlsFailure (context : String) (e : Tls.Client.Error) : IO.Error :=
 is still owned by startup. The TLS engine has already strict-parsed the exact
 Certificate-list bytes and verified CertificateVerify proof of possession. -/
 private def verifyTlsPeer (cfg : ConnectConfig) (state : Tls.Client.State) :
-    IO Unit := do
+    Async Unit := do
   unless (cfg.sslMode.policy).requireChain do
     return
   let some loaded ←
@@ -138,26 +174,75 @@ private def verifyTlsPeer (cfg : ConnectConfig) (state : Tls.Client.State) :
     | .error failure =>
       throw (IO.userError (toString (Error.tlsHostnameVerification failure)))
 
-/-- Protect application bytes when TLS is active. The caller serializes access
-to `tls` with the connection mutex. -/
-private def sendTransport (socket : TCP.Socket.Client)
-    (tls : Option (IO.Ref Tls.Client.State)) (bytes : ByteArray) : IO Unit := do
-  if bytes.isEmpty then return
+/-- Advance the TLS write sequence and return bytes ready for the socket.  This
+function performs no socket I/O, so the live writer may call it under
+`tlsLock` without holding that lock across an await. -/
+private def sealTransportBytes (tls : Option (IO.Ref Tls.Client.State))
+    (bytes : ByteArray) : IO ByteArray := do
+  if bytes.isEmpty then return ByteArray.empty
   match tls with
-  | none => sendWire socket bytes
+  | none => pure bytes
   | some ref =>
     let state ← ref.get
     match Tls.Client.sealApplication state bytes with
-    | .error e =>
-      shutdownSocket socket
-      throw (tlsFailure "write failed" e)
+    | .error e => throw (tlsFailure "write failed" e)
     | .ok output =>
-      try
-        sendWire socket output.wireBytes
-        ref.set output.state
-      catch e =>
-        shutdownSocket socket
-        throw e
+      ref.set output.state
+      pure output.wireBytes
+
+/-- Protect and write application bytes during single-threaded startup or a
+fresh cancellation connection. -/
+private def sendTransport (socket : TCP.Socket.Client)
+    (tls : Option (IO.Ref Tls.Client.State)) (bytes : ByteArray) : Async Unit := do
+  try
+    sendWire socket (← sealTransportBytes tls bytes)
+  catch e =>
+    shutdownSocket socket
+    throw e
+
+private inductive OpenTransportResult where
+  | ok (plaintext : Option ByteArray) (reply : ByteArray)
+  | error (failure : IO.Error) (alert : ByteArray)
+
+/-- Advance the TLS read sequence.  Generated control bytes are returned to
+the caller for the single writer; this function itself never writes. -/
+private def openTransportBytes (tls : Option (IO.Ref Tls.Client.State))
+    (chunk : ByteArray) : IO OpenTransportResult := do
+  match tls with
+  | none => pure (.ok (some chunk) ByteArray.empty)
+  | some ref =>
+    let state ← ref.get
+    match Tls.Client.feedWithFailure state chunk with
+    | .error failure =>
+      let alert := match failure.error.fatalAlertDescription? with
+        | none => ByteArray.empty
+        | some description =>
+          match Tls.Client.sealFatalAlert failure.state description with
+          | .ok output => output.wireBytes
+          | .error _ => ByteArray.empty
+      pure (.error (tlsFailure "read failed" failure.error) alert)
+    | .ok output =>
+      ref.set output.state
+      let plaintext :=
+        if output.plaintext.isEmpty && output.state.closed then none
+        else some output.plaintext
+      pure (.ok plaintext output.wireBytes)
+
+/-- Seal application data while its coordinator admission is sequenced, then
+enqueue only socket-ready bytes.  Callers hold `conn.state`; the nested lock
+order is always coordinator then TLS. -/
+private def enqueueApplicationLocked (conn : Connection) (bytes : ByteArray) :
+    IO (Except Error Unit) := do
+  if bytes.isEmpty then return .ok ()
+  try
+    let wire ← conn.tlsLock.atomically do
+      sealTransportBytes conn.tls bytes
+    if ← conn.outbound.trySend (.wire wire) then
+      pure (.ok ())
+    else
+      pure (.error .closed)
+  catch e =>
+    pure (.error (.transport (toString e)))
 
 /-- Feed one raw socket chunk through TLS. `some #[]` means a control-only TLS
 record (for example NewSessionTicket); `none` means authenticated close_notify.
@@ -165,30 +250,20 @@ Any generated control reply (currently KeyUpdate) is written before returning.
 -/
 private def decodeTransport (socket : TCP.Socket.Client)
     (tls : Option (IO.Ref Tls.Client.State)) (chunk : ByteArray) :
-    IO (Option ByteArray) := do
-  match tls with
-  | none => pure (some chunk)
-  | some ref =>
-    let state ← ref.get
-    match Tls.Client.feedWithFailure state chunk with
-    | .error failure =>
-      sendTlsFatalAlert socket failure.state failure.error
+    Async (Option ByteArray) := do
+  match ← openTransportBytes tls chunk with
+  | .error error alert =>
+      try sendWire socket alert catch _ => pure ()
       shutdownSocket socket
-      throw (tlsFailure "read failed" failure.error)
-    | .ok output =>
-      try
-        sendWire socket output.wireBytes
-        ref.set output.state
-      catch e =>
+      throw error
+  | .ok plaintext reply =>
+      try sendWire socket reply catch e =>
         shutdownSocket socket
         throw e
-      if output.plaintext.isEmpty && output.state.closed then
-        pure none
-      else
-        pure (some output.plaintext)
+      pure plaintext
 
 private partial def recvTransport (socket : TCP.Socket.Client)
-    (tls : Option (IO.Ref Tls.Client.State)) : IO (Option ByteArray) := do
+    (tls : Option (IO.Ref Tls.Client.State)) : Async (Option ByteArray) := do
   match ← recvWire socket with
   | none =>
     match tls with
@@ -204,51 +279,280 @@ private partial def recvTransport (socket : TCP.Socket.Client)
       if plaintext.isEmpty then recvTransport socket tls else pure (some plaintext)
     | none => pure none
 
-private def sendBytes (conn : Connection) (bytes : ByteArray) : IO Unit :=
-  sendTransport conn.socket conn.tls bytes
+private def requestOpKind? : Machine.Request → Option Machine.OpKind
+  | .simpleQuery _ => some .simpleQuery
+  | .parse .. => some .parse
+  | .bind .. => some .bind
+  | .describeStatement _ => some .describeStatement
+  | .describePortal _ => some .describePortal
+  | .execute .. => some .execute
+  | .closeStatement _ | .closePortal _ => some .close
+  | .sync => some .sync
+  | .flush | .copyData _ | .copyDone | .copyFail _ | .terminate => none
 
-private def recvChunk (conn : Connection) : IO (Option ByteArray) :=
-  recvTransport conn.socket conn.tls
+private structure CompletionAction where
+  promise : IO.Promise (Except Error (Array Machine.Event))
+  result : Except Error (Array Machine.Event)
+
+private structure CopyStartAction where
+  promise : IO.Promise (Except Error Machine.CopyInfo)
+  result : Except Error Machine.CopyInfo
+
+private structure CopyDataAction where
+  channel : Std.CloseableChannel ByteArray
+  data : ByteArray
+
+private structure RouteActions where
+  completions : Array CompletionAction := #[]
+  copyStarts : Array CopyStartAction := #[]
+  copyData : Array CopyDataAction := #[]
+  closeCopyData : Array (Std.CloseableChannel ByteArray) := #[]
+  notices : Array ErrorFields := #[]
+  notifications : Array Notification := #[]
+  resolveDrained : Bool := false
+
+private def eventOwner? (routing : List Machine.TaggedOp) : Option Machine.OwnerId :=
+  routing.head?.map (·.owner)
+
+/-- Route one decoded event batch without effects.  The reader applies the
+returned callbacks/channel operations only after releasing the coordinator. -/
+private def routeEvents (initial : ConnState) (events : Array Machine.Event) :
+    ConnState × RouteActions := Id.run do
+  let mut st := initial
+  let mut actions : RouteActions := {}
+  for ev in events do
+    let before := eventOwner? st.routing
+    -- NoticeResponse and NotificationResponse are connection-global.  They
+    -- are valid while the pipeline is idle and must never depend on a caller
+    -- being present at the head of the request queue.
+    match ev with
+    | .notice fields =>
+      actions := { actions with notices := actions.notices.push fields }
+    | .notification pid channel payload =>
+      actions := { actions with notifications :=
+        actions.notifications.push ⟨pid, channel, payload⟩ }
+    | .parameterStatus .. => pure ()
+    | _ =>
+      if h : st.pending.size > 0 then
+        let call := st.pending[0]
+        match ev with
+        | .copyInStarted info | .copyOutStarted info =>
+          let call := { call with events := call.events.push ev }
+          st := { st with pending := st.pending.set 0 call }
+          if let some promise := call.copyStarted then
+            let copyStartAction : CopyStartAction := { promise, result := .ok info }
+            actions := { actions with copyStarts :=
+              (actions.copyStarts.push copyStartAction) }
+        | .copyData data =>
+          let call := { call with events := call.events.push ev }
+          st := { st with pending := st.pending.set 0 call }
+          if let some channel := call.copyData then
+            let copyDataAction : CopyDataAction := { channel, data }
+            actions := { actions with copyData :=
+              (actions.copyData.push copyDataAction) }
+        | _ =>
+          let call := { call with events := call.events.push ev }
+          st := { st with pending := st.pending.set 0 call }
+    st := { st with routing := Machine.taggedStep st.routing ev }
+    let after := eventOwner? st.routing
+    if before != after then
+      if h : st.pending.size > 0 then
+        let call := st.pending[0]
+        let completionAction : CompletionAction := {
+          promise := call.completion, result := .ok call.events }
+        actions := { actions with completions :=
+          (actions.completions.push completionAction) }
+        if let some promise := call.copyStarted then
+          let copyStartAction : CopyStartAction := { promise, result :=
+            (Except.error (.rejected (.rejectedInvalid
+              "statement did not enter the requested COPY mode"))) }
+          actions := { actions with copyStarts :=
+            (actions.copyStarts.push copyStartAction) }
+        if let some channel := call.copyData then
+          actions := { actions with closeCopyData :=
+            (actions.closeCopyData.push channel) }
+        st := { st with
+          pending := st.pending.extract 1 st.pending.size
+          exclusiveOwner :=
+            if st.exclusiveOwner == some call.owner then none else st.exclusiveOwner }
+  if st.life == .closing && st.pending.isEmpty then
+    actions := { actions with resolveDrained := true }
+  return (st, actions)
+
+private def applyRouteActions (conn : Connection) (actions : RouteActions) : IO Unit := do
+  for action in actions.completions do
+    discard <| action.promise.resolve action.result
+  for action in actions.copyStarts do
+    discard <| action.promise.resolve action.result
+  for action in actions.copyData do
+    discard <| action.channel.trySend action.data
+  for channel in actions.closeCopyData do
+    discard <| channel.close.toBaseIO
+  for fields in actions.notices do
+    conn.onNotice fields
+  for notification in actions.notifications do
+    discard <| conn.notifications.trySend notification
+  if actions.resolveDrained then
+    discard <| conn.drained.resolve ()
+
+private def failedState (st : ConnState) : ConnState :=
+  { st with life := .closed, routing := [], pending := #[], exclusiveOwner := none }
+
+/-- Apply failure effects after the coordinator has atomically detached every
+pending caller. -/
+private def finishFailure (conn : Connection) (error : Error)
+    (calls : Array PendingCall) : IO Unit := do
+  for call in calls do
+    discard <| call.completion.resolve (.error error)
+    if let some promise := call.copyStarted then
+      discard <| promise.resolve (.error error)
+    if let some channel := call.copyData then
+      discard <| channel.close.toBaseIO
+  discard <| conn.drained.resolve ()
+  discard <| conn.closeDone.resolve ()
+  discard <| conn.notifications.close.toBaseIO
+  discard <| conn.outbound.close.toBaseIO
+
+private def failConnection (conn : Connection) (error : Error) : IO Unit := do
+  let calls ← conn.state.atomically do
+    let st ← get
+    if st.life == .closed then
+      pure (#[] : Array PendingCall)
+    else
+      set (failedState st)
+      pure st.pending
+  finishFailure conn error calls
+
+private partial def writerLoop (conn : Connection) : Async Unit := do
+  match ← await (← conn.outbound.recv) with
+  | none => pure ()
+  | some (.wire wire) =>
+    try
+      sendWire conn.socket wire
+      writerLoop conn
+    catch e =>
+      failConnection conn (.transport (toString e))
+      try conn.socket.shutdown catch _ => pure ()
+
+private inductive ReaderOutcome where
+  | stop
+  | failed (error : Error) (calls : Array PendingCall)
+  | continued (actions : Option RouteActions)
+
+private partial def readerLoop (conn : Connection) : Async Unit := do
+  try
+    match ← recvWire conn.socket with
+    | none =>
+      let cleanTlsEof ← conn.tlsLock.atomically do
+        match conn.tls with
+        | none => pure true
+        | some ref => pure (← ref.get).peerClosed
+      failConnection conn (if cleanTlsEof then .disconnected
+        else .transport "TLS connection closed without close_notify")
+    | some wireChunk =>
+      -- The coordinator orders TLS read transitions, generated TLS replies,
+      -- application sealing, and writer-queue insertion.  In particular a
+      -- KeyUpdate reply is queued before any caller can seal later data.
+      let outcome ← conn.state.atomically do
+        let st ← get
+        if st.life == .closed then
+          pure ReaderOutcome.stop
+        else
+          let opened ← conn.tlsLock.atomically do
+            openTransportBytes conn.tls wireChunk
+          match opened with
+          | .error error alert =>
+            unless alert.isEmpty do discard <| conn.outbound.trySend (.wire alert)
+            set (failedState st)
+            pure (.failed (.transport (toString error)) st.pending)
+          | .ok plaintext tlsReply =>
+            if !tlsReply.isEmpty && !(← conn.outbound.trySend (.wire tlsReply)) then
+              set (failedState st)
+              pure (.failed .closed st.pending)
+            else
+              match plaintext with
+              | none =>
+                -- The TLS engine models half-close explicitly. PostgreSQL has
+                -- no useful work after the peer closes its write direction,
+                -- so reciprocate under the same ordering critical section.
+                let closeWire ← conn.tlsLock.atomically do
+                  match conn.tls with
+                  | none => pure ByteArray.empty
+                  | some ref =>
+                    match Tls.Client.closeNotify (← ref.get) with
+                    | .error _ => pure ByteArray.empty
+                    | .ok output =>
+                      ref.set output.state
+                      pure output.wireBytes
+                unless closeWire.isEmpty do
+                  discard <| conn.outbound.trySend (.wire closeWire)
+                set (failedState st)
+                pure (.failed .disconnected st.pending)
+              | some chunk =>
+                if chunk.isEmpty then
+                  pure (.continued none)
+                else
+                  match Machine.feed st.machine chunk with
+                  | .error e =>
+                    set (failedState st)
+                    pure (.failed (.fatal e) st.pending)
+                  | .ok (machine, events, out) =>
+                    let (next, actions) := routeEvents { st with machine } events
+                    match ← enqueueApplicationLocked conn out with
+                    | .error error =>
+                      set (failedState st)
+                      pure (.failed error st.pending)
+                    | .ok () =>
+                      set next
+                      pure (.continued (some actions))
+      match outcome with
+      | .stop => pure ()
+      | .failed error calls =>
+        finishFailure conn error calls
+        -- `finishFailure` closes the queue, so the sole writer can flush a
+        -- queued TLS alert/close_notify before the socket is torn down.
+        if let some writer := (← conn.background.get).writer then
+          try
+            discard <| Async.race (Async.ofAsyncTask writer)
+              (Std.Async.sleep (Std.Time.Millisecond.Offset.ofNat 1000))
+          catch _ => pure ()
+        try conn.socket.shutdown catch _ => pure ()
+      | .continued none => readerLoop conn
+      | .continued (some actions) =>
+        applyRouteActions conn actions
+        readerLoop conn
+  catch e =>
+    failConnection conn (.transport (toString e))
+    try conn.socket.shutdown catch _ => pure ()
+
+private def startBackgroundTasks (conn : Connection) : IO Unit := do
+  let writer ← Async.toIO (writerLoop conn)
+  conn.background.set { writer := some writer }
+  let reader ← Async.toIO (readerLoop conn)
+  conn.background.set { reader := some reader, writer := some writer }
 
 private def toSocketAddress (addr : Std.Net.IPAddr) (port : UInt16) : Std.Net.SocketAddress :=
   match addr with
   | .v4 a => .v4 { addr := a, port }
   | .v6 a => .v6 { addr := a, port }
 
-private partial def cancellableSleep (remainingMs : Nat) : IO Unit := do
-  if remainingMs == 0 || (← IO.checkCanceled) then
-    pure ()
-  else
-    let chunk := min remainingMs 50
-    IO.sleep (UInt32.ofNat chunk)
-    cancellableSleep (remainingMs - chunk)
-
-/-- Run `act` with a relative timeout; `none` on timeout. The losing task is
-cancelled so fragmented handshakes cannot accumulate sleepers or socket reads. -/
-private def timedIO (ms : Nat) (act : IO α) : IO (Option α) := do
+/-- Run `act` with a cooperative relative timeout; `none` on timeout.  Neither
+branch occupies a worker while waiting. -/
+private def timedIO (ms : Nat) (act : Async α) : Async (Option α) := do
   if ms == 0 then
     some <$> act
   else
-    let work ← IO.asTask (some <$> act)
-    let timer ← IO.asTask (do
-      cancellableSleep ms
-      pure (none : Option α))
-    match ← IO.waitAny [work, timer] with
-    | .ok result =>
-      if result.isSome then IO.cancel timer else IO.cancel work
-      pure result
-    | .error e =>
-      IO.cancel work
-      IO.cancel timer
-      throw e
+    Async.race (some <$> act) do
+      Std.Async.sleep (Std.Time.Millisecond.Offset.ofNat ms)
+      pure none
 
-private def deadlineFromNow (ms : Nat) : IO (Option Nat) := do
+private def deadlineFromNow (ms : Nat) : Async (Option Nat) := do
   if ms == 0 then
     pure none
   else
     pure (some ((← IO.monoNanosNow) + ms * 1000000))
 
-private def timedIOUntil (deadline : Option Nat) (act : IO α) : IO (Option α) := do
+private def timedIOUntil (deadline : Option Nat) (act : Async α) : Async (Option α) := do
   match deadline with
   | none => some <$> act
   | some deadline =>
@@ -260,8 +564,8 @@ private def timedIOUntil (deadline : Option Nat) (act : IO α) : IO (Option α) 
       timedIO remainingMs act
 
 private def recvSslResponse (socket : TCP.Socket.Client) (deadline : Option Nat) :
-    IO UInt8 := do
-  let some response? ← timedIOUntil deadline ((socket.recv? 1).block)
+    Async UInt8 := do
+  let some response? ← timedIOUntil deadline (socket.recv? 1)
     | throw (IO.userError "PostgreSQL SSLRequest timed out")
   let some response := response?
     | throw (IO.userError "server closed the connection during SSL negotiation")
@@ -273,7 +577,7 @@ private def recvSslResponse (socket : TCP.Socket.Client) (deadline : Option Nat)
 
 private def startTls (socket : TCP.Socket.Client) (cfg : ConnectConfig)
     (deadline : Option Nat) :
-    IO (IO.Ref Tls.Client.State) := do
+    Async (IO.Ref Tls.Client.State) := do
   let mut initial? : Option Tls.Client.Output := none
   while initial?.isNone do
     let entropy ← IO.getRandomBytes 128
@@ -339,7 +643,7 @@ def SslMode.fallbackAttempt : SslMode → Option ConnectPolicy
 
 private def negotiateTransport (socket : TCP.Socket.Client) (cfg : ConnectConfig)
     (policy : ConnectPolicy) (deadline : Option Nat) :
-    IO (Option (IO.Ref Tls.Client.State)) := do
+    Async (Option (IO.Ref Tls.Client.State)) := do
   match policy with
   | .plaintext => pure none
   | .negotiateTls required =>
@@ -356,15 +660,15 @@ private def negotiateTransport (socket : TCP.Socket.Client) (cfg : ConnectConfig
       -- the one-byte reply (CVE-2024-10977).
       throw (IO.userError "server sent an invalid response to PostgreSQL SSLRequest")
 
-private def connectSocket (host : String) (port : UInt16) : IO TCP.Socket.Client := do
-  let addrs ← (DNS.getAddrInfo host (toString port.toNat)).block
+private def connectSocket (host : String) (port : UInt16) : Async TCP.Socket.Client := do
+  let addrs ← DNS.getAddrInfo host (toString port.toNat)
   if addrs.isEmpty then
     throw (IO.userError s!"could not resolve {host}")
   let mut lastError : Option IO.Error := none
   for addr in addrs do
     let socket ← TCP.Socket.Client.mk
     try
-      (socket.connect (toSocketAddress addr port)).block
+      socket.connect (toSocketAddress addr port)
       socket.noDelay
       return socket
     catch e =>
@@ -372,7 +676,7 @@ private def connectSocket (host : String) (port : UInt16) : IO TCP.Socket.Client
   throw (lastError.getD (IO.userError s!"could not connect to {host}:{port.toNat}"))
 
 private def connectAttempt (cfg : ConnectConfig) (onNotice : ErrorFields → IO Unit)
-    (policy : ConnectPolicy) : IO (Except Machine.PgError Connection) := do
+    (policy : ConnectPolicy) : Async (Except Machine.PgError Connection) := do
   let deadline ← deadlineFromNow cfg.connectTimeoutMs
   let some socket ← timedIOUntil deadline (connectSocket cfg.host cfg.port)
     | throw (IO.userError s!"connecting to {cfg.host}:{cfg.port.toNat} timed out")
@@ -423,13 +727,23 @@ private def connectAttempt (cfg : ConnectConfig) (onNotice : ErrorFields → IO 
             | .notification pid channel payload =>
               notifications := notifications.push ⟨pid, channel, payload⟩
             | _ => pure ()
-    let state ← Std.Mutex.new { machine := m, notifications }
-    pure (.ok {
+    let state ← Std.Mutex.new { machine := m }
+    let conn : Connection := {
       socket, tls, state, onNotice, host := cfg.host, port := cfg.port
+      tlsLock := ← Std.Mutex.new ()
+      outbound := ← Std.CloseableChannel.new
+      notifications := ← Std.CloseableChannel.new
+      background := ← IO.mkRef {}
+      drained := ← IO.Promise.new
+      closeDone := ← IO.Promise.new
       connectTimeoutMs := cfg.connectTimeoutMs
       sslMode := cfg.sslMode
       sslRootCert := cfg.sslRootCert
-      cancelKey := m.cancelKey? })
+      cancelKey := m.cancelKey? }
+    for notification in notifications do
+      discard <| conn.notifications.trySend notification
+    startBackgroundTasks conn
+    pure (.ok conn)
   catch e =>
     shutdownSocket socket
     throw e
@@ -489,7 +803,7 @@ theorem fallback_plaintext_only_unencrypted {m : SslMode}
   cases m <;> first | rfl | exact absurd h (by simp [SslMode.fallbackAttempt])
 
 private def finishConnectAttempt (result : Except Machine.PgError Connection) :
-    IO Connection :=
+    Async Connection :=
   match result with
   | .ok conn => pure conn
   | .error (.channelBinding failure) =>
@@ -507,7 +821,7 @@ and `SslMode.fallbackAttempt`, which are proved to follow `SslMode.policy` —
 in particular no encryption-requiring mode has any retry
 (`fallbackAttempt_of_requireEncryption`). -/
 def connect (cfg : ConnectConfig) (onNotice : ErrorFields → IO Unit := fun _ => pure ()) :
-    IO Connection := do
+    Async Connection := do
   match ← connectAttempt cfg onNotice cfg.sslMode.initialAttempt with
   | .ok conn => pure conn
   | .error e =>
@@ -524,7 +838,7 @@ def connect (cfg : ConnectConfig) (onNotice : ErrorFields → IO Unit := fun _ =
 
 /-- Connect from a `postgres://` URL. -/
 def connectUri (uri : String) (onNotice : ErrorFields → IO Unit := fun _ => pure ()) :
-    IO Connection := do
+    Async Connection := do
   match ConnectConfig.parseUri uri with
   | .ok cfg => connect cfg onNotice
   | .error e => throw (IO.userError e)
@@ -538,89 +852,127 @@ structure Statement where
 
 namespace Connection
 
-/-- Drive the socket until `expectedReady` ReadyForQuery events have arrived,
-returning the op-relevant events in wire order (notices go to the callback,
-notifications to the queue, ParameterStatus is absorbed by the machine). -/
-private partial def driveCollect (conn : Connection) (expectedReady : Nat) :
-    Std.AtomicT ConnState IO (Except Error (Array Machine.Event)) := do
-  let mut kept : Array Machine.Event := #[]
-  let mut seenReady := 0
-  let mut outcome : Option (Except Error (Array Machine.Event)) := none
-  while outcome.isNone do
-    match ← recvChunk conn with
-    | none => outcome := some (.error .disconnected)
-    | some chunk =>
-      let st ← get
-      match Machine.feed st.machine chunk with
-      | .error e => outcome := some (.error (.fatal e))
-      | .ok (m, events, out) =>
-        set { st with machine := m }
-        sendBytes conn out
-        for ev in events do
-          match ev with
-          | .notice fields => conn.onNotice fields
-          | .notification pid channel payload =>
-            let n : Notification := ⟨pid, channel, payload⟩
-            modify fun s => { s with notifications := s.notifications.push n }
-          | .parameterStatus .. => pure ()
-          | .ready tx =>
-            kept := kept.push (.ready tx)
-            seenReady := seenReady + 1
-            if seenReady ≥ expectedReady then
-              outcome := some (.ok kept)
-          | ev => kept := kept.push ev
-  pure (outcome.getD (.error .disconnected))
+private def rejected (message : String) : Error :=
+  .rejected (.rejectedInvalid message)
 
-/-- Drive until an event satisfying `isStop` arrives (kept in the returned
-array). Async traffic is absorbed as in `driveCollect`. -/
-private partial def driveUntilEvent (conn : Connection) (isStop : Machine.Event → Bool) :
-    Std.AtomicT ConnState IO (Except Error (Array Machine.Event)) := do
-  let mut kept : Array Machine.Event := #[]
-  let mut outcome : Option (Except Error (Array Machine.Event)) := none
-  while outcome.isNone do
-    match ← recvChunk conn with
-    | none => outcome := some (.error .disconnected)
-    | some chunk =>
-      let st ← get
-      match Machine.feed st.machine chunk with
-      | .error e => outcome := some (.error (.fatal e))
-      | .ok (m, events, out) =>
-        set { st with machine := m }
-        sendBytes conn out
-        for ev in events do
-          match ev with
-          | .notice fields => conn.onNotice fields
-          | .notification pid channel payload =>
-            let n : Notification := ⟨pid, channel, payload⟩
-            modify fun s => { s with notifications := s.notifications.push n }
-          | .parameterStatus .. => pure ()
-          | ev =>
-            kept := kept.push ev
-            if isStop ev && outcome.isNone then
-              outcome := some (.ok kept)
-  pure (outcome.getD (.error .disconnected))
+private def isBoundary : Machine.Request → Bool
+  | .sync | .simpleQuery _ => true
+  | _ => false
 
-/-- Submit requests and drive to the final ReadyForQuery, returning raw events
-— the general pipelining entry point. `reqs` must contain at least one `sync`
-or `simpleQuery` (something that produces ReadyForQuery), else the drive could
-never terminate. Server errors appear as `errorResponse` events (with the
-usual skip-until-Sync semantics), not as `.error`. -/
-partial def run (conn : Connection) (reqs : Array Machine.Request) :
-    IO (Except Error (Array Machine.Event)) := do
-  let expectedReady := reqs.foldl (fun n r =>
-    match r with
-    | .sync | .simpleQuery _ => n + 1
-    | _ => n) 0
-  if expectedReady == 0 then
-    return .error (.rejected (.rejectedInvalid "run needs a sync or simpleQuery"))
-  conn.state.atomically do
+private def isRunControl : Machine.Request → Bool
+  | .flush | .copyData _ | .copyDone | .copyFail _ | .terminate => true
+  | _ => false
+
+private def validateRun (reqs : Array Machine.Request) : Except Error (List Machine.OpKind) := do
+  if reqs.isEmpty then
+    throw (rejected "run needs a non-empty request batch")
+  if reqs.size > 1024 then
+    throw (rejected "run batch exceeds the 1024-request safety limit")
+  let some final := reqs.back?
+    | throw (rejected "run needs a non-empty request batch")
+  unless isBoundary final do
+    throw (rejected "run needs a final sync or simpleQuery boundary")
+  for req in reqs.extract 0 (reqs.size - 1) do
+    if isBoundary req then
+      throw (rejected "run does not allow requests after a response boundary")
+    if isRunControl req then
+      throw (rejected "run does not accept COPY, Flush, or Terminate control requests")
+  if isRunControl final then
+    throw (rejected "run does not accept COPY, Flush, or Terminate control requests")
+  pure (reqs.toList.filterMap requestOpKind?)
+
+private structure CallHandle where
+  owner : Machine.OwnerId
+  completion : IO.Promise (Except Error (Array Machine.Event))
+  copyStarted : Option (IO.Promise (Except Error Machine.CopyInfo)) := none
+  copyData : Option (Std.CloseableChannel ByteArray) := none
+
+private inductive CoordinatorResult (α : Type) where
+  | rejected (error : Error)
+  | failed (error : Error) (calls : Array PendingCall)
+  | ok (value : α)
+
+private def submitBatch (conn : Connection) (reqs : Array Machine.Request)
+    (exclusive : Bool := false)
+    (copyStarted : Option (IO.Promise (Except Error Machine.CopyInfo)) := none)
+    (copyData : Option (Std.CloseableChannel ByteArray) := none) :
+    Async (Except Error CallHandle) := do
+  let kinds ← match validateRun reqs with
+    | .ok kinds => pure kinds
+    | .error e => return .error e
+  let completion ← IO.Promise.new
+  let submitted : CoordinatorResult Machine.OwnerId ← conn.state.atomically do
     let st ← get
-    match Machine.submitAll st.machine reqs with
-    | .error e => pure (.error (.rejected e))
-    | .ok (m, bytes) =>
-      set { st with machine := m }
-      sendBytes conn bytes
-      driveCollect conn expectedReady
+    match st.life with
+    | .closing | .closed => pure (.rejected Error.closed)
+    | .open =>
+      if st.exclusiveOwner.isSome then
+        pure (.rejected (rejected "a COPY operation owns the connection"))
+      else
+        match Machine.submitAll st.machine reqs with
+        | .error e => pure (.rejected (.rejected e))
+        | .ok (machine, bytes) =>
+          let owner := st.nextOwner
+          let tagged := kinds.map fun kind => ({ owner, kind } : Machine.TaggedOp)
+          let call : PendingCall := {
+            owner, completion, copyStarted, copyData }
+          -- Admission order, owner order, and writer-queue order are one
+          -- transaction.  `trySend` is nonblocking, so no peer wait occurs
+          -- while the coordinator is held.
+          match ← enqueueApplicationLocked conn bytes with
+          | .error error =>
+            set (failedState st)
+            pure (.failed error st.pending)
+          | .ok () =>
+            set { st with
+              machine
+              routing := st.routing ++ tagged
+              pending := st.pending.push call
+              nextOwner := owner + 1
+              exclusiveOwner := if exclusive then some owner else none }
+            pure (.ok owner)
+  match submitted with
+  | .rejected e => pure (.error e)
+  | .failed e calls =>
+    finishFailure conn e calls
+    pure (.error e)
+  | .ok owner => pure (.ok { owner, completion, copyStarted, copyData })
+
+private def submitCopyControl (conn : Connection) (owner : Machine.OwnerId)
+    (request : Machine.Request) : Async (Except Error Unit) := do
+  let submitted : CoordinatorResult Unit ← conn.state.atomically do
+    let st ← get
+    if st.life == .closed then
+      pure (.rejected Error.closed)
+    else if st.exclusiveOwner != some owner then
+      pure (.rejected (rejected "COPY ownership is no longer active"))
+    else
+      match Machine.submit st.machine request with
+      | .error e => pure (.rejected (.rejected e))
+      | .ok (machine, bytes) =>
+        match ← enqueueApplicationLocked conn bytes with
+        | .error error =>
+          set (failedState st)
+          pure (.failed error st.pending)
+        | .ok () =>
+          set { st with machine }
+          pure (.ok ())
+  match submitted with
+  | .rejected e => pure (.error e)
+  | .failed e calls =>
+    finishFailure conn e calls
+    pure (.error e)
+  | .ok () => pure (.ok ())
+
+/-- Submit one bounded batch.  Batches are admitted concurrently and written
+in submission order.  Each batch must have exactly one final ReadyForQuery
+boundary; protocol-control traffic is reserved for the dedicated COPY/close
+paths. -/
+def run (conn : Connection) (reqs : Array Machine.Request) :
+    Async (Except Error (Array Machine.Event)) := do
+  match ← submitBatch conn reqs with
+  | .error e => pure (.error e)
+  | .ok call => await call.completion
 
 /-- Interpret a simple-query event stream: one `Rows` per statement. -/
 private def foldSimple (events : Array Machine.Event) :
@@ -645,14 +997,10 @@ private def foldSimple (events : Array Machine.Event) :
   | some fields => return .error (.server fields)
   | none => return .ok results
 
-/-- Run one simple-query exchange (`Q`): possibly multiple statements, one
-`Rows` per completed statement. A statement error yields `.error (.server _)`
-with the connection still usable; fatal errors poison the connection. -/
-def query (conn : Connection) (sql : String) : IO (Except Error (Array Rows)) := do
+def query (conn : Connection) (sql : String) : Async (Except Error (Array Rows)) := do
   pure ((← conn.run #[.simpleQuery sql]).bind foldSimple)
 
-/-- `query` for statements where only the command tags matter. -/
-def exec (conn : Connection) (sql : String) : IO (Except Error (Array String)) := do
+def exec (conn : Connection) (sql : String) : Async (Except Error (Array String)) := do
   pure ((← conn.query sql).map (·.map (·.tag)))
 
 private def foldPrepare (name : String) (events : Array Machine.Event) :
@@ -678,72 +1026,40 @@ private def foldExecute (events : Array Machine.Event) : Except Error Rows := Id
     | _ => pure ()
   return .ok result
 
-/-- Parse + Describe + Sync: create a named (or unnamed, `""`) prepared
-statement and learn its parameter types and result columns. -/
 def prepare (conn : Connection) (name sql : String) (paramTypeOids : Array UInt32 := #[]) :
-    IO (Except Error Statement) := do
+    Async (Except Error Statement) := do
   pure ((← conn.run #[.parse name sql paramTypeOids, .describeStatement name, .sync]).bind
     (foldPrepare name))
 
-/-- Bind + Describe + Execute + Sync on a prepared statement, draining all
-rows. `params` are wire values (text format by default); `none` = NULL. -/
 def execute (conn : Connection) (statement : String)
     (params : Array (Option ByteArray) := #[])
     (paramFormats : Array UInt16 := #[])
-    (resultFormats : Array UInt16 := #[]) : IO (Except Error Rows) := do
+    (resultFormats : Array UInt16 := #[]) : Async (Except Error Rows) := do
   pure ((← conn.run #[
     .bind "" statement paramFormats params resultFormats,
     .describePortal "",
     .execute "" 0,
     .sync]).bind foldExecute)
 
-/-- Deliver a queued notification, else wait up to `timeoutMs` for one to
-arrive on the wire. `none` on timeout. Statement errors cannot occur here;
-anything the server sends besides async traffic poisons the connection. -/
-partial def waitNotification (conn : Connection) (timeoutMs : Nat := 1000) :
-    IO (Except Error (Option Notification)) := do
-  conn.state.atomically do
-    let st ← get
-    if st.notifications.size > 0 then
-      let n := st.notifications[0]!
-      set { st with notifications := st.notifications.extract 1 st.notifications.size }
-      pure (.ok (some n))
-    else
-      let sleep ← (Sleep.mk (Std.Time.Millisecond.Offset.ofNat timeoutMs)).block
-      let mut outcome : Option (Except Error (Option Notification)) := none
-      while outcome.isNone do
-        let raced ← (Selectable.one #[
-          .case (conn.socket.recvSelector 65536) (fun chunk? => pure (some chunk?)),
-          .case sleep.selector (fun _ => pure none)]).block
-        match raced with
-        | none => outcome := some (.ok none)  -- timeout
-        | some none => outcome := some (.error .disconnected)
-        | some (some wireChunk) =>
-          match ← decodeTransport conn.socket conn.tls wireChunk with
-          | none => outcome := some (.error .disconnected)
-          | some chunk =>
-            -- A post-handshake TLS control record can produce no PostgreSQL
-            -- bytes. Keep racing the same deadline in that case.
-            unless chunk.isEmpty do
-              let st ← get
-              match Machine.feed st.machine chunk with
-              | .error e => outcome := some (.error (.fatal e))
-              | .ok (m, events, out) =>
-                set { st with machine := m }
-                sendBytes conn out
-                for ev in events do
-                  match ev with
-                  | .notice fields => conn.onNotice fields
-                  | .notification pid channel payload =>
-                    let n : Notification := ⟨pid, channel, payload⟩
-                    modify fun s => { s with notifications := s.notifications.push n }
-                  | _ => pure ()
-                let st ← get
-                if st.notifications.size > 0 then
-                  let n := st.notifications[0]!
-                  set { st with notifications := st.notifications.extract 1 st.notifications.size }
-                  outcome := some (.ok (some n))
-      pure (outcome.getD (.ok none))
+private inductive NotificationWait where
+  | received (notification : Option Notification)
+  | timeout
+
+/-- Await one notification without competing with the connection reader for
+socket ownership. -/
+def waitNotification (conn : Connection) (timeoutMs : Nat := 1000) :
+    Async (Except Error (Option Notification)) := do
+  let sleep ← Sleep.mk (Std.Time.Millisecond.Offset.ofNat timeoutMs)
+  let event ← Selectable.one #[
+    .case conn.notifications.recvSelector
+      (fun item => pure (NotificationWait.received item)),
+    .case sleep.selector (fun _ => pure NotificationWait.timeout)]
+  match event with
+  | .timeout => pure (.ok none)
+  | .received (some notification) => pure (.ok (some notification))
+  | .received none =>
+    let closed ← conn.state.atomically do pure ((← get).life != .open)
+    pure (.error (if closed then .closed else .disconnected))
 
 private def firstServerError (events : Array Machine.Event) : Option ErrorFields :=
   events.findSome? fun
@@ -755,63 +1071,45 @@ private def commandTag (events : Array Machine.Event) : String :=
     | .commandComplete tag => some tag
     | _ => none).getD ""
 
-/-- `COPY ... FROM STDIN` via the simple query protocol: `next` supplies data
-chunks (`none` = done; an exception aborts the COPY with CopyFail). Returns
-the CommandComplete tag (`"COPY <n>"`). -/
-partial def copyIn (conn : Connection) (sql : String) (next : IO (Option ByteArray)) :
-    IO (Except Error String) := do
-  conn.state.atomically do
-    let st ← get
-    match Machine.submit st.machine (.simpleQuery sql) with
-    | .error e => pure (.error (.rejected e))
-    | .ok (m, bytes) =>
-      set { st with machine := m }
-      sendBytes conn bytes
-      match ← driveUntilEvent conn
-        (fun e => (e matches .copyInStarted _) || (e matches .ready _)) with
+/-- `COPY ... FROM STDIN`.  The producer is cooperative and runs outside the
+reader/coordinator; an exception submits best-effort CopyFail before the final
+ReadyForQuery is awaited. -/
+partial def copyIn (conn : Connection) (sql : String)
+    (next : Async (Option ByteArray)) : Async (Except Error String) := do
+  let started ← IO.Promise.new
+  let call ← match ← submitBatch conn #[.simpleQuery sql] true (some started) with
+    | .error e => return .error e
+    | .ok call => pure call
+  match ← await started with
+  | .error e => pure (.error e)
+  | .ok _ =>
+    let mut producerFailure : Option String := none
+    let mut done := false
+    while !done do
+      let chunk? ← try next catch e =>
+        producerFailure := some (toString e)
+        pure none
+      match chunk? with
+      | some chunk =>
+        match ← submitCopyControl conn call.owner (.copyData chunk) with
+        | .ok () => pure ()
+        | .error e => return .error e
+      | none => done := true
+    let finish := match producerFailure with
+      | some reason => Machine.Request.copyFail reason
+      | none => Machine.Request.copyDone
+    match ← submitCopyControl conn call.owner finish with
+    | .error e => pure (.error e)
+    | .ok () =>
+      match ← await call.completion with
       | .error e => pure (.error e)
       | .ok events =>
-        if let some fields := firstServerError events then
-          return .error (.server fields)
-        unless events.any (· matches .copyInStarted _) do
-          return .error (.rejected (.rejectedInvalid s!"not a COPY FROM STDIN statement: {sql}"))
-        -- direction reversed: pump user data
-        let mut failed : Option String := none
-        let mut sending := true
-        while sending do
-          let chunk? ← try
-              next
-            catch e =>
-              failed := some (toString e)
-              pure none
-          match chunk? with
-          | some chunk =>
-            let st ← get
-            match Machine.submit st.machine (.copyData chunk) with
-            | .error e => return .error (.rejected e)
-            | .ok (m, bytes) =>
-              set { st with machine := m }
-              sendBytes conn bytes
-          | none => sending := false
-        let finish := match failed with
-          | some reason => Machine.Request.copyFail reason
-          | none => Machine.Request.copyDone
-        let st ← get
-        match Machine.submit st.machine finish with
-        | .error e => pure (.error (.rejected e))
-        | .ok (m, bytes) =>
-          set { st with machine := m }
-          sendBytes conn bytes
-          match ← driveUntilEvent conn (· matches .ready _) with
-          | .error e => pure (.error e)
-          | .ok events =>
-            match firstServerError events with
-            | some fields => pure (.error (.server fields))
-            | none => pure (.ok (commandTag events))
+        match firstServerError events with
+        | some fields => pure (.error (.server fields))
+        | none => pure (.ok (commandTag events))
 
-/-- `copyIn` from an in-memory chunk list. -/
 def copyInChunks (conn : Connection) (sql : String) (chunks : Array ByteArray) :
-    IO (Except Error String) := do
+    Async (Except Error String) := do
   let idx ← IO.mkRef 0
   conn.copyIn sql do
     let i ← idx.get
@@ -821,51 +1119,50 @@ def copyInChunks (conn : Connection) (sql : String) (chunks : Array ByteArray) :
     else
       pure none
 
-/-- `COPY ... TO STDOUT` via the simple query protocol: every data chunk goes
-to `sink`; returns the CommandComplete tag. -/
-partial def copyOut (conn : Connection) (sql : String) (sink : ByteArray → IO Unit) :
-    IO (Except Error String) := do
-  conn.state.atomically do
-    let st ← get
-    match Machine.submit st.machine (.simpleQuery sql) with
-    | .error e => pure (.error (.rejected e))
-    | .ok (m, bytes) =>
-      set { st with machine := m }
-      sendBytes conn bytes
-      match ← driveUntilEvent conn (· matches .ready _) with
-      | .error e => pure (.error e)
-      | .ok events =>
-        if let some fields := firstServerError events then
-          return .error (.server fields)
-        for ev in events do
-          if let .copyData data := ev then
-            sink data
-        pure (.ok (commandTag events))
+private partial def pumpCopyOut (channel : Std.CloseableChannel ByteArray)
+    (sink : ByteArray → Async Unit) : Async Unit := do
+  match ← await (← channel.recv) with
+  | none => pure ()
+  | some data => sink data; pumpCopyOut channel sink
 
-/-- `LISTEN <channel>`; notifications arrive via `waitNotification`. -/
-def listen (conn : Connection) (channel : String) : IO (Except Error Unit) := do
+/-- `COPY ... TO STDOUT`.  The reader only routes chunks; the caller's sink is
+run by this independent cooperative pump. -/
+def copyOut (conn : Connection) (sql : String) (sink : ByteArray → Async Unit) :
+    Async (Except Error String) := do
+  let started ← IO.Promise.new
+  let data ← Std.CloseableChannel.new
+  let call ← match ← submitBatch conn #[.simpleQuery sql] true (some started) (some data) with
+    | .error e => return .error e
+    | .ok call => pure call
+  match ← await started with
+  | .error e => pure (.error e)
+  | .ok _ =>
+    pumpCopyOut data sink
+    match ← await call.completion with
+    | .error e => pure (.error e)
+    | .ok events =>
+      match firstServerError events with
+      | some fields => pure (.error (.server fields))
+      | none => pure (.ok (commandTag events))
+
+def listen (conn : Connection) (channel : String) : Async (Except Error Unit) := do
   let quoted := "\"" ++ channel.replace "\"" "\"\"" ++ "\""
   pure ((← conn.exec s!"LISTEN {quoted}").map (fun _ => ()))
 
-/-- `pg_notify(channel, payload)` through a parametrized statement (no
-escaping pitfalls). -/
-def notify (conn : Connection) (channel payload : String) : IO (Except Error Unit) := do
+def notify (conn : Connection) (channel payload : String) : Async (Except Error Unit) := do
   let r ← conn.run #[
     .parse "" "SELECT pg_notify($1, $2)",
     .bind "" "" #[] #[some channel.toUTF8, some payload.toUTF8] #[],
     .execute "" 0,
     .sync]
-  pure (r.bind (fun events =>
+  pure (r.bind fun events =>
     match firstServerError events with
     | some fields => .error (.server fields)
-    | none => .ok ()))
+    | none => .ok ())
 
-/-- Cancel whatever this connection is executing over a fresh socket. If the
-original connection negotiated TLS, the cancellation connection requires a
-fresh TLS handshake too, so the BackendKeyData bearer secret is never
-downgraded to plaintext. Safe to call while another task holds the operation
-mutex. Best-effort by design. -/
-def cancel (conn : Connection) : IO Unit := do
+/-- Dispatch PostgreSQL CancelRequest on its policy-equivalent fresh
+connection.  It never consumes the main connection's reader or writer. -/
+def cancel (conn : Connection) : Async Unit := do
   match conn.cancelKey with
   | none => pure ()
   | some key =>
@@ -880,15 +1177,10 @@ def cancel (conn : Connection) : IO Unit := do
         connectTimeoutMs := conn.connectTimeoutMs
         sslMode := conn.sslMode
         sslRootCert := conn.sslRootCert }
-      let tls ←
-        if conn.tls.isSome then
+      let tls ← if conn.tls.isSome then
           negotiateTransport socket cancelCfg (.negotiateTls true) deadline
-        else
-          pure none
+        else pure none
       sendTransport socket tls (encodeCancelRequest key.processId key.secret)
-      -- The server normally closes immediately after consuming CancelRequest.
-      -- Attempt a clean TLS shutdown without turning a dispatched cancellation
-      -- into a failure if the peer wins that race.
       if let some ref := tls then
         try
           let output ← match Tls.Client.closeNotify (← ref.get) with
@@ -902,58 +1194,86 @@ def cancel (conn : Connection) : IO Unit := do
       shutdownSocket socket
       throw e
 
-/-- The latest backend-reported value of a run-time parameter. -/
-def parameter? (conn : Connection) (name : String) : IO (Option String) := do
-  conn.state.atomically do
-    pure ((← get).machine.parameter? name)
+def parameter? (conn : Connection) (name : String) : Async (Option String) :=
+  conn.state.atomically do pure ((← get).machine.parameter? name)
 
-/-- The effective protocol version (post-NegotiateProtocolVersion). -/
-def protocolVersion (conn : Connection) : IO Machine.ProtocolVersion := do
-  conn.state.atomically do
-    pure (← get).machine.protocolVersion
+def protocolVersion (conn : Connection) : Async Machine.ProtocolVersion :=
+  conn.state.atomically do pure (← get).machine.protocolVersion
 
-/-- SASL mechanism negotiated while authenticating this connection. `none`
-means the server selected a non-SASL authentication method. -/
-def negotiatedSaslMechanism? (conn : Connection) : IO (Option String) := do
-  conn.state.atomically do
-    pure (← get).machine.negotiatedSaslMechanism?
+def negotiatedSaslMechanism? (conn : Connection) : Async (Option String) :=
+  conn.state.atomically do pure (← get).machine.negotiatedSaslMechanism?
 
-/-- Whether PostgreSQL application traffic on this connection is protected by
-TLS. This says nothing about certificate identity validation. -/
-def usesTls (conn : Connection) : Bool :=
-  conn.tls.isSome
+def usesTls (conn : Connection) : Bool := conn.tls.isSome
 
-/-- The server-supplied leaf certificate DER when TLS is active. The TLS
-handshake has verified proof of possession through CertificateVerify, but the
-certificate chain and hostname remain unverified until a verification mode
-performs those policy checks. -/
-def peerCertificate? (conn : Connection) : IO (Option ByteArray) := do
-  match conn.tls with
-  | none => pure none
-  | some ref => pure (← ref.get).leafCertificate?
-
-/-- Graceful shutdown: Terminate, then close the socket. Safe to call on a
-poisoned connection. A TLS connection also emits `close_notify`. -/
-def close (conn : Connection) : IO Unit := do
-  conn.state.atomically do
-    let st ← get
-    match Machine.submit st.machine .terminate with
-    | .ok (m, bytes) =>
-      set { st with machine := m }
-      try sendBytes conn bytes catch _ => pure ()
-    | .error _ => pure ()
+def peerCertificate? (conn : Connection) : Async (Option ByteArray) := do
+  conn.tlsLock.atomically do
     match conn.tls with
-    | none => pure ()
-    | some ref =>
-      try
-        let tlsState ← ref.get
-        match Tls.Client.closeNotify tlsState with
-        | .error _ => pure ()
-        | .ok output =>
-          ref.set output.state
-          sendWire conn.socket output.wireBytes
-      catch _ => pure ()
-  shutdownSocket conn.socket
+    | none => pure none
+    | some ref => pure (← ref.get).leafCertificate?
+
+/-- Idempotent graceful shutdown.  The leader rejects new work, waits for all
+already-attributed calls, enqueues one Terminate and (for TLS) close_notify,
+drains the exact writer task, then half-closes the socket. -/
+def close (conn : Connection) : Async Unit := do
+  let (leader, drainNow) ← conn.state.atomically do
+    let st ← get
+    match st.life with
+    | .open =>
+      set { st with life := .closing }
+      pure (true, st.pending.isEmpty)
+    | .closing => pure (false, false)
+    | .closed => pure (false, false)
+  if !leader then
+    discard <| await conn.closeDone
+    return
+  if drainNow then discard <| conn.drained.resolve ()
+  discard <| await conn.drained
+  let closeFailure? ← conn.state.atomically do
+    let st ← get
+    if st.life == .closed then pure none
+    else
+      let (machine, terminateBytes) :=
+        match Machine.submit st.machine .terminate with
+        | .error _ => (st.machine, ByteArray.empty)
+        | .ok result => result
+      match ← enqueueApplicationLocked conn terminateBytes with
+      | .error error =>
+        set (failedState st)
+        pure (some (error, st.pending))
+      | .ok () =>
+        -- Every earlier application item is already sealed and ahead of
+        -- Terminate in the writer FIFO.  Advancing TLS to close_notify here
+        -- therefore cannot invalidate a deferred application seal.
+        let closeWire ← conn.tlsLock.atomically do
+          match conn.tls with
+          | none => pure ByteArray.empty
+          | some ref =>
+            match Tls.Client.closeNotify (← ref.get) with
+            | .error _ => pure ByteArray.empty
+            | .ok output => ref.set output.state; pure output.wireBytes
+        if !closeWire.isEmpty && !(← conn.outbound.trySend (.wire closeWire)) then
+          set (failedState st)
+          pure (some (Error.closed, st.pending))
+        else
+          set { st with machine }
+          pure none
+  if let some (error, calls) := closeFailure? then
+    finishFailure conn error calls
+  discard <| conn.outbound.close.toBaseIO
+  if let some writer := (← conn.background.get).writer then
+    try Async.ofAsyncTask writer catch _ => pure ()
+  conn.state.atomically do modify fun st => { st with life := .closed }
+  discard <| conn.notifications.close.toBaseIO
+  try
+    discard <| Async.race conn.socket.shutdown
+      (Std.Async.sleep (Std.Time.Millisecond.Offset.ofNat 1000))
+  catch _ => pure ()
+  if let some reader := (← conn.background.get).reader then
+    try
+      discard <| Async.race (Async.ofAsyncTask reader)
+        (Std.Async.sleep (Std.Time.Millisecond.Offset.ofNat 1000))
+    catch _ => pure ()
+  discard <| conn.closeDone.resolve ()
 
 end Connection
 

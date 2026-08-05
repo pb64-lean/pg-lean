@@ -20,6 +20,7 @@ During development, run it from the build:
 -/
 
 open Pg
+open Std.Async
 
 def renderValue : Option ByteArray → String
   | none => "NULL"
@@ -97,7 +98,7 @@ def printRowsTyped (rs : Rows) : IO Unit := do
 With `-b`, results are requested in binary format and rendered through the
 typed codecs. -/
 def runExtended (url sql : String) (params : List String) (binary : Bool := false) :
-    IO UInt32 := do
+    Async UInt32 := do
   let cfg ← match ConnectConfig.parseUri url with
     | .ok cfg => pure cfg
     | .error e => IO.eprintln s!"bad url: {e}"; return 2
@@ -118,7 +119,7 @@ def runExtended (url sql : String) (params : List String) (binary : Bool := fals
     conn.close
     return 1
 
-def main (args : List String) : IO UInt32 := do
+private def asyncMain (args : List String) : Async UInt32 := do
   match args with
   | "-e" :: "-b" :: url :: sql :: params => runExtended url sql params (binary := true)
   | "-e" :: url :: sql :: params => runExtended url sql params
@@ -144,3 +145,6 @@ def main (args : List String) : IO UInt32 := do
   | _ => do
     IO.eprintln "usage: pg_lean [-e [-b]] <postgres://user[:pass]@host[:port]/db> SQL [SQL|param ...]"
     return 2
+
+def main (args : List String) : IO UInt32 :=
+  Async.block (asyncMain args)

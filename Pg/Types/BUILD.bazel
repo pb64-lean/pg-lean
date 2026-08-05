@@ -2,6 +2,7 @@ package(default_visibility = ["//visibility:public"])
 
 load("@rules_lean//lean:defs.bzl", "lean_assurance_test", "lean_library")
 load("//:assurance.bzl", "PG_ALLOWED_AXIOMS")
+load("//:assurance_types.bzl", "PG_TYPES_PRINCIPAL_TYPES")
 
 # OIDs and text/binary codecs (PgNumeric, PgInterval, Std.Time mappings).
 lean_library(
@@ -26,8 +27,8 @@ lean_library(
 lean_assurance_test(
     name = "types_assurance",
     allowed_axioms = PG_ALLOWED_AXIOMS,
-    allowed_extern_modules = [],
     module_prefixes = ["Pg"],
+    policy_mode = "exact",
     principal_theorems = [
         # Text-format parameters: the wire spelling decodes to the value sent.
         "Pg.decodeValue_text",
@@ -73,5 +74,12 @@ lean_assurance_test(
         "Pg.arrayScan_elem",
         "Pg.arrayScan_quoted",
     ],
+    principal_theorem_types = PG_TYPES_PRINCIPAL_TYPES,
+    expected_unsafe_constants = [],
+    expected_partial_definitions = [],
+    expected_opaque_constants = [],
+    expected_implemented_by = {},
+    expected_extern_declarations = {},
+    expected_native_targets = [],
     deps = [":types"],
 )
