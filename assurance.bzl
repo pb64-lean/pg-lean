@@ -5,17 +5,15 @@ axioms the Lean standard library itself relies on, and nothing else. There is
 no `sorry`, no `native_decide`, and no LRAT certificate anywhere in the trusted
 surface.
 
-pg-lean previously used `bv_decide` for big-endian byte (de)composition in
-`Pg.Protocol.Message` and `Pg.Types.Codec`. In Lean 4.31 `bv_decide` discharges
-a goal by running a SAT solver and checking its refutation with a *natively
-compiled* LRAT checker, recording the check as one axiom per call site. Those
-seven call sites are gone: the recompositions are now proved at the `Nat` level
-by `Nat.shiftLeft_add_eq_or_of_lt` (which turns a disjoint `|||` into `+`)
-followed by `omega`, so the `Std.Tactic.BVDecide` imports are gone too.
+The big-endian byte (de)composition proofs in `Pg.Protocol.Message` and
+`Pg.Types.Codec` operate at the `Nat` level. They use
+`Nat.shiftLeft_add_eq_or_of_lt` (which turns a disjoint `|||` into `+`) followed
+by `omega`, and do not import `Std.Tactic.BVDecide` or depend on its natively
+checked LRAT certificates.
 
-Keeping this list at exactly three is the point: any new axiom, from any
-tactic, in any module under `Pg`, fails every assurance target and forces the
-choice to be made deliberately.
+The exact three-item list makes every other axiom, from any tactic in any
+module under `Pg`, fail every assurance target unless the policy is explicitly
+changed.
 """
 
 PG_ALLOWED_AXIOMS = [

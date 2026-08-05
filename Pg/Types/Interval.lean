@@ -113,8 +113,8 @@ is 500000 microseconds. -/
     else timeMagnitude orig (c :: rest)
 
 /-- One token at a time, carrying the accumulated interval and a number
-awaiting its unit word. Explicit recursion — the `for` loop this replaces had
-two mutable variables and was opaque to the kernel. -/
+awaiting its unit word. Explicit recursion keeps both pieces of state visible
+to the kernel. -/
 @[expose] def step (orig : String) (iv : PgInterval) (pending : Option Int) :
     List (List Char) → Except String PgInterval
   | [] => if pending.isNone then .ok iv else .error "interval: trailing number"

@@ -14,7 +14,7 @@ statements:
                                                 results, rendered through the
                                                 typed codecs
 
-During development, run it from the build:
+Run it from the build with:
 
   bazel run //Cmd:pg_lean -- postgres://bill@localhost:5432/postgres "SELECT version()"
 -/

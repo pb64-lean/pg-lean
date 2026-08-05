@@ -2,11 +2,10 @@
 
 [![CI](https://github.com/pb64-lean/pg-lean/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/pb64-lean/pg-lean/actions/workflows/ci.yml) [![PG live](https://github.com/pb64-lean/pg-lean/actions/workflows/pg-live.yml/badge.svg?branch=main)](https://github.com/pb64-lean/pg-lean/actions/workflows/pg-live.yml) [![Assurance](https://github.com/pb64-lean/pg-lean/actions/workflows/assurance.yml/badge.svg?branch=main)](https://github.com/pb64-lean/pg-lean/actions/workflows/assurance.yml)
 
-A PostgreSQL client for Lean 4, built as an extension of the standard
-library's networking foundations (`Std.Async.TCP`), with the eventual goal of
-an upstream contribution. The PostgreSQL protocol and TLS 1.3 state machines
-are pure Lean; TLS cryptography uses the sibling `tls13-lean` HACL* bindings
-for formally verified, constant-time primitives.
+A PostgreSQL client for Lean 4 built on the standard library's networking
+foundations (`Std.Async.TCP`). The PostgreSQL protocol and TLS 1.3 state
+machines are pure Lean; TLS cryptography uses the sibling `tls13-lean` HACL*
+bindings for formally verified, constant-time primitives.
 
 Bazel + `rules_lean` project, sibling to `../tls13-lean`, `../rules_lean`, and
 `../grpc-lean` (same pinned nix Lean toolchain).
@@ -134,8 +133,8 @@ bazel run //Cmd:pg_lean -- -e -b postgres://postgres@localhost/postgres \
   query keywords, `connect_timeout`, `sslrootcert`, `channel_binding`, and all
   six `sslmode` spellings). Verifying modes resolve trust in libpq order:
   explicit `sslrootcert`, `PGSSLROOTCERT`, then `~/.postgresql/root.crt`.
-  The programmatic `sslMode` default remains `disable` for compatibility with
-  pre-TLS pg-lean; request TLS `prefer` or `require` explicitly.
+  The programmatic `sslMode` default is `disable`; request TLS `prefer` or
+  `require` explicitly.
 
 ## Security compromises (by design, documented)
 
@@ -143,7 +142,7 @@ bazel run //Cmd:pg_lean -- -e -b postgres://postgres@localhost/postgres \
 |---|---|---|
 | SCRAM-SHA-256 | Full, pure Lean | SHA-256/HMAC/PBKDF2 implemented here; FIPS/RFC vectors in `bazel test` |
 | SASLprep (RFC 4013) | Partial | ASCII exact (SASLprep is identity); non-ASCII passwords sent as raw UTF-8 (matches several production drivers; works against PG in practice) |
-| md5 auth | Full | Deprecated in PG 18 but still live-tested on 17 |
+| md5 auth | Full | Deprecated in PG 18; live-tested on 17 |
 | Cleartext auth | Full | Plaintext on the wire — see TLS row |
 | TLS 1.3 encryption | Partial | HACL* ChaCha20-Poly1305/SHA-256 with X25519/P-256; PostgreSQL SSLRequest path only (not PG 17+ direct negotiation) |
 | TLS server identity | Authenticated in verification modes | CertificateVerify proof-of-possession is mandatory in every TLS mode. `verify-ca` validates the X.509 chain, validity, CA constraints, KeyUsage, and critical extensions; `verify-full` additionally verifies SAN/CN hostname or byte-exact IP identity. `require` deliberately encrypts without authenticating a CA-trusted server identity. CRL/OCSP revocation is not implemented, matching libpq's default behavior |
@@ -240,9 +239,9 @@ section docstring states its scope.
   land in `parameters` in order). The two halves join in
   `parseUri_renderUri_query`: **rendering a config together with its startup
   parameters produces a URI that parses back to both** — the authority, path
-  *and* every query field, in order. The step that needed proving was
-  `splitAllChar_renderQuery`, that a rendered query string splits back into
-  exactly its fields.
+  *and* every query field, in order. The supporting
+  `splitAllChar_renderQuery` lemma proves that a rendered query string splits
+  back into exactly its fields.
 - **Codecs** (`Pg/Types/Codec.lean`) — text and binary integer roundtrips and
   `PgInterval.fromBinary_toBinary`; `PgNumeric.fromBinary_toBinary` — **binary
   `numeric` is lossless**: sign, weight, display scale and every base-10000
@@ -316,8 +315,8 @@ be covered by `module_prefixes`, by `unaudited_module_prefixes`, or by the
 toolchain allowlist. The root target declares `HaclStar`/`TLS13`/`Tls` as
 unaudited here because the tls13-lean sibling's own assurance targets audit
 them; the three per-library targets import nothing outside `Pg` and the
-toolchain, so an import of a new unaudited module anywhere fails the build.
-Current whole-client result: no `sorry`, no `unsafe`, no `opaque`, four
+toolchain, so importing an unlisted module anywhere fails the build.
+The whole-client inventory contains no `sorry`, no `unsafe`, no `opaque`, four
 `partial` definitions (the pinned socket/channel loops `recvTransport`,
 `readerLoop`, `writerLoop`, and `pumpCopyOut` in `Pg/Connection.lean`), and
 **no `@[extern]` constants at all** — the expected extern inventory is empty,
@@ -330,22 +329,18 @@ The allowed axiom set is **exactly the standard three** — `propext`,
 scope: none`. There is no `sorry`, no `native_decide`, and no SAT/LRAT
 certificate anywhere in the trusted surface.
 
-Getting there took removing the last non-standard axioms. Lean 4.31's
-`bv_decide` checks the SAT solver's refutation with a *natively compiled* LRAT
-checker and records that check as one axiom per call site; pg-lean had seven,
-all for big-endian byte (de)composition. They are now proved at the `Nat` level
-instead: `Nat.shiftLeft_add_eq_or_of_lt` turns a disjoint `|||` into `+`
-(`or_add_lt`), after which `omega` decides every extraction identity, because
-it handles `/` and `%` by literal powers of two. See `pack_nat16`/`pack_nat32`/
-`unpack_pack16`/`unpack_pack32` in [`Pg/Protocol/Message.lean`](Pg/Protocol/Message.lean)
-and `pack_nat64`/`unpack_pack64` in [`Pg/Types/Codec.lean`](Pg/Types/Codec.lean);
-neither module imports `Std.Tactic.BVDecide` any more. Keeping the list at
-three means any new axiom, from any tactic, in any module under `Pg`, fails
-every assurance target and has to be justified.
+The big-endian byte (de)composition proofs operate at the `Nat` level:
+`Nat.shiftLeft_add_eq_or_of_lt` turns a disjoint `|||` into `+` (`or_add_lt`),
+and `omega` decides the extraction identities over `/` and `%` by literal
+powers of two. See `pack_nat16`/`pack_nat32`/`unpack_pack16`/`unpack_pack32` in
+[`Pg/Protocol/Message.lean`](Pg/Protocol/Message.lean) and
+`pack_nat64`/`unpack_pack64` in [`Pg/Types/Codec.lean`](Pg/Types/Codec.lean).
+Neither module imports `Std.Tactic.BVDecide`; any axiom outside the three-item
+allowlist fails every assurance target and requires explicit policy approval.
 
 ## Testing (the yardstick)
 
-Hermetic, every commit — `bazel test //...` (10 suites):
+Hermetic — `bazel test //...` (10 suites):
 crypto vectors (FIPS 180-4, RFC 4231, PBKDF2, RFC 1321, RFC 4648), the RFC
 7677 SCRAM exchange byte-for-byte, hand-frozen wire goldens for the whole
 message catalog + fragmentation torture + corrupt-payload rejection, machine
@@ -371,13 +366,13 @@ uses ordinary SCRAM-SHA-256.
 ## Toolchain notes
 
 Bazel builds with the pinned nix Lean (4.31-pre; `Std.Async.*` namespaces).
-The host/editor toolchain (4.27) uses `lakefile.lean` for LSP only — restart
-the language server after first checkout. Verify Lean sources with
-`~/.elan/bin/lean +grpc-lean-nix-4.31`, not the host lean: 4.31 renamed
-`Array.mkArray`→`replicate` and returns `String.Slice` from
-`trimAscii`/`drop`; `Std.Time` Offsets are `UnitVal` structures.
+The host/editor toolchain (4.27) uses `lakefile.lean` for LSP only. Restart the
+language server when initializing the checkout. Verify Lean sources with
+`~/.elan/bin/lean +grpc-lean-nix-4.31`, not the host Lean: the build API uses
+`Array.replicate`, returns `String.Slice` from `trimAscii`/`drop`, and represents
+`Std.Time` offsets as `UnitVal` structures.
 
-## Remaining work
+## Unsupported surface
 
 - CRL/OCSP certificate revocation checking for X.509 verification modes.
 - PostgreSQL direct TLS negotiation (`sslnegotiation=direct`, ALPN
@@ -385,7 +380,7 @@ the language server after first checkout. Verify Lean sources with
 - Full SASLprep (NFKC tables) for non-ASCII passwords.
 - Connection pooling and bounded/backpressured queues for applications that
   need explicit memory caps under sustained pipeline or COPY load.
-- `date`/`timestamp` ±infinity (Std.Time has no representation; currently a
-  decode error), BC dates, multi-dimensional arrays, exotic types via an
+- `date`/`timestamp` ±infinity (Std.Time has no representation; decoding
+  returns an error), BC dates, multi-dimensional arrays, exotic types via an
   extensible registry.
 - Unix-domain sockets, multi-host URIs, GSSAPI.

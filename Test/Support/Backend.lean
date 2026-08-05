@@ -13,7 +13,7 @@ open Pg.Protocol
 
 /-!
 Backend-message *builders* — encoders for messages only a server sends,
-used to author test exchanges. Test-only by design: the library itself ships
+for authoring test exchanges. Test-only by design: the library itself ships
 only backend decoders. The chain of trust is anchored in WireTest, which pins
 each builder against a hand-frozen hex golden before flows rely on them.
 -/

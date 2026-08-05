@@ -2,9 +2,9 @@
 
 These OpenSSL 3.6.2 certificates provide RSA-2048 (`rsaEncryption` SPKI),
 P-256, and Ed25519 leaf keys for the hermetic sans-I/O TLS tests. The
-corresponding private keys were used once to sign deterministic
-CertificateVerify inputs and then deleted. Only public certificates and the
-captured signatures in `Test/TlsTest.lean` are committed.
+corresponding private keys are not committed or retained. The repository
+contains only public certificates and the captured deterministic signatures
+in `Test/TlsTest.lean`.
 
 Each signed input is exactly:
 
@@ -23,10 +23,10 @@ Ed25519, empty session ID    a40e84207b92becf29dbfe44f55a2991d81960413db3ae6899c
 Ed25519, P-256 key exchange d9ca90f7686b9d776991ee32eaca1c769f1177ffe0557ac59c5c48e446a2224b
 ```
 
-Certificates were generated with `openssl genpkey` followed by
+Fixture construction uses `openssl genpkey` followed by
 `openssl req -new -x509`, fixed serials `0x4001` through `0x4003`, and critical
-`CA:FALSE` BasicConstraints plus `digitalSignature` KeyUsage. After writing
-each 130-byte signed input to `content.bin`, signatures were produced with:
+`CA:FALSE` BasicConstraints plus `digitalSignature` KeyUsage. With each
+130-byte signed input in `content.bin`, the signature commands are:
 
 ```sh
 openssl dgst -sha256 -sign rsa.key \
@@ -42,5 +42,4 @@ openssl pkeyutl -sign -rawin -inkey ed25519.key \
   -in content.bin -out signature.bin
 ```
 
-All five captures were independently verified with the matching OpenSSL
-public key before the private keys were removed.
+All five captures verify with their matching OpenSSL public keys.
