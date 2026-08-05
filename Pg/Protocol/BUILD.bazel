@@ -71,6 +71,13 @@ lean_assurance_test(
         "Pg.Protocol.Machine.eraseOwners_append",
         "Pg.Protocol.Machine.tagged_terminal_pops_head",
         "Pg.Protocol.Machine.tagged_feed_fifo",
+        # Error recovery is owner-local for the batch shapes the connection
+        # shell admits: a validated extended batch drops only to its own
+        # trailing Sync, and a lone simple query drops nothing, so a server
+        # error can never complete a later owner with the wrong result.
+        "Pg.Protocol.Machine.taggedDropUntilSync_stops_at_owner_sync",
+        "Pg.Protocol.Machine.taggedStep_error_stays_in_batch",
+        "Pg.Protocol.Machine.taggedStep_error_keeps_simpleQuery",
         # Byte accounting through the machine, not just the framer.
         "Pg.Protocol.Machine.step_decode",
         "Pg.Protocol.Machine.submit_decode",

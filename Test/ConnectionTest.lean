@@ -238,6 +238,35 @@ def serveConcurrent (server : TCP.Socket.Server) (sendIdle : IO.Promise Unit)
   expect (tag == 88) "concurrent server: expected Terminate"
   (client.shutdown).block
 
+/-- Owner-local error-recovery server: replies strictly in arrival order, so
+attribution is decided by the client's FIFO alone.  A Sync is answered with an
+error + ReadyForQuery (its extended batch failed at Parse, before any
+per-op reply), a `SELECT boom` Query with an error + ReadyForQuery, and every
+other Query with one row echoing its SQL text. -/
+def serveErrorRecovery (server : TCP.Socket.Server) (messageCount : Nat) : IO Unit := do
+  let client ← server.accept.block
+  let _ ← readStartup client
+  let sc ← ServerConn.mk' client
+  send client (authOk ++ readyForQuery 'I')
+  for _ in [0:messageCount] do
+    let msg ← readMsg sc
+    if msg.tag == 80 || msg.tag == 68 then  -- 'P' Parse, 'D' Describe
+      pure ()
+    else if msg.tag == 83 then  -- 'S' Sync
+      send client (errorResponse "ERROR" "42601" "syntax error" ++ readyForQuery 'I')
+    else if msg.tag == 81 then  -- 'Q' Query
+      let sql := (String.fromUTF8? (msg.payload.extract 0 (msg.payload.size - 1))).getD ""
+      if sql == "SELECT boom" then
+        send client (errorResponse "ERROR" "22012" "division by zero" ++ readyForQuery 'I')
+      else
+        send client (rowDescription #[col "value" 25] ++ row #[sql] ++
+          commandComplete "SELECT 1" ++ readyForQuery 'I')
+    else
+      throw (IO.userError s!"error-recovery server: unexpected tag {msg.tag}")
+  let tag ← readTagged sc
+  expect (tag == 88) "error-recovery server: expected Terminate"
+  (client.shutdown).block
+
 /-- EOF server: dies mid-response. -/
 def serveEof (server : TCP.Socket.Server) : IO Unit := do
   let client ← server.accept.block
@@ -275,6 +304,92 @@ def expectConnectFailureContaining (cfg : ConnectConfig) (needle label : String)
   catch e =>
     unless (toString e).contains needle do
       throw (IO.userError s!"{label}: expected {needle}, got {e}")
+
+/-- Owner-local error recovery (regression for the FIFO ownership hole):
+a batch mixing extended requests with a final simple query is rejected at
+submission, and pipelined server errors complete only their own owner. -/
+def errorRecoveryChecks : IO Unit := do
+  let firstCell (result : Except Pg.Error (Array Pg.Rows)) : Option ByteArray :=
+    result.toOption.bind fun results =>
+      results[0]?.bind fun rows =>
+        rows.rows[0]?.bind fun cells => cells[0]?.bind id
+  let (errServer, errPort) ← mkServer
+  let errServerTask ← IO.asTask (serveErrorRecovery errServer 9)
+  let errConn ← runAsync (connect { host := "127.0.0.1", port := errPort, user := "u" })
+  -- The reviewer's 3-owner trace: owner 0 mixes extended requests with a
+  -- final simple query.  Skip-until-Sync recovery for such a batch would
+  -- drop past the batch into owners 1 and 2, so it is rejected at submission
+  -- and nothing reaches the wire; the later owners run unperturbed.
+  expect ((← runAsync (errConn.run
+      #[.parse "bad" "SELECT ]", .simpleQuery "SELECT 'owner0'"]))
+      matches .error (.rejected _))
+    "mixed extended/simpleQuery batch rejected at submit"
+  match ← runAsync (errConn.query "SELECT 'owner1'") with
+  | .error e => throw (IO.userError s!"owner1 after rejected batch: {toString e}")
+  | .ok results =>
+    expect (results[0]!.rows == #[#[some (ascii "SELECT 'owner1'")]])
+      "owner1 completes after rejected batch"
+  match ← runAsync (errConn.query "SELECT 'owner2'") with
+  | .error e => throw (IO.userError s!"owner2 after rejected batch: {toString e}")
+  | .ok results =>
+    expect (results[0]!.rows == #[#[some (ascii "SELECT 'owner2'")]])
+      "owner2 completes after rejected batch"
+  -- Pipeline five owners before any reply arrives: an erroring extended
+  -- batch, two healthy queries, an erroring simple query, and a final
+  -- healthy query.  Recovery must stay inside each erroring owner's own
+  -- batch, so every later owner still receives exactly its own result.
+  let errReady : Std.CloseableChannel Unit ← Std.CloseableChannel.new
+  let errStart ← IO.Promise.new
+  let extendedTask ← Async.toIO do
+    discard <| errReady.trySend ()
+    await errStart
+    errConn.run #[.parse "bad" "SELECT ]", .describeStatement "bad", .sync]
+  let recover1Task ← Async.toIO do
+    discard <| errReady.trySend ()
+    await errStart
+    errConn.query "SELECT 'r1'"
+  let recover2Task ← Async.toIO do
+    discard <| errReady.trySend ()
+    await errStart
+    errConn.query "SELECT 'r2'"
+  let boomTask ← Async.toIO do
+    discard <| errReady.trySend ()
+    await errStart
+    errConn.query "SELECT boom"
+  let afterBoomTask ← Async.toIO do
+    discard <| errReady.trySend ()
+    await errStart
+    errConn.query "SELECT 'r4'"
+  for _ in [0:5] do
+    runAsync do
+      match ← await (← errReady.recv) with
+      | some () => pure ()
+      | none => throw (IO.userError "error-recovery barrier closed early")
+  discard <| errStart.resolve ()
+  match ← runAsync (Async.ofAsyncTask extendedTask) with
+  | .error e => throw (IO.userError s!"erroring extended batch: {toString e}")
+  | .ok events =>
+    let sqlState := events.findSome? fun
+      | .errorResponse fields => fields.sqlState?
+      | _ => none
+    expect (sqlState == some "42601") "extended-batch error attributed to its owner"
+  for (task, payload) in #[(recover1Task, "SELECT 'r1'"), (recover2Task, "SELECT 'r2'")] do
+    let result ← runAsync (Async.ofAsyncTask task)
+    expect (firstCell result == some (ascii payload))
+      s!"owner after erroring extended batch got {payload}"
+  match ← runAsync (Async.ofAsyncTask boomTask) with
+  | .error (.server fields) =>
+    expect (fields.sqlState? == some "22012") "simple-query error attributed to its owner"
+  | other =>
+    throw (IO.userError
+      s!"expected pipelined simple-query error, got ok/other ({other matches .ok _})")
+  let afterBoom ← runAsync (Async.ofAsyncTask afterBoomTask)
+  expect (firstCell afterBoom == some (ascii "SELECT 'r4'"))
+    "owner after erroring simple query got its own result"
+  runAsync errConn.close
+  match errServerTask.get with
+  | .ok () => pure ()
+  | .error e => throw e
 
 def main : IO Unit := do
   -- Stable, actionable TLS identity failures for callers and the live matrix.
@@ -588,6 +703,9 @@ def main : IO Unit := do
   match concurrentServerTask.get with
   | .ok () => pure ()
   | .error e => throw e
+
+  -- Owner-local error recovery (regression for the FIFO ownership hole).
+  errorRecoveryChecks
 
   -- EOF mid-response poisons the query with .disconnected
   let (server2, port2) ← mkServer

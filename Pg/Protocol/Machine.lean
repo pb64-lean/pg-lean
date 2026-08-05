@@ -2137,6 +2137,67 @@ theorem eraseOwners_append (before batch : List TaggedOp) :
   | nil => rfl
   | cons op rest ih => simp [eraseOwners, ih]
 
+/-!
+### Owner-local error recovery
+
+The connection shell admits an extended batch only when it ends in its own
+Sync and contains no earlier boundary, and a simple query only alone
+(`Pg.Connection.validateRun`).  For exactly those shapes, the recovery drop a
+server error triggers can never leave the erroring owner's batch: it stops at
+that batch's own trailing Sync, and a simple query drops nothing at all.
+-/
+
+/-- The recovery drop stops at the erroring owner's own Sync: everything the
+batch still had in flight is cancelled, and no op of any later owner —
+`later` is every subsequently admitted batch — is dropped. -/
+theorem taggedDropUntilSync_stops_at_owner_sync (mid : List TaggedOp)
+    (syncOp : TaggedOp) (later : List TaggedOp)
+    (hmid : ∀ op ∈ mid, op.kind ≠ OpKind.sync)
+    (hsync : syncOp.kind = OpKind.sync) :
+    taggedDropUntilSync (mid ++ syncOp :: later) = syncOp :: later := by
+  induction mid with
+  | nil =>
+    show taggedDropUntilSync (syncOp :: later) = syncOp :: later
+    unfold taggedDropUntilSync
+    rw [if_pos (by rw [hsync]; rfl)]
+  | cons op rest ih =>
+    show taggedDropUntilSync (op :: (rest ++ syncOp :: later)) = syncOp :: later
+    unfold taggedDropUntilSync
+    rw [if_neg (by
+      intro hb
+      exact hmid op (List.mem_cons_self ..) (opKind_eq_of_beq hb))]
+    exact ih (fun k hk => hmid k (List.mem_cons_of_mem _ hk))
+
+/-- A server error on the head of a validated extended batch cancels exactly
+the erroring owner's remaining ops: routing resumes at that batch's own Sync
+with every later owner's op still queued, so completions cannot shift across
+an owner boundary. -/
+theorem taggedStep_error_stays_in_batch {head : TaggedOp} {f : ErrorFields}
+    (mid : List TaggedOp) (syncOp : TaggedOp) (later : List TaggedOp)
+    (hheadSync : head.kind ≠ OpKind.sync)
+    (hheadSimple : head.kind ≠ OpKind.simpleQuery)
+    (hmid : ∀ op ∈ mid, op.kind ≠ OpKind.sync)
+    (hsync : syncOp.kind = OpKind.sync) :
+    taggedStep (head :: (mid ++ syncOp :: later)) (.errorResponse f) =
+      syncOp :: later := by
+  unfold taggedStep
+  have hterm : isTerminal head.kind (.errorResponse f) = false := by
+    cases head.kind <;> rfl
+  simp only [hterm, opKind_beq_eq_false hheadSync, opKind_beq_eq_false hheadSimple,
+    isRecoverableError, Bool.not_false, Bool.and_true, Bool.false_eq_true,
+    if_false, if_pos]
+  exact taggedDropUntilSync_stops_at_owner_sync mid syncOp later hmid hsync
+
+/-- A server error while a lone simple query heads the queue drops nothing:
+the simple protocol never enters ignore-till-Sync recovery, so the head stays
+to be popped by its own ReadyForQuery and later owners are untouched. -/
+theorem taggedStep_error_keeps_simpleQuery {head : TaggedOp}
+    {rest : List TaggedOp} {f : ErrorFields}
+    (hkind : head.kind = OpKind.simpleQuery) :
+    taggedStep (head :: rest) (.errorResponse f) = head :: rest := by
+  simp only [taggedStep, hkind]
+  rfl
+
 private theorem shellRun_single (fifo : List OpKind) (ev : Event) :
     shellRun fifo #[ev] = shellStep fifo ev := by rfl
 

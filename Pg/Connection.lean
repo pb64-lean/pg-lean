@@ -344,12 +344,18 @@ private def routeEvents (initial : ConnState) (events : Array Machine.Event) :
             actions := { actions with copyStarts :=
               (actions.copyStarts.push copyStartAction) }
         | .copyData data =>
-          let call := { call with events := call.events.push ev }
-          st := { st with pending := st.pending.set 0 call }
-          if let some channel := call.copyData then
+          -- A call with a streaming sink receives payloads through its
+          -- channel only; also retaining them in the completion events would
+          -- buffer the whole COPY TO STDOUT payload until the call completes,
+          -- defeating the sink.  Calls without a channel keep the events.
+          match call.copyData with
+          | some channel =>
             let copyDataAction : CopyDataAction := { channel, data }
             actions := { actions with copyData :=
               (actions.copyData.push copyDataAction) }
+          | none =>
+            let call := { call with events := call.events.push ev }
+            st := { st with pending := st.pending.set 0 call }
         | _ =>
           let call := { call with events := call.events.push ev }
           st := { st with pending := st.pending.set 0 call }
@@ -879,6 +885,16 @@ private def validateRun (reqs : Array Machine.Request) : Except Error (List Mach
       throw (rejected "run does not accept COPY, Flush, or Terminate control requests")
   if isRunControl final then
     throw (rejected "run does not accept COPY, Flush, or Terminate control requests")
+  -- A simple query must be the entire batch.  Extended-protocol error
+  -- recovery skips to the batch's own Sync (`Machine.taggedDropUntilSync`
+  -- stops only at `OpKind.sync`), so a Query boundary after extended requests
+  -- would let recovery drop past this owner's batch into later owners' ops,
+  -- misattributing their completions.  Admitting only sync-terminated
+  -- extended batches is what makes recovery owner-local
+  -- (`Machine.taggedStep_error_stays_in_batch`).
+  if (final matches Machine.Request.simpleQuery _) && reqs.size != 1 then
+    throw (rejected
+      "run does not allow extended requests before a simpleQuery boundary; end extended batches with sync")
   pure (reqs.toList.filterMap requestOpKind?)
 
 private structure CallHandle where
@@ -1074,7 +1090,7 @@ private def commandTag (events : Array Machine.Event) : String :=
 /-- `COPY ... FROM STDIN`.  The producer is cooperative and runs outside the
 reader/coordinator; an exception submits best-effort CopyFail before the final
 ReadyForQuery is awaited. -/
-partial def copyIn (conn : Connection) (sql : String)
+def copyIn (conn : Connection) (sql : String)
     (next : Async (Option ByteArray)) : Async (Except Error String) := do
   let started ← IO.Promise.new
   let call ← match ← submitBatch conn #[.simpleQuery sql] true (some started) with
@@ -1261,7 +1277,10 @@ def close (conn : Connection) : Async Unit := do
     finishFailure conn error calls
   discard <| conn.outbound.close.toBaseIO
   if let some writer := (← conn.background.get).writer then
-    try Async.ofAsyncTask writer catch _ => pure ()
+    try
+      discard <| Async.race (Async.ofAsyncTask writer)
+        (Std.Async.sleep (Std.Time.Millisecond.Offset.ofNat 1000))
+    catch _ => pure ()
   conn.state.atomically do modify fun st => { st with life := .closed }
   discard <| conn.notifications.close.toBaseIO
   try

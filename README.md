@@ -107,9 +107,11 @@ bazel run //Cmd:pg_lean -- -e -b postgres://postgres@localhost/postgres \
   with suspension/resume, parameter + result formats (text and binary).
 - **Concurrent, owner-tagged pipelining**: bounded batches are admitted and
   written in coordinator order, while one background reader attributes every
-  reply to the submitting caller. Extended batches end in their own Sync, so
-  skip-until-Sync recovery cannot cross an owner boundary. Generic `run`
-  rejects ambiguous multi-boundary and protocol-control batches.
+  reply to the submitting caller. Admission enforces that extended batches end
+  in their own Sync and that a simple query is a batch of its own, so
+  skip-until-Sync recovery cannot cross an owner boundary
+  (`taggedStep_error_stays_in_batch`). Generic `run` rejects ambiguous
+  multi-boundary, mixed extended/simple-query, and protocol-control batches.
 - **COPY IN/OUT** streaming with exclusive connection ownership for the COPY
   lifetime; **LISTEN/NOTIFY** with an independent queue that receives messages
   even while no request is pending; **cancellation** via separate-connection
@@ -203,7 +205,12 @@ section docstring states its scope.
   owner-tagged refinement proves erasing owner metadata commutes with recovery,
   each event, whole feeds, and append; `tagged_terminal_pops_head` proves a
   terminal event removes exactly the tagged head used by the live
-  coordinator's completion criterion.
+  coordinator's completion criterion. For the batch shapes admission allows,
+  error recovery is owner-local: `taggedStep_error_stays_in_batch` proves a
+  server error on a validated extended batch drops ops only up to that batch's
+  own trailing Sync (never a later owner's), and
+  `taggedStep_error_keeps_simpleQuery` that a lone simple query drops nothing
+  at all.
 - **Startup ordering** — `AuthStep`/`AuthReach` are PostgreSQL's documented
   authentication sequences; `step_startup_order` and `runSteps_startup_order`
   prove the machine refines them, `authStep_stage_le` that the exchange never
@@ -300,15 +307,23 @@ time, so a regression is a red build rather than a stale claim:
 | `//Pg/Sasl:sasl_assurance` | SCRAM construction and mutual authentication |
 | `//:pg_lean_assurance` | the whole client: `sslmode` policy, trust-store gate, connection-string roundtrips |
 
-Each target checks that its named theorems exist, are theorems, and close over
-an allowed axiom set — and scans **every** first-party module (`module_prefixes
-= ["Pg"]`, 22 modules / ~4200 constants) for `sorry`, stray axioms, `unsafe`,
-and `@[extern]`. Current whole-client result: no `sorry`, no `unsafe`, no
-`opaque`, two `partial` definitions (the socket read loop and the cancellable
-sleep in `Pg/Connection.lean`), and **no `@[extern]` constants at all** —
-`allowed_extern_modules` is empty, so any first-party native code would fail
-the audit. pg-lean's crypto is pure Lean; the only native code it runs is
-`tls13-lean`'s HACL* bindings, audited in that repository.
+Each target checks that its named theorems match their pinned statements
+definitionally and close over an allowed axiom set — and scans **every**
+first-party module (`module_prefixes = ["Pg"]`, 22 modules / ~4600 constants)
+for `sorry`, stray axioms, `unsafe`, and `@[extern]`. Exact mode is a closed
+world at module granularity: every module the audited environment imports must
+be covered by `module_prefixes`, by `unaudited_module_prefixes`, or by the
+toolchain allowlist. The root target declares `HaclStar`/`TLS13`/`Tls` as
+unaudited here because the tls13-lean sibling's own assurance targets audit
+them; the three per-library targets import nothing outside `Pg` and the
+toolchain, so an import of a new unaudited module anywhere fails the build.
+Current whole-client result: no `sorry`, no `unsafe`, no `opaque`, four
+`partial` definitions (the pinned socket/channel loops `recvTransport`,
+`readerLoop`, `writerLoop`, and `pumpCopyOut` in `Pg/Connection.lean`), and
+**no `@[extern]` constants at all** — the expected extern inventory is empty,
+so any first-party native code would fail the audit. pg-lean's crypto is pure
+Lean; the only native code it runs is `tls13-lean`'s HACL* bindings, audited
+in that repository.
 
 The allowed axiom set is **exactly the standard three** — `propext`,
 `Classical.choice`, `Quot.sound` — and the scan reports `declared axioms in

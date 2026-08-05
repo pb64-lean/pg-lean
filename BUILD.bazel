@@ -49,6 +49,18 @@ lean_assurance_test(
     name = "pg_lean_assurance",
     allowed_axioms = PG_ALLOWED_AXIOMS,
     module_prefixes = ["Pg"],
+    # Exact mode partitions the whole imported environment: every module must
+    # be audited here, declared audited elsewhere, or ship with the toolchain.
+    # The connection shell imports the tls13-lean sibling's TLS client
+    # (`Tls`), X.509/key-schedule layers (`TLS13`), and HACL* bindings
+    # (`HaclStar`); those are audited by tls13-lean's own assurance targets.
+    # The three per-library targets in Pg/*/BUILD.bazel import nothing outside
+    # `Pg` and the toolchain, so only this root target declares them.
+    unaudited_module_prefixes = [
+        "HaclStar",
+        "TLS13",
+        "Tls",
+    ],
     policy_mode = "exact",
     principal_theorems = [
         # The sslmode policy table, and the connect path that reads it.
